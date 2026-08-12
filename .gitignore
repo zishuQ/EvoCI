@@ -1,0 +1,13 @@
+.env
+.evoci/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+results/
+pytest-of-root/
+evoci-skill-test-*/

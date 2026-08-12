@@ -1,0 +1,75 @@
+"""Filesystem, command, and worker permission policies."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class PolicyViolation(PermissionError):
+    """A requested tool operation exceeded its granted capability."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCapabilities:
+    read_files: bool
+    search_code: bool
+    git_read: bool
+    execute_tests: bool
+    write_files: bool
+    network: bool = False
+
+
+INVESTIGATOR_CAPABILITIES = WorkerCapabilities(True, True, True, True, False)
+FIXER_CAPABILITIES = WorkerCapabilities(True, True, True, True, True)
+REVIEWER_CAPABILITIES = WorkerCapabilities(True, True, True, True, False)
+
+
+class WorkspaceBoundary:
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+
+    def resolve(self, path: str | Path, *, must_exist: bool = False) -> Path:
+        candidate = (self.root / path).resolve()
+        if candidate != self.root and self.root not in candidate.parents:
+            raise PolicyViolation(f"path escapes workspace: {path}")
+        if must_exist and not candidate.exists():
+            raise FileNotFoundError(candidate)
+        return candidate
+
+
+SAFE_COMMANDS = frozenset(
+    {
+        "python",
+        "python3",
+        "pytest",
+        "ruff",
+        "mypy",
+        "git",
+        "uv",
+        "npm",
+        "pnpm",
+        "yarn",
+        "node",
+        "cargo",
+        "go",
+    }
+)
+
+
+def validate_command(argv: list[str], *, network: bool = False) -> None:
+    if not argv:
+        raise PolicyViolation("empty command")
+    executable = Path(argv[0]).name
+    if executable not in SAFE_COMMANDS:
+        raise PolicyViolation(f"command is not allowlisted: {executable}")
+    joined = " ".join(argv).lower()
+    forbidden = ("sudo ", "rm -rf", "curl ", "wget ", "--privileged", "/etc/", "../")
+    if any(token in joined for token in forbidden):
+        raise PolicyViolation("command contains a forbidden pattern")
+    if (
+        not network
+        and executable in {"npm", "pnpm", "yarn", "uv"}
+        and any(token in argv for token in ("add", "install", "publish", "upload"))
+    ):
+        raise PolicyViolation("network-affecting package command is disabled")

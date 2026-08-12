@@ -1,0 +1,30 @@
+{"task_id":"select-formatting-01","category":"Formatting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-formatting-02","category":"Formatting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-formatting-03","category":"Formatting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-formatting-04","category":"Formatting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-formatting-05","category":"Formatting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-linting-01","category":"Linting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-linting-02","category":"Linting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-linting-03","category":"Linting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-linting-04","category":"Linting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-linting-05","category":"Linting","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-type-checking-01","category":"Type Checking","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-type-checking-02","category":"Type Checking","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-type-checking-03","category":"Type Checking","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-type-checking-04","category":"Type Checking","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-type-checking-05","category":"Type Checking","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-test-failure-01","category":"Test Failure","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-test-failure-02","category":"Test Failure","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-test-failure-03","category":"Test Failure","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-test-failure-04","category":"Test Failure","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-test-failure-05","category":"Test Failure","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-dependency-01","category":"Dependency","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-dependency-02","category":"Dependency","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-dependency-03","category":"Dependency","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-dependency-04","category":"Dependency","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-dependency-05","category":"Dependency","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-configuration-01","category":"Configuration","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-configuration-02","category":"Configuration","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-configuration-03","category":"Configuration","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-configuration-04","category":"Configuration","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
+{"task_id":"select-configuration-05","category":"Configuration","skipped":true,"skip_reason":"Select a reproducible CI-Repair-Bench row from the local dataset export."}
