@@ -63,6 +63,7 @@ class EvoCIState(TypedDict, total=False):
     learning_decision: dict[str, object] | None
     candidate_skill_id: str | None
     learning_errors: list[dict[str, str]]
+    learning_deferred: bool
 
     status: Literal["running", "waiting_approval", "success", "failed"]
     failure_reason: str | None

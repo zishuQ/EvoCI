@@ -161,6 +161,11 @@ class FixerOutput(BaseModel):
         return self
 
 
+VerificationCommandSource = Literal["mandatory", "supplementary"]
+VerificationStatus = Literal["passed", "failed", "incomplete", "unavailable"]
+ReviewStatus = Literal["passed", "failed", "not_performed"]
+
+
 class VerificationCommandResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -169,25 +174,92 @@ class VerificationCommandResult(BaseModel):
     stdout: str
     stderr: str
     timed_out: bool = False
+    source: VerificationCommandSource = "mandatory"
+    executed: bool = True
+    skip_reason: str | None = None
 
 
 class VerificationResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     passed: bool
+    status: VerificationStatus = "failed"
     level: Literal["targeted", "repository", "full_ci"] = "targeted"
     commands: list[VerificationCommandResult]
+    expected_count: int = 0
+    executed_count: int = 0
+    incomplete_reason: str | None = None
+    oracle_source: Literal["harness", "none"] = "harness"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_completeness(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        commands = data.get("commands") or []
+        passed = bool(data.get("passed"))
+        status = data.get("status", "failed")
+        if passed and status == "failed" and not data.get("incomplete_reason"):
+            status = "passed"
+        expected = data.get("expected_count") or len(commands)
+        if data.get("executed_count"):
+            executed_count = data["executed_count"]
+        else:
+            executed_count = 0
+            for command in commands:
+                if isinstance(command, dict):
+                    executed_count += int(command.get("executed", True))
+                else:
+                    executed_count += int(getattr(command, "executed", True))
+        payload = dict(data)
+        payload["status"] = status
+        payload["expected_count"] = expected
+        payload["executed_count"] = executed_count
+        return payload
+
+    @model_validator(mode="after")
+    def verify_success_contract(self) -> VerificationResult:
+        if self.passed and self.status != "passed":
+            raise ValueError("passed=true is only valid for verified success")
+        if self.status == "passed" and not self.passed:
+            raise ValueError("status=passed requires passed=true")
+        return self
 
 
 class ReviewResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     accepted: bool
+    performed: bool = True
+    status: ReviewStatus = "failed"
     blockers: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
     used_memory_ids: list[str] = Field(default_factory=list)
     used_skill_refs: list[SkillRef] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_review_status(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        performed = data.get("performed", True)
+        accepted = bool(data.get("accepted"))
+        payload = dict(data)
+        if not performed:
+            payload["accepted"] = False
+            payload["status"] = "not_performed"
+        elif accepted:
+            payload["status"] = "passed"
+        else:
+            payload["status"] = "failed"
+        return payload
+
+    @model_validator(mode="after")
+    def unperformed_review_is_not_accepted(self) -> ReviewResult:
+        if not self.performed and self.accepted:
+            raise ValueError("unperformed review cannot be accepted")
+        return self
 
 
 class MemoryHit(BaseModel):

@@ -301,7 +301,8 @@ async def collect_metrics(
     verification = result.get("verification")
     review = result.get("review")
     targeted_verification_passed = bool(verification and verification.passed)
-    review_passed = bool(review and review.accepted)
+    review_performed = bool(review is not None and getattr(review, "performed", True))
+    review_passed = bool(review_performed and review is not None and review.accepted)
     trajectory = recorder.build_view(
         run_id=run_id,
         verification_history=result.get("verification_history", []),
@@ -361,6 +362,7 @@ async def collect_metrics(
         agent_declared_success=status == "success",
         targeted_verification_passed=targeted_verification_passed,
         review_passed=review_passed,
+        review_performed=review_performed,
         benchmark_verification=benchmark_verification,
         benchmark_verification_status=benchmark_verification.status,
         benchmark_resolved=benchmark_verification.status == "passed",

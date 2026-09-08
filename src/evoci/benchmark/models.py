@@ -128,6 +128,7 @@ class RunMetrics(BaseModel):
     agent_declared_success: bool
     targeted_verification_passed: bool
     review_passed: bool
+    review_performed: bool = False
     benchmark_verification: BenchmarkVerificationResult
     benchmark_verification_status: BenchmarkVerificationStatus
     benchmark_resolved: bool

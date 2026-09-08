@@ -346,6 +346,7 @@ async def test_single_variant_uses_feedback_and_retries_with_shared_budget(
         "ci_failure": CIFailure(
             summary="addition test failed",
             log_excerpt="AssertionError",
+            failed_commands=[["python", "-m", "unittest", "-q"]],
             task_family="test",
         ),
         "workspace_path": str(workspace),

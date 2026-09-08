@@ -235,7 +235,11 @@ def initial_state(workspace: Path, *, run_id: str = "run-1") -> dict[str, object
         "run_id": run_id,
         "task_id": "task-1",
         "repo": RepoSpec(name="fixture"),
-        "ci_failure": CIFailure(summary="test failed", log_excerpt="AssertionError"),
+        "ci_failure": CIFailure(
+            summary="test failed",
+            log_excerpt="AssertionError",
+            failed_commands=[["python", "-c", "raise SystemExit(0)"]],
+        ),
         "workspace_path": str(workspace),
     }
 
@@ -845,7 +849,7 @@ async def test_patch_apply_crash_resumes_after_partial_side_effect(
     monkeypatch.setattr(graph_builder_module, "_apply_edit", crash_once)
     with pytest.raises(CrashAfterFirstEdit):
         await graph.ainvoke(initial_state(tmp_path, run_id="patch-crash"), invocation_config)
-    assert (tmp_path / "a.py").read_text() == "VALUE = 'desired'\n"
+    assert (tmp_path / "a.py").read_text() == original
     assert (tmp_path / "b.py").read_text() == original
 
     result = await graph.ainvoke(None, invocation_config)

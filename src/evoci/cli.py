@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import shutil
 import sqlite3
@@ -59,7 +58,7 @@ from evoci.domain.models import (
     VerificationCommandResult,
     VerificationResult,
 )
-from evoci.graph.builder import GraphRuntime, build_graph
+from evoci.graph.builder import GraphRuntime, build_graph, persist_run_outcome
 from evoci.graph.routing import contains_review_bypass, contains_workspace_review_bypass
 from evoci.memory.consolidation import ModelMemoryConsolidator
 from evoci.memory.retrieval import MemoryRetriever
@@ -73,7 +72,13 @@ from evoci.runtime.events import EventType
 from evoci.runtime.run_store import SQLiteRunStore
 from evoci.runtime.trajectory import TrajectoryRecorder
 from evoci.tools.filesystem import FileTools
-from evoci.tools.shell import CommandRunner
+from evoci.tools.patch import (
+    apply_edit,
+    precheck_edits,
+    restore_edit_baseline,
+    snapshot_edit_baseline,
+)
+from evoci.verification.service import VerificationService
 
 app = typer.Typer(help="Durable, self-improving multi-agent CI recovery")
 runs_app = typer.Typer(help="Inspect durable runs")
@@ -105,7 +110,10 @@ class LiveResources:
 
 
 async def _live_resources(
-    config: EvoCIConfig, features: VariantFeatures | None = None
+    config: EvoCIConfig,
+    features: VariantFeatures | None = None,
+    *,
+    defer_success_learning: bool = False,
 ) -> LiveResources:
     enabled = features or variant_features("evo")
     config.ensure_directories()
@@ -205,6 +213,7 @@ async def _live_resources(
         recorder=recorder,
         curator_pipeline=curator_pipeline,
         budget_manager=budget_manager,
+        defer_success_learning=defer_success_learning,
     )
     return LiveResources(
         runtime,
@@ -593,11 +602,6 @@ async def _drive_single(
         writable=True,
         max_chars=resources.runtime.config.output_limit_chars,
     )
-    runner = CommandRunner(
-        workspace,
-        timeout=resources.runtime.config.command_timeout_seconds,
-        max_chars=resources.runtime.config.output_limit_chars,
-    )
     assert resources.runtime.budget_manager is not None
     budget = resources.runtime.budget_manager.for_run(run_id)
     previous_verification: VerificationResult | None = None
@@ -611,14 +615,10 @@ async def _drive_single(
     failure_reason: str | None = "single-agent repair budget exhausted"
     attempt = 0
 
-    def restore(baseline: dict[str, str | None]) -> None:
-        for path, content in baseline.items():
-            target = files.boundary.resolve(path)
-            if content is None:
-                if target.exists():
-                    target.unlink()
-            elif not target.exists() or target.read_text(encoding="utf-8") != content:
-                files.write_file(path, content)
+    verifier = VerificationService(
+        timeout=resources.runtime.config.command_timeout_seconds,
+        max_chars=resources.runtime.config.output_limit_chars,
+    )
 
     for attempt in range(1, resources.runtime.config.max_repair_attempts + 1):
         try:
@@ -647,163 +647,157 @@ async def _drive_single(
             failure_reason = previous_summary
             continue
 
-        baseline: dict[str, str | None] = {}
-        for edit in output.edits:
-            target = files.boundary.resolve(edit.path)
-            baseline[edit.path] = target.read_text(encoding="utf-8") if target.exists() else None
+        baseline = snapshot_edit_baseline(workspace, output.edits)
         apply_failed = False
-        for index, edit in enumerate(output.edits):
-            call_id = f"single-apply:{attempt}:{index}"
-            try:
-                budget.consume_tool_call()
-            except RepairBudgetExhausted as exc:
-                failure_reason = str(exc)
-                apply_failed = True
-                break
-            resources.recorder.emit(
-                run_id=run_id,
-                event_type=EventType.TOOL_CALL,
-                agent_id="single",
-                invocation_id=f"repair:{attempt}",
-                event_key=call_id,
-                payload={
-                    "call_id": call_id,
-                    "tool_name": "apply_patch",
-                    "arguments": {"path": edit.path, "delete": edit.delete},
-                },
-            )
-            target = files.boundary.resolve(edit.path)
-            existed = target.exists()
-            try:
-                if edit.delete:
-                    if not existed:
-                        pass
-                    elif edit.expected_sha256 and (
-                        hashlib.sha256(target.read_bytes()).hexdigest() != edit.expected_sha256
-                    ):
-                        raise RuntimeError(f"file changed since proposal: {edit.path}")
-                    else:
-                        target.unlink()
-                else:
-                    assert edit.content is not None
-                    if existed and target.read_text(encoding="utf-8") == edit.content:
-                        pass
-                    else:
-                        if edit.expected_sha256 and (
-                            not existed
-                            or hashlib.sha256(target.read_bytes()).hexdigest()
-                            != edit.expected_sha256
-                        ):
-                            raise RuntimeError(f"file changed since proposal: {edit.path}")
-                        files.write_file(edit.path, edit.content)
-            except Exception as exc:
-                failure_reason = f"patch apply failed: {exc}"
-                apply_failed = True
-            resources.recorder.emit(
-                run_id=run_id,
-                event_type=EventType.TOOL_RESULT,
-                agent_id="single",
-                invocation_id=f"repair:{attempt}",
-                event_key=call_id,
-                payload={
-                    "call_id": call_id,
-                    "tool_name": "apply_patch",
-                    "success": not apply_failed,
-                    "created_files": (
-                        [edit.path] if not apply_failed and not existed and not edit.delete else []
-                    ),
-                    "modified_files": ([edit.path] if not apply_failed and existed else []),
-                    "error": failure_reason if apply_failed else None,
-                },
-            )
-            if apply_failed:
-                break
+        try:
+            precheck_edits(workspace, output.edits)
+            if output.edits:
+                budget.ensure_tool_calls(len(output.edits))
+            for index, edit in enumerate(output.edits):
+                call_id = f"single-apply:{attempt}:{index}"
+                try:
+                    budget.consume_tool_call()
+                except RepairBudgetExhausted as exc:
+                    failure_reason = str(exc)
+                    apply_failed = True
+                    break
+                resources.recorder.emit(
+                    run_id=run_id,
+                    event_type=EventType.TOOL_CALL,
+                    agent_id="single",
+                    invocation_id=f"repair:{attempt}",
+                    event_key=call_id,
+                    payload={
+                        "call_id": call_id,
+                        "tool_name": "apply_patch",
+                        "arguments": {"path": edit.path, "delete": edit.delete},
+                    },
+                )
+                started = monotonic()
+                try:
+                    created, modified = apply_edit(workspace, files, edit)
+                except Exception as exc:
+                    failure_reason = f"patch apply failed: {exc}"
+                    apply_failed = True
+                    resources.recorder.emit(
+                        run_id=run_id,
+                        event_type=EventType.TOOL_RESULT,
+                        agent_id="single",
+                        invocation_id=f"repair:{attempt}",
+                        event_key=call_id,
+                        payload={
+                            "call_id": call_id,
+                            "tool_name": "apply_patch",
+                            "success": False,
+                            "error": failure_reason,
+                            "duration_seconds": monotonic() - started,
+                        },
+                    )
+                    break
+                resources.recorder.emit(
+                    run_id=run_id,
+                    event_type=EventType.TOOL_RESULT,
+                    agent_id="single",
+                    invocation_id=f"repair:{attempt}",
+                    event_key=call_id,
+                    payload={
+                        "call_id": call_id,
+                        "tool_name": "apply_patch",
+                        "success": True,
+                        "created_files": created,
+                        "modified_files": modified,
+                        "duration_seconds": monotonic() - started,
+                    },
+                )
+        except BaseException:
+            restore_edit_baseline(workspace, baseline)
+            raise
         if apply_failed:
-            restore(baseline)
+            restore_edit_baseline(workspace, baseline)
             previous_summary = failure_reason
             continue
 
         final_blockers = contains_workspace_review_bypass(workspace)
         if final_blockers:
-            restore(baseline)
+            restore_edit_baseline(workspace, baseline)
             previous_blockers = tuple(final_blockers)
             previous_summary = "; ".join(final_blockers)
             failure_reason = previous_summary
             continue
 
-        commands = output.proposal.verification_plan or failure.failed_commands
-        command_results: list[VerificationCommandResult] = []
-        for index, command in enumerate(commands):
-            call_id = f"single-verify:{attempt}:{index}"
-            try:
-                budget.consume_tool_call()
-            except RepairBudgetExhausted as exc:
-                failure_reason = str(exc)
-                break
+        current_attempt = attempt
+
+        async def on_command_start(
+            index: int, command: list[str], source: str, *, attempt: int = current_attempt
+        ) -> None:
+            del source
             resources.recorder.emit(
                 run_id=run_id,
                 event_type=EventType.TOOL_CALL,
                 agent_id="single",
                 invocation_id=f"repair:{attempt}",
-                event_key=call_id,
+                event_key=f"single-verify:{attempt}:{index}",
                 payload={
-                    "call_id": call_id,
+                    "call_id": f"single-verify:{attempt}:{index}",
                     "tool_name": "run_test",
                     "arguments": {"argv": command},
                 },
             )
-            command_result = await runner.run(command, extra_env={"CI": "1"})
-            passed = command_result.exit_code == 0 and not command_result.timed_out
-            command_results.append(
-                VerificationCommandResult(
-                    command=command,
-                    exit_code=command_result.exit_code,
-                    stdout=command_result.stdout,
-                    stderr=command_result.stderr,
-                    timed_out=command_result.timed_out,
-                )
-            )
+
+        async def on_command_done(
+            index: int,
+            result: VerificationCommandResult,
+            *,
+            attempt: int = current_attempt,
+        ) -> None:
+            passed = result.executed and result.exit_code == 0 and not result.timed_out
             resources.recorder.emit(
                 run_id=run_id,
                 event_type=EventType.TOOL_RESULT,
                 agent_id="single",
                 invocation_id=f"repair:{attempt}",
-                event_key=call_id,
+                event_key=f"single-verify:{attempt}:{index}",
                 payload={
-                    "call_id": call_id,
+                    "call_id": f"single-verify:{attempt}:{index}",
                     "tool_name": "run_test",
                     "success": passed,
-                    "exit_code": command_result.exit_code,
-                    "error": command_result.stderr if not passed else None,
+                    "exit_code": result.exit_code,
+                    "error": result.stderr if not passed else None,
+                    "executed": result.executed,
+                    "source": result.source,
                 },
             )
-            if not passed:
-                break
-        verification = VerificationResult(
-            passed=bool(command_results)
-            and all(result.exit_code == 0 and not result.timed_out for result in command_results),
-            commands=command_results,
+
+        verification = await verifier.run(
+            workspace=workspace,
+            mandatory=failure.failed_commands,
+            supplementary=output.proposal.verification_plan,
+            budget=budget,
+            on_command_start=on_command_start,
+            on_command_done=on_command_done,
         )
         verification_history.append(verification)
         previous_verification = verification
         if verification.passed:
-            review = ReviewResult(accepted=True, confidence=1.0)
+            review = ReviewResult(accepted=False, performed=False, confidence=0.0)
             status = "success"
             failure_reason = None
             break
-        restore(baseline)
-        previous_summary = next(
+        restore_edit_baseline(workspace, baseline)
+        previous_summary = verification.incomplete_reason or next(
             (
                 result.stderr or f"exit code {result.exit_code}"
-                for result in command_results
-                if result.exit_code != 0 or result.timed_out
+                for result in verification.commands
+                if result.executed and (result.exit_code != 0 or result.timed_out)
             ),
             failure_reason,
         )
+        failure_reason = previous_summary
 
     if review is None:
         review = ReviewResult(
             accepted=False,
+            performed=False,
             blockers=[failure_reason or "single-agent repair failed"],
             confidence=1.0,
         )
@@ -1125,7 +1119,9 @@ def benchmark(
                 session_id=session_id,
                 task_index=None,
             )
-            shared = await _live_resources(shared_config, features)
+            shared = await _live_resources(
+                shared_config, features, defer_success_learning=True
+            )
 
         async def execute_entry(
             entry: BenchmarkManifestEntry, selected_variant: BenchmarkVariant
@@ -1140,7 +1136,9 @@ def benchmark(
                 session_id=session_id,
                 task_index=None if continual else task_index,
             )
-            resources = shared or await _live_resources(active_config, features)
+            resources = shared or await _live_resources(
+                active_config, features, defer_success_learning=True
+            )
             try:
                 verifier = FailedCommandReplayVerifier(
                     timeout=active_config.command_timeout_seconds,
@@ -1192,7 +1190,7 @@ def benchmark(
                 active_count = (
                     len(resources.registry.list({"active"})) if features.capabilities else 0
                 )
-                return await collect_metrics(
+                metrics = await collect_metrics(
                     result=result,
                     recorder=resources.recorder,
                     run_id=run_id,
@@ -1205,6 +1203,24 @@ def benchmark(
                     skill_registry_size=registry_size,
                     active_skill_count=active_count,
                 )
+                if result.get("learning_deferred") and result.get("status") == "success":
+                    independent_ok = metrics.benchmark_resolved
+                    learned = await persist_run_outcome(
+                        resources.runtime,
+                        cast(Any, result),
+                        success=independent_ok,
+                        failure_reason=(
+                            None
+                            if independent_ok
+                            else (
+                                "independent benchmark verification "
+                                f"{metrics.benchmark_verification_status}: "
+                                f"{metrics.benchmark_verification.details}"
+                            )
+                        ),
+                    )
+                    result.update(learned)
+                return metrics
             finally:
                 if shared is None:
                     await resources.close()

@@ -55,7 +55,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-exclude = ["pytest-of-root"]
+exclude = ["pytest-of-root", "tests/langgraph_guide"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

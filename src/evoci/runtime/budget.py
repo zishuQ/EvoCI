@@ -48,6 +48,17 @@ class RunRepairBudget:
                 raise RepairBudgetExhausted("run-level tool-call budget exhausted")
             self._tool_calls += 1
 
+    def remaining_tool_calls(self) -> int:
+        with self._lock:
+            return max(0, self.max_tool_calls - self._tool_calls)
+
+    def ensure_tool_calls(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            if self._tool_calls + count > self.max_tool_calls:
+                raise RepairBudgetExhausted("run-level tool-call budget exhausted")
+
     def snapshot(self) -> BudgetSnapshot:
         with self._lock:
             return BudgetSnapshot(
