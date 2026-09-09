@@ -6,6 +6,7 @@ from pathlib import Path
 from evoci.domain.models import FileEdit
 from evoci.graph.builder import _apply_edit
 from evoci.tools.filesystem import FileTools
+from evoci.tools.patch import precheck_edits
 
 
 def _hash(content: str) -> str:
@@ -51,3 +52,4 @@ def test_delete_and_create_replay_are_noops_at_desired_state(tmp_path: Path) -> 
     assert _apply_edit(tmp_path, tools, delete) == ([], [])
     assert _apply_edit(tmp_path, tools, create) == (["new.py"], [])
     assert _apply_edit(tmp_path, tools, create) == ([], [])
+    precheck_edits(tmp_path, [delete, create])

@@ -53,7 +53,9 @@ from evoci.tools.patch import (
     PatchConflict,
     PatchError,
     apply_edit,
+    attempt_targets,
     precheck_edits,
+    recover_attempt_writes,
     restore_attempt_writes,
     restore_edit_baseline,
     snapshot_edit_baseline,
@@ -896,6 +898,7 @@ def build_graph(
                 "fixer_output": None,
             }
         baseline = _snapshot_edit_baseline(Path(state["workspace_path"]), output.edits)
+        targets = attempt_targets(output.edits)
         usage_events, used_memories, used_skills = _attribution(
             runtime,
             state,
@@ -911,6 +914,8 @@ def build_graph(
             "fixer_output": output,
             "approved": None,
             "attempt_baseline": baseline,
+            "attempt_targets": targets,
+            "attempt_written": {},
             "used_memory_ids": used_memories,
             "used_skill_refs": used_skills,
             "events": [
@@ -1059,7 +1064,7 @@ def build_graph(
         tools = FileTools(root, writable=True, max_chars=config.output_limit_chars)
         events: list[RunEvent] = []
         baseline = state.get("attempt_baseline", {})
-        written: dict[str, str | None] = {}
+        written = recover_attempt_writes(root, output.edits)
 
         def restore() -> None:
             restore_attempt_writes(root, baseline, written)

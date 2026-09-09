@@ -81,6 +81,7 @@ from evoci.tools.patch import (
     PatchError,
     apply_edit,
     precheck_edits,
+    recover_attempt_writes,
     restore_attempt_writes,
     snapshot_edit_baseline,
 )
@@ -661,7 +662,7 @@ async def _drive_single(
             continue
 
         baseline = snapshot_edit_baseline(workspace, output.edits)
-        written: dict[str, str | None] = {}
+        written = recover_attempt_writes(workspace, output.edits)
         apply_failed = False
         try:
             precheck_edits(workspace, output.edits)

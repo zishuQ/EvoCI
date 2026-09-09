@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -265,24 +264,36 @@ def make_runtime(
 
 @pytest.mark.asyncio
 async def test_send_fans_out_in_parallel_and_fans_in_before_diagnosis(tmp_path: Path) -> None:
+    started: set[str] = set()
+    barrier = asyncio.Event()
+
+    class BarrierInvestigator(FakeInvestigator):
+        async def run(self, **kwargs: object) -> WorkerResult:
+            task = kwargs["task"]
+            assert isinstance(task, InvestigationTask)
+            started.add(task.task_id)
+            if len(started) == 3:
+                barrier.set()
+            # Serial execution cannot release this barrier before the hang timeout.
+            await asyncio.wait_for(barrier.wait(), timeout=3)
+            return await super().run(**kwargs)
+
     coordinator = FakeCoordinator([[task("a"), task("b"), task("c")]])
-    investigator = FakeInvestigator(delay=0.08)
+    investigator = BarrierInvestigator()
     diagnoser = FakeDiagnoser()
     graph = build_graph(
         make_runtime(tmp_path, coordinator, investigator, diagnoser),
         checkpointer=InMemorySaver(),
     )
 
-    started = time.monotonic()
     result = await graph.ainvoke(
         initial_state(tmp_path), {"configurable": {"thread_id": "parallel"}}
     )
-    elapsed = time.monotonic() - started
 
+    assert started == {"a", "b", "c"}
     assert result["status"] == "success"
     assert len(result["evidence"]) == 3
     assert diagnoser.evidence_counts == [3]
-    assert elapsed < 0.20
 
 
 @pytest.mark.asyncio

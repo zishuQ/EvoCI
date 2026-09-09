@@ -59,19 +59,24 @@ class FileTools:
                         return matches
         return matches
 
-    def write_file(self, path: str, content: str) -> None:
+    def write_file(self, path: str, content: str, *, mode: int | None = None) -> None:
         if not self.writable:
             raise PolicyViolation("worker does not have write permission")
         target = self.boundary.resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         # Write beside the destination so a failed/partial write cannot truncate it.
-        mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+        if mode is not None:
+            file_mode = stat.S_IMODE(mode)
+        elif target.exists():
+            file_mode = stat.S_IMODE(target.stat().st_mode)
+        else:
+            file_mode = 0o600
         fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         staged = Path(temporary)
         os.close(fd)
         try:
             staged.write_text(content, encoding="utf-8")
-            staged.chmod(mode)
+            staged.chmod(file_mode)
             os.replace(staged, target)
         finally:
             staged.unlink(missing_ok=True)

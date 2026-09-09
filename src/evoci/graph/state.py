@@ -46,8 +46,9 @@ class EvoCIState(TypedDict, total=False):
     verification_history: Annotated[list[VerificationResult], operator.add]
     review: ReviewResult | None
     approved: bool | None
-    attempt_baseline: dict[str, str | None]
+    attempt_baseline: dict[str, dict[str, str | int | None] | str | None]
     attempt_written: dict[str, str | None]
+    attempt_targets: dict[str, str | None]
     previous_review_blockers: list[str]
     previous_attempt_summary: str | None
 

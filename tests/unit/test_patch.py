@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from evoci.tools.patch import (
     PatchConflict,
     apply_edits,
     precheck_edits,
+    recover_attempt_writes,
     restore_edit_baseline,
     snapshot_edit_baseline,
 )
@@ -57,3 +59,51 @@ def test_restore_is_idempotent(tmp_path: Path) -> None:
     restore_edit_baseline(tmp_path, baseline)
     restore_edit_baseline(tmp_path, baseline)
     assert (tmp_path / "a.txt").read_text() == "old\n"
+
+
+def test_restore_deleted_executable_keeps_mode(tmp_path: Path) -> None:
+    script = tmp_path / "build.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o751)
+    edits = [FileEdit(path="build.sh", delete=True)]
+    baseline = snapshot_edit_baseline(tmp_path, edits)
+    apply_edits(tmp_path, edits)
+    assert not script.exists()
+    restore_edit_baseline(tmp_path, baseline)
+    assert script.read_text() == "#!/bin/sh\nexit 0\n"
+    assert stat.S_IMODE(script.stat().st_mode) == 0o751
+
+
+def test_legacy_string_baseline_still_restores_content(tmp_path: Path) -> None:
+    path = tmp_path / "gone.txt"
+    apply_edits(tmp_path, [FileEdit(path="gone.txt", delete=True)])
+    restore_edit_baseline(tmp_path, {"gone.txt": "legacy\n"})
+    assert path.read_text() == "legacy\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_precheck_accepts_already_applied_edit(tmp_path: Path) -> None:
+    original = "VALUE = 0\n"
+    desired = "VALUE = 1\n"
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    (tmp_path / "a.py").write_text(desired)
+    (tmp_path / "b.py").write_text(original)
+    edits = [
+        FileEdit(path="a.py", content=desired, expected_sha256=digest),
+        FileEdit(path="b.py", content=desired, expected_sha256=digest),
+    ]
+    precheck_edits(tmp_path, edits)
+    assert recover_attempt_writes(tmp_path, edits) == {"a.py": desired}
+
+
+def test_precheck_still_rejects_third_party_change(tmp_path: Path) -> None:
+    original = "VALUE = 0\n"
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    (tmp_path / "a.py").write_text("VALUE = 1\n")
+    (tmp_path / "b.py").write_text("VALUE = 99\n")
+    edits = [
+        FileEdit(path="a.py", content="VALUE = 1\n", expected_sha256=digest),
+        FileEdit(path="b.py", content="VALUE = 1\n", expected_sha256=digest),
+    ]
+    with pytest.raises(PatchConflict, match=r"b\.py"):
+        precheck_edits(tmp_path, edits)
