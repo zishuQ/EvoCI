@@ -15,7 +15,7 @@ from evoci.runtime.budget import RunBudgetManager
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
 from evoci.tools.policy import PolicyViolation
-from evoci.tools.registry import ToolRegistry
+from evoci.tools.registry import RunSkillScriptArgs, ToolRegistry
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -35,13 +35,11 @@ def _serializable(value: Any) -> Any:
 
 
 def _skill_ref_from_arguments(arguments: dict[str, Any]) -> tuple[str, int] | None:
-    skill_id = arguments.get("skill_id")
-    version = arguments.get("version")
-    if not isinstance(skill_id, str) or not skill_id.strip():
+    try:
+        validated = RunSkillScriptArgs.model_validate(arguments)
+    except ValidationError:
         return None
-    if not isinstance(version, int) or version < 1:
-        return None
-    return skill_id, version
+    return validated.skill_id, validated.version
 
 
 def _result_success(result: Any) -> tuple[bool, int | None, str | None]:

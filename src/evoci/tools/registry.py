@@ -17,7 +17,7 @@ from evoci.tools.filesystem import FileTools
 from evoci.tools.git import GitTools
 from evoci.tools.isolation import copy_workspace_with_independent_git
 from evoci.tools.policy import PolicyViolation, WorkerCapabilities
-from evoci.tools.shell import CommandRunner
+from evoci.tools.shell import CommandRunner, run_cancellable
 
 if TYPE_CHECKING:
     from evoci.capability.registry import CapabilityRegistry
@@ -154,6 +154,8 @@ class ToolRegistry:
 
     async def ainvoke(self, name: str, **kwargs: Any) -> Any:
         spec, validated = self._resolve(name, kwargs)
+        if name == "run_skill_script":
+            return await run_cancellable(spec.function, **validated)
         result = spec.function(**validated)
         if inspect.isawaitable(result):
             return await result

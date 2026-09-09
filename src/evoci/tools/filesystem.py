@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,7 +64,17 @@ class FileTools:
             raise PolicyViolation("worker does not have write permission")
         target = self.boundary.resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        # Write beside the destination so a failed/partial write cannot truncate it.
+        mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+        fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        staged = Path(temporary)
+        os.close(fd)
+        try:
+            staged.write_text(content, encoding="utf-8")
+            staged.chmod(mode)
+            os.replace(staged, target)
+        finally:
+            staged.unlink(missing_ok=True)
 
     def apply_patch(self, files: dict[str, str]) -> PatchApplicationResult:
         """Apply a bounded set of full-file replacements through the writer boundary."""

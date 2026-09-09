@@ -479,7 +479,7 @@ async def persist_run_outcome(
                     )
                     assert current is not None
                     if current.manifest.status == "candidate":
-                        validation = runtime.candidate_validator.validate_to_trial(
+                        validation = await runtime.candidate_validator.avalidate_to_trial(
                             created.manifest.skill_id, created.manifest.version
                         )
                         validation_passed = validation.passed

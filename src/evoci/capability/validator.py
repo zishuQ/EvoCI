@@ -15,7 +15,7 @@ from pathlib import Path
 from evoci.capability.models import RegisteredSkill, ValidationResult
 from evoci.capability.registry import CapabilityRegistry
 from evoci.tools.policy import PolicyViolation
-from evoci.tools.shell import CommandRunner, run_grouped_subprocess
+from evoci.tools.shell import CommandRunner, run_cancellable, run_grouped_subprocess
 
 SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -118,6 +118,13 @@ class CandidateValidator:
 
     def validate_to_trial(self, skill_id: str, version: int) -> ValidationResult:
         result = self.validate(skill_id, version)
+        self.registry.transition(skill_id, version, "trial" if result.passed else "rejected")
+        return result
+
+    async def avalidate_to_trial(self, skill_id: str, version: int) -> ValidationResult:
+        # Transition on the caller's thread only after validation has fully completed.
+        # Cancellation joins subprocess cleanup and leaves the candidate unpromoted.
+        result = await run_cancellable(self.validate, skill_id, version)
         self.registry.transition(skill_id, version, "trial" if result.passed else "rejected")
         return result
 

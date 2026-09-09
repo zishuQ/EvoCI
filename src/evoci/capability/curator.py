@@ -322,7 +322,7 @@ class CuratorPipeline:
                     supersedes=sources,
                     operation_key=(f"curator:{run_id}:candidate:{group_key}" if run_id else None),
                 )
-                validation = self.validator.validate_to_trial(
+                validation = await self.validator.avalidate_to_trial(
                     created.manifest.skill_id, created.manifest.version
                 )
                 candidates.append(

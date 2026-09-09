@@ -81,7 +81,7 @@ from evoci.tools.patch import (
     PatchError,
     apply_edit,
     precheck_edits,
-    restore_edit_baseline,
+    restore_attempt_writes,
     snapshot_edit_baseline,
 )
 from evoci.tools.policy import PolicyViolation
@@ -661,13 +661,14 @@ async def _drive_single(
             continue
 
         baseline = snapshot_edit_baseline(workspace, output.edits)
+        written: dict[str, str | None] = {}
         apply_failed = False
         try:
             precheck_edits(workspace, output.edits)
             if output.edits:
                 budget.ensure_tool_calls(len(output.edits))
         except (RepairBudgetExhausted, PatchConflict, PatchError) as exc:
-            restore_edit_baseline(workspace, baseline)
+            restore_attempt_writes(workspace, baseline, written)
             failure_reason = (
                 str(exc)
                 if isinstance(exc, RepairBudgetExhausted)
@@ -699,6 +700,7 @@ async def _drive_single(
                 started = monotonic()
                 try:
                     created, modified = apply_edit(workspace, files, edit)
+                    written[edit.path] = None if edit.delete else edit.content
                 except Exception as exc:
                     failure_reason = f"patch apply failed: {exc}"
                     apply_failed = True
@@ -733,16 +735,16 @@ async def _drive_single(
                     },
                 )
         except BaseException:
-            restore_edit_baseline(workspace, baseline)
+            restore_attempt_writes(workspace, baseline, written)
             raise
         if apply_failed:
-            restore_edit_baseline(workspace, baseline)
+            restore_attempt_writes(workspace, baseline, written)
             previous_summary = failure_reason
             continue
 
         final_blockers = contains_workspace_review_bypass(workspace)
         if final_blockers:
-            restore_edit_baseline(workspace, baseline)
+            restore_attempt_writes(workspace, baseline, written)
             previous_blockers = tuple(final_blockers)
             previous_summary = "; ".join(final_blockers)
             failure_reason = previous_summary
@@ -801,7 +803,7 @@ async def _drive_single(
                 on_command_done=on_command_done,
             )
         except BaseException:
-            restore_edit_baseline(workspace, baseline)
+            restore_attempt_writes(workspace, baseline, written)
             raise
         verification_history.append(verification)
         previous_verification = verification
@@ -810,7 +812,7 @@ async def _drive_single(
             status = "success"
             failure_reason = None
             break
-        restore_edit_baseline(workspace, baseline)
+        restore_attempt_writes(workspace, baseline, written)
         previous_summary = verification.incomplete_reason or next(
             (
                 result.stderr or f"exit code {result.exit_code}"

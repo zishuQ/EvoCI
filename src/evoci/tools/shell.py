@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import selectors
 import signal
 import subprocess
 import tempfile
+import threading
+from collections.abc import Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from evoci.tools.policy import WorkspaceBoundary, validate_command
@@ -41,6 +46,35 @@ def _kill_process_group(process: Any) -> None:
             break
 
 
+_process_cancel: ContextVar[threading.Event | None] = ContextVar("process_cancel", default=None)
+
+
+async def run_cancellable[T](function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run synchronous process work off-loop; cancellation joins its cleanup first."""
+    cancellation = threading.Event()
+    token = _process_cancel.set(cancellation)
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    finally:
+        _process_cancel.reset(token)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancellation.set()
+        # Shield against repeated cancellation too: callers must not remove a workspace
+        # or close its registry while the worker still owns a subprocess.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()
+        raise
+
+
 def run_grouped_subprocess(
     argv: list[str],
     *,
@@ -49,8 +83,12 @@ def run_grouped_subprocess(
     timeout: float,
     max_chars: int,
 ) -> CommandResult:
-    """Synchronous process-group execution with timeout reaping and bounded output."""
-
+    """Drain both pipes incrementally with bounded tails and process-group cleanup."""
+    if max_chars < 1 or timeout <= 0:
+        raise ValueError("timeout and max_chars must be positive")
+    cancellation = _process_cancel.get()
+    if cancellation is not None and cancellation.is_set():
+        raise asyncio.CancelledError()
     process = subprocess.Popen(
         argv,
         cwd=cwd,
@@ -59,48 +97,49 @@ def run_grouped_subprocess(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    tails = [bytearray(), bytearray()]
+    truncated = False
     timed_out = False
+    deadline = monotonic() + timeout
     try:
-        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        with selectors.DefaultSelector() as selector:
+            for index, stream in enumerate((process.stdout, process.stderr)):
+                assert stream is not None
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, index)
+            while selector.get_map() or process.poll() is None:
+                if cancellation is not None and cancellation.is_set():
+                    raise asyncio.CancelledError()
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                for key, _ in selector.select(min(remaining, 0.05)):
+                    chunk = os.read(key.fd, 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    tail = tails[key.data]
+                    tail.extend(chunk)
+                    if len(tail) > max_chars:
+                        del tail[:-max_chars]
+                        truncated = True
+    finally:
+        # Also reap background children after the direct child exits normally.
         _kill_process_group(process)
-        stdout_bytes, stderr_bytes = process.communicate(timeout=2)
-    stdout = (stdout_bytes or b"").decode(errors="replace")
-    stderr = (stderr_bytes or b"").decode(errors="replace")
-    truncated = len(stdout) > max_chars or len(stderr) > max_chars
+        process.wait(timeout=2)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
     return CommandResult(
         argv=tuple(argv),
         cwd=str(cwd),
-        exit_code=process.returncode if process.returncode is not None else -1,
-        stdout=stdout[-max_chars:],
-        stderr=stderr[-max_chars:],
+        exit_code=process.returncode,
+        stdout=tails[0].decode(errors="replace"),
+        stderr=tails[1].decode(errors="replace"),
         timed_out=timed_out,
         truncated=truncated,
     )
-
-
-async def _read_bounded(stream: asyncio.StreamReader | None, limit: int) -> tuple[bytes, bool]:
-    if stream is None:
-        return b"", False
-    buf = bytearray()
-    truncated = False
-    while True:
-        chunk = await stream.read(4096)
-        if not chunk:
-            break
-        if truncated:
-            continue
-        room = limit - len(buf)
-        if room <= 0:
-            truncated = True
-            continue
-        if len(chunk) > room:
-            buf.extend(chunk[:room])
-            truncated = True
-        else:
-            buf.extend(chunk)
-    return bytes(buf), truncated
 
 
 class CommandRunner:
@@ -117,54 +156,12 @@ class CommandRunner:
         network: bool = False,
         extra_env: dict[str, str] | None = None,
     ) -> CommandResult:
-        validate_command(argv, network=network)
-        resolved_cwd = self.boundary.resolve(cwd, must_exist=True)
-        allowed_env_keys = {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV"}
-        environment = {key: value for key, value in os.environ.items() if key in allowed_env_keys}
-        if extra_env:
-            invalid = set(extra_env) - {"CI", "PYTHONPATH", "PYTHONWARNINGS"}
-            if invalid:
-                raise ValueError(f"environment keys are not allowlisted: {sorted(invalid)}")
-            environment.update(extra_env)
-        with tempfile.TemporaryDirectory(prefix="evoci-pycache-") as pycache:
-            environment["PYTHONPYCACHEPREFIX"] = pycache
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=resolved_cwd,
-                env=environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            stdout_task = asyncio.create_task(_read_bounded(process.stdout, self.max_chars))
-            stderr_task = asyncio.create_task(_read_bounded(process.stderr, self.max_chars))
-            waiter = asyncio.create_task(process.wait())
-            timed_out = False
-            try:
-                await asyncio.wait_for(asyncio.shield(waiter), timeout=self.timeout)
-            except TimeoutError:
-                timed_out = True
-                _kill_process_group(process)
-                try:
-                    await asyncio.wait_for(waiter, timeout=2.0)
-                except TimeoutError:
-                    _kill_process_group(process)
-            except asyncio.CancelledError:
-                _kill_process_group(process)
-                waiter.cancel()
-                stdout_task.cancel()
-                stderr_task.cancel()
-                raise
-            stdout_bytes, stdout_truncated = await stdout_task
-            stderr_bytes, stderr_truncated = await stderr_task
-        return CommandResult(
-            argv=tuple(argv),
-            cwd=str(resolved_cwd),
-            exit_code=process.returncode if process.returncode is not None else -1,
-            stdout=stdout_bytes.decode(errors="replace"),
-            stderr=stderr_bytes.decode(errors="replace"),
-            timed_out=timed_out,
-            truncated=stdout_truncated or stderr_truncated,
+        return await run_cancellable(
+            self.run_sync,
+            argv,
+            cwd=cwd,
+            network=network,
+            extra_env=extra_env,
         )
 
     def run_sync(

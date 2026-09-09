@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
-import signal
-import subprocess
 import sys
 from pathlib import Path
 
 from evoci.capability.models import ScriptExecutionResult
 from evoci.capability.registry import CapabilityRegistry
 from evoci.tools.policy import PolicyViolation, WorkspaceBoundary
+from evoci.tools.shell import run_grouped_subprocess
 
 
 def run_skill_script(
@@ -47,30 +46,17 @@ def run_skill_script(
         for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
     }
-    process = subprocess.Popen(
+    completed = run_grouped_subprocess(
         [sys.executable, str(script), *args],
         cwd=resolved_workspace,
         env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
+        timeout=timeout,
+        max_chars=max_chars,
     )
-    timed_out = False
-    try:
-        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            process.kill()
-        stdout_bytes, stderr_bytes = process.communicate(timeout=2)
-    stdout = (stdout_bytes or b"").decode(errors="replace")[-max_chars:]
-    stderr = (stderr_bytes or b"").decode(errors="replace")[-max_chars:]
     return ScriptExecutionResult(
-        exit_code=process.returncode if process.returncode is not None else -1,
-        stdout=stdout,
-        stderr=stderr,
-        timed_out=timed_out,
+        exit_code=completed.exit_code,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        timed_out=completed.timed_out,
         observed_revision=observed_revision,
     )
