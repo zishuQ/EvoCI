@@ -20,6 +20,8 @@ class GitTools:
     async def show(self, revision: str = "HEAD") -> CommandResult:
         if revision.startswith("-") or any(char.isspace() for char in revision):
             raise ValueError("invalid revision")
+        if ":" in revision:
+            return await self.runner.run(["git", "show", revision])
         return await self.runner.run(["git", "show", "--stat", "--oneline", revision])
 
     async def diff(self) -> CommandResult:
