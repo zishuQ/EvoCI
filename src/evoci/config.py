@@ -57,7 +57,9 @@ class EvoCIConfig(BaseModel):
     @classmethod
     def from_env(cls, *, cwd: Path | None = None) -> EvoCIConfig:
         root = (cwd or Path.cwd()).resolve()
-        load_dotenv(root / ".env", override=False)
+        env_file = root / ".env"
+        if env_file.is_file():
+            load_dotenv(env_file, override=False)
 
         def path_value(name: str, default: str) -> Path:
             raw = Path(os.environ.get(name, default))

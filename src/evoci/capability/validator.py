@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import ast
-import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -16,7 +15,7 @@ from pathlib import Path
 from evoci.capability.models import RegisteredSkill, ValidationResult
 from evoci.capability.registry import CapabilityRegistry
 from evoci.tools.policy import PolicyViolation
-from evoci.tools.shell import CommandRunner
+from evoci.tools.shell import CommandRunner, run_grouped_subprocess
 
 SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -36,10 +35,35 @@ FORBIDDEN_TEXT = (
 )
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "requests", "httpx", "urllib", "ftplib"}
 FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "os.system", "os.popen"}
-_PYTEST_COUNT = re.compile(
-    r"(\d+)\s+(passed|failed|error|errors|skipped|deselected)", re.IGNORECASE
-)
-_COLLECTED = re.compile(r"(\d+)\s+tests?\s+collected")
+_PYTEST_PLUGIN = """from __future__ import annotations
+
+import json
+from pathlib import Path
+
+_COUNTS = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+
+
+def pytest_collection_modifyitems(items: list[object]) -> None:
+    _COUNTS["collected"] = len(items)
+
+
+def pytest_runtest_logreport(report: object) -> None:
+    when = getattr(report, "when", "")
+    if when == "setup" and getattr(report, "failed", False):
+        _COUNTS["errors"] += 1
+    if when == "call":
+        if getattr(report, "passed", False):
+            _COUNTS["passed"] += 1
+        elif getattr(report, "failed", False):
+            _COUNTS["failed"] += 1
+        elif getattr(report, "skipped", False):
+            _COUNTS["skipped"] += 1
+
+
+def pytest_sessionfinish(session: object, exitstatus: int) -> None:
+    del session, exitstatus
+    Path("evoci-pytest-report.json").write_text(json.dumps(_COUNTS), encoding="utf-8")
+"""
 
 
 def _python_policy(source: str, path: str) -> list[str]:
@@ -65,18 +89,6 @@ def _python_policy(source: str, path: str) -> list[str]:
             if name in FORBIDDEN_CALLS:
                 errors.append(f"{path}: forbidden call {name}")
     return errors
-
-
-def _pytest_summary(output: str) -> dict[str, int]:
-    counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0, "collected": 0}
-    collected = _COLLECTED.search(output)
-    if collected:
-        counts["collected"] = int(collected.group(1))
-    for count, label in _PYTEST_COUNT.findall(output):
-        key = "error" if label.lower().startswith("error") else label.lower()
-        if key in counts and key != "collected":
-            counts[key] = int(count)
-    return counts
 
 
 class CandidateValidator:
@@ -140,11 +152,7 @@ class CandidateValidator:
     ) -> tuple[str | None, int, int, bool]:
         package = Path(record.package_path)
         tests_dir = package / "tests"
-        test_files = (
-            sorted({*tests_dir.glob("test*.py"), *tests_dir.glob("*_test.py")})
-            if tests_dir.is_dir()
-            else []
-        )
+        test_files = list(tests_dir.rglob("*.py")) if tests_dir.is_dir() else []
         commands = list(record.manifest.verification_commands)
         if not test_files and not commands:
             return None, 0, 0, False
@@ -166,73 +174,63 @@ class CandidateValidator:
         return None, tests_run, len(test_files), True
 
     def _run_pytest(self, copied: Path, file_count: int) -> tuple[str | None, int]:
+        (copied / "evoci_skill_pytest_plugin.py").write_text(_PYTEST_PLUGIN, encoding="utf-8")
         environment = {
             key: value
             for key, value in os.environ.items()
             if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
         }
         environment["PYTHONPATH"] = str(copied)
-        collect_argv = [
+        argv = [
             sys.executable,
             "-m",
             "pytest",
             "tests",
-            "--collect-only",
+            f"--rootdir={copied}",
+            "-p",
+            "evoci_skill_pytest_plugin",
+            "-o",
+            "addopts=",
             "-q",
+            "--tb=short",
         ]
-        try:
-            collected = subprocess.run(
-                collect_argv,
-                cwd=copied,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return "skill tests timed out during collection", 0
-        collect_output = collected.stdout + collected.stderr
-        if collected.returncode != 0:
-            return f"test collection failed: {collect_output[-4_000:]}", 0
-        summary = _pytest_summary(collect_output)
-        collected_count = summary["collected"] or collect_output.count("::")
+        completed = run_grouped_subprocess(
+            argv,
+            cwd=copied,
+            env=environment,
+            timeout=self.timeout,
+            max_chars=8_000,
+        )
+        report_path = copied / "evoci-pytest-report.json"
+        counts = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+        if report_path.is_file():
+            counts.update(json.loads(report_path.read_text(encoding="utf-8")))
+        executed = int(counts["passed"]) + int(counts["failed"]) + int(counts["errors"])
+        collected_count = int(counts["collected"])
+        if completed.timed_out:
+            return "skill tests timed out", executed or file_count
+        if collected_count <= 0 and completed.exit_code != 0:
+            output = (completed.stdout + completed.stderr)[-4_000:]
+            return f"test collection failed: {output}", 0
         if collected_count <= 0:
             return "no tests collected", 0
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", "tests", "-q", "--tb=short"],
-                cwd=copied,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return "skill tests timed out", file_count
-        output = result.stdout + result.stderr
-        counts = _pytest_summary(output)
-        executed = counts["passed"] + counts["failed"] + counts["error"]
-        if result.returncode != 0 or counts["failed"] or counts["error"]:
-            return f"skill tests failed: {output[-4_000:]}", executed or collected_count
+        if completed.exit_code != 0 or counts["failed"] or counts["errors"]:
+            output = (completed.stdout + completed.stderr)[-4_000:]
+            return f"skill tests failed: {output}", executed or collected_count
         if executed <= 0:
             return "zero tests executed", 0
         return None, executed
 
     def _run_verification_commands(self, copied: Path, commands: list[list[str]]) -> str | None:
-        async def run_all() -> str | None:
-            runner = CommandRunner(copied, timeout=self.timeout)
-            for command in commands:
-                try:
-                    completed = await runner.run(command, extra_env={"CI": "1"})
-                except (OSError, PolicyViolation, TypeError, ValueError) as exc:
-                    return f"verification command could not run: {type(exc).__name__}: {exc}"
-                if completed.timed_out:
-                    return f"verification command timed out: {' '.join(command)}"
-                if completed.exit_code != 0:
-                    detail = completed.stderr or f"exit code {completed.exit_code}"
-                    return f"verification command failed: {' '.join(command)}: {detail[-2_000:]}"
-            return None
-
-        return asyncio.run(run_all())
+        runner = CommandRunner(copied, timeout=self.timeout)
+        for command in commands:
+            try:
+                completed = runner.run_sync(command, extra_env={"CI": "1"})
+            except (OSError, PolicyViolation, TypeError, ValueError) as exc:
+                return f"verification command could not run: {type(exc).__name__}: {exc}"
+            if completed.timed_out:
+                return f"verification command timed out: {' '.join(command)}"
+            if completed.exit_code != 0:
+                detail = completed.stderr or f"exit code {completed.exit_code}"
+                return f"verification command failed: {' '.join(command)}: {detail[-2_000:]}"
+        return None

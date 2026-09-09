@@ -47,6 +47,7 @@ class EvoCIState(TypedDict, total=False):
     review: ReviewResult | None
     approved: bool | None
     attempt_baseline: dict[str, str | None]
+    attempt_written: dict[str, str | None]
     previous_review_blockers: list[str]
     previous_attempt_summary: str | None
 

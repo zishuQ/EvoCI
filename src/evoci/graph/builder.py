@@ -54,6 +54,7 @@ from evoci.tools.patch import (
     PatchError,
     apply_edit,
     precheck_edits,
+    restore_attempt_writes,
     restore_edit_baseline,
     snapshot_edit_baseline,
 )
@@ -995,9 +996,17 @@ def build_graph(
             )
         ]
         try:
-            restored, removed = _restore_edit_baseline(
-                Path(state["workspace_path"]), state.get("attempt_baseline", {})
-            )
+            written = state.get("attempt_written")
+            if written is None:
+                restored, removed = _restore_edit_baseline(
+                    Path(state["workspace_path"]), state.get("attempt_baseline", {})
+                )
+            else:
+                restored, removed = restore_attempt_writes(
+                    Path(state["workspace_path"]),
+                    state.get("attempt_baseline", {}),
+                    written,
+                )
         except Exception as exc:
             events.append(
                 _event(
@@ -1050,9 +1059,10 @@ def build_graph(
         tools = FileTools(root, writable=True, max_chars=config.output_limit_chars)
         events: list[RunEvent] = []
         baseline = state.get("attempt_baseline", {})
+        written: dict[str, str | None] = {}
 
         def restore() -> None:
-            _restore_edit_baseline(root, baseline)
+            restore_attempt_writes(root, baseline, written)
 
         def failed(reason: str) -> dict[str, Any]:
             restore()
@@ -1060,6 +1070,7 @@ def build_graph(
                 "phase": "apply_patch",
                 "status": "failed",
                 "failure_reason": reason,
+                "attempt_written": written,
                 "events": events,
             }
 
@@ -1109,6 +1120,18 @@ def build_graph(
                         )
                     )
                     return failed(f"patch apply failed: {exc}")
+                except BaseException:
+                    intended = None if edit.delete else edit.content
+                    target = tools.boundary.resolve(edit.path)
+                    current = (
+                        target.read_text(encoding="utf-8")
+                        if target.exists() and target.is_file()
+                        else None
+                    )
+                    if current == intended:
+                        written[edit.path] = intended
+                    raise
+                written[edit.path] = None if edit.delete else edit.content
                 events.append(
                     _event(
                         runtime,
@@ -1126,7 +1149,7 @@ def build_graph(
                         },
                     )
                 )
-            return {"phase": "apply_patch", "events": events}
+            return {"phase": "apply_patch", "attempt_written": written, "events": events}
         except RepairBudgetExhausted as exc:
             return failed(str(exc))
         except (PatchConflict, PatchError) as exc:
@@ -1202,17 +1225,25 @@ def build_graph(
             )
 
         assert runtime.budget_manager is not None
-        verification = await VerificationService(
-            timeout=config.command_timeout_seconds,
-            max_chars=config.output_limit_chars,
-        ).run(
-            workspace=Path(state["workspace_path"]),
-            mandatory=state["ci_failure"].failed_commands,
-            supplementary=output.proposal.verification_plan,
-            budget=runtime.budget_manager.for_run(state["run_id"]),
-            on_command_start=on_command_start,
-            on_command_done=on_command_done,
-        )
+        try:
+            verification = await VerificationService(
+                timeout=config.command_timeout_seconds,
+                max_chars=config.output_limit_chars,
+            ).run(
+                workspace=Path(state["workspace_path"]),
+                mandatory=state["ci_failure"].failed_commands,
+                supplementary=output.proposal.verification_plan,
+                budget=runtime.budget_manager.for_run(state["run_id"]),
+                on_command_start=on_command_start,
+                on_command_done=on_command_done,
+            )
+        except BaseException:
+            restore_attempt_writes(
+                Path(state["workspace_path"]),
+                state.get("attempt_baseline", {}),
+                state.get("attempt_written") or {},
+            )
+            raise
         if not verification.passed:
             events.append(
                 _event(

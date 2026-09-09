@@ -32,6 +32,27 @@ def snapshot_edit_baseline(root: Path, edits: list[FileEdit]) -> dict[str, str |
     return baseline
 
 
+def restore_attempt_writes(
+    root: Path,
+    baseline: dict[str, str | None],
+    written: dict[str, str | None],
+) -> tuple[list[str], list[str]]:
+    """Restore only files this attempt wrote, and only if they still match that write."""
+
+    subset = {path: baseline.get(path) for path in written}
+    tools = FileTools(root, writable=True)
+    eligible: dict[str, str | None] = {}
+    for path, applied in written.items():
+        target = tools.boundary.resolve(path)
+        current = (
+            target.read_text(encoding="utf-8") if target.exists() and target.is_file() else None
+        )
+        if current != applied:
+            continue
+        eligible[path] = subset.get(path)
+    return restore_edit_baseline(root, eligible)
+
+
 def restore_edit_baseline(
     root: Path, baseline: dict[str, str | None]
 ) -> tuple[list[str], list[str]]:

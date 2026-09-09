@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from time import monotonic
 from typing import Any, TypeVar, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from evoci.domain.models import SkillRef
 from evoci.model.gateway import ToolLoopGateway, ToolLoopMessage
@@ -32,6 +32,16 @@ def _serializable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _skill_ref_from_arguments(arguments: dict[str, Any]) -> tuple[str, int] | None:
+    skill_id = arguments.get("skill_id")
+    version = arguments.get("version")
+    if not isinstance(skill_id, str) or not skill_id.strip():
+        return None
+    if not isinstance(version, int) or version < 1:
+        return None
+    return skill_id, version
 
 
 def _result_success(result: Any) -> tuple[bool, int | None, str | None]:
@@ -185,10 +195,11 @@ class BoundedToolAgent:
                 try:
                     result = await tools.ainvoke(call.name, **call.arguments)
                     success, exit_code, error = _result_success(result)
-                except PolicyViolation as exc:
+                except (PolicyViolation, ValidationError) as exc:
                     rejected = True
                     error = f"{type(exc).__name__}: {exc}"
                 except (KeyError, ValueError, TypeError, RuntimeError, OSError) as exc:
+                    rejected = call.name in {"run_skill_script", "read_skill_resource"}
                     error = f"{type(exc).__name__}: {exc}"
                 serialized = _serializable(result)
                 payload: dict[str, Any] = {
@@ -213,38 +224,37 @@ class BoundedToolAgent:
                     payload=payload,
                 )
                 if call.name == "run_skill_script":
-                    skill_id = str(call.arguments.get("skill_id", ""))
-                    version = int(call.arguments.get("version", 0))
-                    if skill_id and version > 0:
-                        if rejected:
-                            self.recorder.emit(
-                                run_id=run_id,
-                                event_type=EventType.SKILL_INVOCATION_REJECTED,
-                                agent_id=agent_id,
-                                invocation_id=invocation_id,
-                                event_key=call.call_id,
-                                payload={
-                                    "skill_id": skill_id,
-                                    "version": version,
-                                    "resource": call.arguments.get("script_name"),
-                                    "reason": error,
-                                },
-                            )
-                        else:
-                            used_skills.add((skill_id, version))
-                            self.recorder.emit(
-                                run_id=run_id,
-                                event_type=EventType.SKILL_USED,
-                                agent_id=agent_id,
-                                invocation_id=invocation_id,
-                                event_key=call.call_id,
-                                payload={
-                                    "skill_id": skill_id,
-                                    "version": version,
-                                    "resource": call.arguments.get("script_name"),
-                                    "success": success,
-                                },
-                            )
+                    ref = _skill_ref_from_arguments(call.arguments)
+                    resource = call.arguments.get("script_name")
+                    if rejected or result is None:
+                        self.recorder.emit(
+                            run_id=run_id,
+                            event_type=EventType.SKILL_INVOCATION_REJECTED,
+                            agent_id=agent_id,
+                            invocation_id=invocation_id,
+                            event_key=call.call_id,
+                            payload={
+                                "skill_id": None if ref is None else ref[0],
+                                "version": None if ref is None else ref[1],
+                                "resource": resource,
+                                "reason": error,
+                            },
+                        )
+                    elif ref is not None:
+                        used_skills.add(ref)
+                        self.recorder.emit(
+                            run_id=run_id,
+                            event_type=EventType.SKILL_USED,
+                            agent_id=agent_id,
+                            invocation_id=invocation_id,
+                            event_key=call.call_id,
+                            payload={
+                                "skill_id": ref[0],
+                                "version": ref[1],
+                                "resource": resource,
+                                "success": success,
+                            },
+                        )
                 tool_content = {"ok": success, "result": serialized, "error": error}
                 messages.append(
                     ToolLoopMessage(

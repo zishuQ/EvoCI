@@ -322,17 +322,21 @@ def create_worker_registry(
                 )
             may_write = capabilities.write_files and record.manifest.permissions.write_workspace
             script_workspace = workspace if may_write else disposable_workspace()
-            return run_skill_script(
-                capability_registry,
-                skill_id=skill_id,
-                version=version,
-                script_name=script_name,
-                args=args,
-                workspace=script_workspace,
-                timeout=timeout,
-                max_chars=max_chars,
-                observed_revision=workspace_revision,
-            )
+            try:
+                return run_skill_script(
+                    capability_registry,
+                    skill_id=skill_id,
+                    version=version,
+                    script_name=script_name,
+                    args=args,
+                    workspace=script_workspace,
+                    timeout=timeout,
+                    max_chars=max_chars,
+                    observed_revision=workspace_revision,
+                )
+            finally:
+                if may_write:
+                    invalidate_snapshots()
 
         def read_skill_resource(
             skill_id: str,

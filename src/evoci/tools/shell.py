@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from evoci.tools.policy import WorkspaceBoundary, validate_command
 
@@ -24,7 +26,7 @@ class CommandResult:
     truncated: bool = False
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+def _kill_process_group(process: Any) -> None:
     pid = process.pid
     try:
         pgid = os.getpgid(pid)
@@ -37,6 +39,45 @@ def _kill_process_group(process: asyncio.subprocess.Process) -> None:
             with suppress(ProcessLookupError):
                 process.kill()
             break
+
+
+def run_grouped_subprocess(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    max_chars: int,
+) -> CommandResult:
+    """Synchronous process-group execution with timeout reaping and bounded output."""
+
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_process_group(process)
+        stdout_bytes, stderr_bytes = process.communicate(timeout=2)
+    stdout = (stdout_bytes or b"").decode(errors="replace")
+    stderr = (stderr_bytes or b"").decode(errors="replace")
+    truncated = len(stdout) > max_chars or len(stderr) > max_chars
+    return CommandResult(
+        argv=tuple(argv),
+        cwd=str(cwd),
+        exit_code=process.returncode if process.returncode is not None else -1,
+        stdout=stdout[-max_chars:],
+        stderr=stderr[-max_chars:],
+        timed_out=timed_out,
+        truncated=truncated,
+    )
 
 
 async def _read_bounded(stream: asyncio.StreamReader | None, limit: int) -> tuple[bytes, bool]:
@@ -125,3 +166,30 @@ class CommandRunner:
             timed_out=timed_out,
             truncated=stdout_truncated or stderr_truncated,
         )
+
+    def run_sync(
+        self,
+        argv: list[str],
+        *,
+        cwd: str = ".",
+        network: bool = False,
+        extra_env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        validate_command(argv, network=network)
+        resolved_cwd = self.boundary.resolve(cwd, must_exist=True)
+        allowed_env_keys = {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV"}
+        environment = {key: value for key, value in os.environ.items() if key in allowed_env_keys}
+        if extra_env:
+            invalid = set(extra_env) - {"CI", "PYTHONPATH", "PYTHONWARNINGS"}
+            if invalid:
+                raise ValueError(f"environment keys are not allowlisted: {sorted(invalid)}")
+            environment.update(extra_env)
+        with tempfile.TemporaryDirectory(prefix="evoci-pycache-") as pycache:
+            environment["PYTHONPYCACHEPREFIX"] = pycache
+            return run_grouped_subprocess(
+                argv,
+                cwd=resolved_cwd,
+                env=environment,
+                timeout=self.timeout,
+                max_chars=self.max_chars,
+            )

@@ -30,6 +30,7 @@ from evoci.agents.model_agents import (
 from evoci.benchmark.adapters import CIRepairBenchAdapter
 from evoci.benchmark.execution import (
     FailedCommandReplayVerifier,
+    attach_learning_metrics,
     collect_metrics,
     prepare_workspace,
 )
@@ -76,6 +77,8 @@ from evoci.runtime.run_store import SQLiteRunStore
 from evoci.runtime.trajectory import TrajectoryRecorder
 from evoci.tools.filesystem import FileTools
 from evoci.tools.patch import (
+    PatchConflict,
+    PatchError,
     apply_edit,
     precheck_edits,
     restore_edit_baseline,
@@ -663,6 +666,16 @@ async def _drive_single(
             precheck_edits(workspace, output.edits)
             if output.edits:
                 budget.ensure_tool_calls(len(output.edits))
+        except (RepairBudgetExhausted, PatchConflict, PatchError) as exc:
+            restore_edit_baseline(workspace, baseline)
+            failure_reason = (
+                str(exc)
+                if isinstance(exc, RepairBudgetExhausted)
+                else f"patch apply failed: {exc}"
+            )
+            previous_summary = failure_reason
+            continue
+        try:
             for index, edit in enumerate(output.edits):
                 call_id = f"single-apply:{attempt}:{index}"
                 try:
@@ -778,14 +791,18 @@ async def _drive_single(
                 },
             )
 
-        verification = await verifier.run(
-            workspace=workspace,
-            mandatory=failure.failed_commands,
-            supplementary=output.proposal.verification_plan,
-            budget=budget,
-            on_command_start=on_command_start,
-            on_command_done=on_command_done,
-        )
+        try:
+            verification = await verifier.run(
+                workspace=workspace,
+                mandatory=failure.failed_commands,
+                supplementary=output.proposal.verification_plan,
+                budget=budget,
+                on_command_start=on_command_start,
+                on_command_done=on_command_done,
+            )
+        except BaseException:
+            restore_edit_baseline(workspace, baseline)
+            raise
         verification_history.append(verification)
         previous_verification = verification
         if verification.passed:
@@ -1238,6 +1255,20 @@ def benchmark(
                         ),
                     )
                     result.update(learned)
+                    registry_size = (
+                        len(resources.registry.list()) if features.capabilities else 0
+                    )
+                    active_count = (
+                        len(resources.registry.list({"active"})) if features.capabilities else 0
+                    )
+                    metrics = attach_learning_metrics(
+                        metrics,
+                        result=result,
+                        recorder=resources.recorder,
+                        run_id=run_id,
+                        skill_registry_size=registry_size,
+                        active_skill_count=active_count,
+                    )
                 return metrics
             finally:
                 if shared is None:

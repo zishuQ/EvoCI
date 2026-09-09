@@ -21,6 +21,7 @@ from evoci.benchmark.models import (
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
 from evoci.tools.shell import CommandRunner
+from evoci.verification.service import VerificationService
 from evoci.workspace.manager import WorkspaceManager
 
 
@@ -47,9 +48,11 @@ class FailedCommandReplayVerifier:
         self.max_chars = max_chars
 
     async def _run(self, command: list[str], workspace: Path) -> BenchmarkCommandResult:
-        completed = await CommandRunner(
-            workspace, timeout=self.timeout, max_chars=self.max_chars
-        ).run(command, extra_env={"CI": "1"})
+        service = VerificationService(timeout=self.timeout, max_chars=self.max_chars)
+        async with service.isolated_workspace(workspace) as snapshot:
+            completed = await CommandRunner(
+                snapshot, timeout=self.timeout, max_chars=self.max_chars
+            ).run(command, extra_env={"CI": "1"})
         return BenchmarkCommandResult(
             command=command,
             exit_code=completed.exit_code,
@@ -397,4 +400,50 @@ async def collect_metrics(
         skill_updated=int(decision.get("action") == "update_skill"),
         skill_registry_size=skill_registry_size,
         active_skill_count=active_skill_count,
+    )
+
+
+def attach_learning_metrics(
+    metrics: RunMetrics,
+    *,
+    result: dict[str, Any],
+    recorder: TrajectoryRecorder,
+    run_id: str,
+    skill_registry_size: int,
+    active_skill_count: int,
+) -> RunMetrics:
+    """Refresh post-learning fields without re-running the independent oracle."""
+
+    trajectory = recorder.build_view(
+        run_id=run_id,
+        verification_history=result.get("verification_history", []),
+        final_status="success" if result.get("status") == "success" else "failed",
+        failure_reason=result.get("failure_reason"),
+    )
+    events = recorder.events(run_id)
+    skill_candidates = [
+        event for event in events if event.type == EventType.SKILL_CANDIDATE_CREATED
+    ]
+    decision = result.get("learning_decision") or {}
+    return metrics.model_copy(
+        update={
+            "llm_calls": trajectory.model_call_count,
+            "post_run_model_calls": sum(
+                event.type == EventType.MODEL_CALL
+                and event.payload.get("budget_scope") == "post_run"
+                for event in events
+            ),
+            "post_run_tool_calls": sum(
+                event.type == EventType.TOOL_CALL
+                and event.payload.get("budget_scope") == "post_run"
+                for event in events
+            ),
+            "skills_used": len(trajectory.skills_used),
+            "skill_created": sum(
+                event.payload.get("parent_version") is None for event in skill_candidates
+            ),
+            "skill_updated": int(decision.get("action") == "update_skill"),
+            "skill_registry_size": skill_registry_size,
+            "active_skill_count": active_skill_count,
+        }
     )

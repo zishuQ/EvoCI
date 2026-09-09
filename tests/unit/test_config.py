@@ -100,6 +100,7 @@ def test_model_routing_falls_back_to_main_model(monkeypatch, tmp_path: Path) -> 
     monkeypatch.delenv("EVO_MODEL_FAST", raising=False)
     monkeypatch.delenv("EVO_MODEL_STRONG", raising=False)
     monkeypatch.delenv("EVO_MODEL_AUX", raising=False)
+    monkeypatch.delenv("EVO_AUX_MODEL_NAME", raising=False)
     config = EvoCIConfig.from_env(cwd=tmp_path)
     assert (config.fast_model_name or config.model_name) == "main"
     assert (config.strong_model_name or config.model_name) == "main"
@@ -111,6 +112,7 @@ def test_model_routing_uses_fast_for_aux_when_aux_is_unset(monkeypatch, tmp_path
     monkeypatch.setenv("EVO_MODEL_FAST", "fast")
     monkeypatch.delenv("EVO_MODEL_STRONG", raising=False)
     monkeypatch.delenv("EVO_MODEL_AUX", raising=False)
+    monkeypatch.delenv("EVO_AUX_MODEL_NAME", raising=False)
     config = EvoCIConfig.from_env(cwd=tmp_path)
     assert config.fast_model_name == "fast"
     assert (config.strong_model_name or config.model_name) == "main"
