@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import tempfile
 from collections.abc import Callable
@@ -72,6 +73,15 @@ class RunSkillScriptArgs(BaseModel):
     version: int = Field(ge=1)
     script_name: str
     args: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ReadSkillResourceArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    skill_id: str
+    version: int = Field(ge=1)
+    path: str
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=8_000, ge=1, le=32_000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,10 +197,19 @@ def create_worker_registry(
     tool_allowlist: set[str] | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry(capabilities, tool_allowlist=tool_allowlist)
-    files = FileTools(workspace, writable=capabilities.write_files, max_chars=max_chars)
+    file_tools = FileTools(workspace, writable=capabilities.write_files, max_chars=max_chars)
     inspection_runner = CommandRunner(workspace, timeout=timeout, max_chars=max_chars)
     git = GitTools(inspection_runner)
     disposable: Path | None = None
+    workspace_revision = 0
+
+    def invalidate_snapshots() -> None:
+        nonlocal disposable, workspace_revision
+        workspace_revision += 1
+        while registry._temporary_workspaces:
+            registry._temporary_workspaces.pop().cleanup()
+        disposable = None
+        registry.execution_workspace = None
 
     def disposable_workspace() -> Path:
         nonlocal disposable
@@ -208,26 +227,29 @@ def create_worker_registry(
     async def run_bounded_command(argv: list[str], cwd: str = ".", network: bool = False) -> Any:
         if network and not capabilities.network:
             raise PolicyViolation("worker does not have network permission")
-        return await runner.run(argv, cwd=cwd, network=network)
+        result = await runner.run(argv, cwd=cwd, network=network)
+        if capabilities.write_files:
+            invalidate_snapshots()
+        return result
 
     registry.register(
         "read_file",
         "read_files",
-        files.read_file,
+        file_tools.read_file,
         description="Read a UTF-8 text file inside the workspace.",
         args_model=ReadFileArgs,
     )
     registry.register(
         "list_files",
         "read_files",
-        files.list_files,
+        file_tools.list_files,
         description="List files below a workspace-relative path.",
         args_model=ListFilesArgs,
     )
     registry.register(
         "search_code",
         "search_code",
-        files.search_code,
+        file_tools.search_code,
         description="Search workspace text files with a regular expression.",
         args_model=SearchCodeArgs,
     )
@@ -273,10 +295,15 @@ def create_worker_registry(
         description="Run one allowlisted test argv command without a shell.",
         args_model=RunCommandArgs,
     )
+    def apply_patch(files: dict[str, str]) -> Any:
+        result = file_tools.apply_patch(files)
+        invalidate_snapshots()
+        return result
+
     registry.register(
         "apply_patch",
         "write_files",
-        files.apply_patch,
+        apply_patch,
         description="Apply full-file replacements inside the workspace.",
         args_model=ApplyPatchArgs,
     )
@@ -304,7 +331,52 @@ def create_worker_registry(
                 workspace=script_workspace,
                 timeout=timeout,
                 max_chars=max_chars,
+                observed_revision=workspace_revision,
             )
+
+        def read_skill_resource(
+            skill_id: str,
+            version: int,
+            path: str,
+            offset: int = 0,
+            limit: int = 8_000,
+        ) -> dict[str, Any]:
+            if allowed_skill_refs is not None and (skill_id, version) not in allowed_skill_refs:
+                raise PolicyViolation("skill was not selected for this run")
+            record = capability_registry.get(skill_id, version)
+            if record is None:
+                raise KeyError(f"unknown skill: {skill_id} v{version}")
+            if record.manifest.status not in {"trial", "active"}:
+                raise PolicyViolation("only trial or active skill resources may be read")
+            package = Path(record.package_path).resolve()
+            relative = Path(path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise PolicyViolation(f"unsafe skill resource path: {path}")
+            declared = {file.path: file.sha256 for file in record.manifest.files}
+            if path not in declared:
+                raise PolicyViolation("resource is not declared in the skill manifest")
+            target = (package / relative).resolve()
+            if package not in target.parents or not target.is_file():
+                raise PolicyViolation("skill resource escaped the package")
+            if target.is_symlink():
+                raise PolicyViolation("skill resource must not be a symlink")
+            payload = target.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != declared[path]:
+                raise PolicyViolation(f"skill resource hash mismatch: {path}")
+            text = payload.decode("utf-8", errors="replace")
+            fragment = text[offset : offset + limit]
+            return {
+                "skill_id": skill_id,
+                "version": version,
+                "path": path,
+                "offset": offset,
+                "limit": limit,
+                "length": len(text),
+                "truncated": offset + limit < len(text) or offset > 0,
+                "sha256": digest,
+                "content": fragment,
+            }
 
         registry.register(
             "run_skill_script",
@@ -314,5 +386,14 @@ def create_worker_registry(
                 "Run a declared script from a retrieved trial or active capability package."
             ),
             args_model=RunSkillScriptArgs,
+        )
+        registry.register(
+            "read_skill_resource",
+            "read_files",
+            read_skill_resource,
+            description=(
+                "Read a declared reference, template, or other file from a selected skill package."
+            ),
+            args_model=ReadSkillResourceArgs,
         )
     return registry

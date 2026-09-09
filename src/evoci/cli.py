@@ -42,7 +42,10 @@ from evoci.benchmark.models import (
 from evoci.benchmark.runner import BenchmarkRunner
 from evoci.benchmark.variants import VariantFeatures, variant_features
 from evoci.capability.curator import CuratorPipeline, ModelCurator
-from evoci.capability.materializer import CapabilityMaterializer
+from evoci.capability.materializer import (
+    CapabilityMaterializer,
+    resolve_capability_runtime_root,
+)
 from evoci.capability.miner import ExperienceMiner
 from evoci.capability.registry import CapabilityRegistry
 from evoci.capability.retrieval import CapabilityRetriever
@@ -78,6 +81,7 @@ from evoci.tools.patch import (
     restore_edit_baseline,
     snapshot_edit_baseline,
 )
+from evoci.tools.policy import PolicyViolation
 from evoci.verification.service import VerificationService
 
 app = typer.Typer(help="Durable, self-improving multi-agent CI recovery")
@@ -206,7 +210,13 @@ async def _live_resources(
             else None
         ),
         capability_materializer=(
-            CapabilityMaterializer(registry, config.runtime_dir) if enabled.capabilities else None
+            CapabilityMaterializer(
+                registry,
+                config.runtime_dir,
+                allow_relocate=not config.runtime_dir_explicit,
+            )
+            if enabled.capabilities
+            else None
         ),
         experience_miner=ExperienceMiner(aux_gateway) if enabled.capabilities else None,
         candidate_validator=validator if enabled.capabilities else None,
@@ -939,6 +949,14 @@ def run_task(
     if not path.is_file():
         raise typer.BadParameter(f"task file not found: {path}")
     initial = _load_task(path, task_id)
+    try:
+        resolve_capability_runtime_root(
+            config.runtime_dir,
+            Path(str(initial["workspace_path"])),
+            allow_relocate=not config.runtime_dir_explicit,
+        )
+    except PolicyViolation as exc:
+        raise typer.BadParameter(str(exc)) from exc
     run_id = str(initial["run_id"])
 
     async def execute() -> dict[str, Any]:

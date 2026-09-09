@@ -25,6 +25,7 @@ class EvoCIConfig(BaseModel):
     repo_cache_dir: Path = Path(".evoci/repos")
     capability_dir: Path = Path(".evoci/skills")
     runtime_dir: Path = Path(".evoci/runtime")
+    runtime_dir_explicit: bool = False
     model_timeout_seconds: float = Field(default=120.0, gt=0)
     command_timeout_seconds: float = Field(default=120.0, gt=0)
     output_limit_chars: int = Field(default=32_000, ge=1_000)
@@ -79,6 +80,7 @@ class EvoCIConfig(BaseModel):
             repo_cache_dir=path_value("EVO_REPO_CACHE_DIR", ".evoci/repos"),
             capability_dir=path_value("EVO_CAPABILITY_DIR", ".evoci/skills"),
             runtime_dir=path_value("EVO_RUNTIME_DIR", ".evoci/runtime"),
+            runtime_dir_explicit=bool(os.environ.get("EVO_RUNTIME_DIR")),
             model_timeout_seconds=float(os.environ.get("EVO_MODEL_TIMEOUT_SECONDS", "120")),
             command_timeout_seconds=float(os.environ.get("EVO_COMMAND_TIMEOUT_SECONDS", "120")),
             max_leaf_iterations=int(os.environ.get("EVO_MAX_LEAF_ITERATIONS", "8")),

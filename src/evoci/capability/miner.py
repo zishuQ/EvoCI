@@ -73,15 +73,40 @@ class ExperienceMiner:
             or repeated_pattern_detected
         )
 
-    async def decide(self, trajectory: TrajectoryView) -> LearningDecision:
-        return await self.gateway.complete(
-            system_prompt=(
+    async def _complete(
+        self, trajectory: TrajectoryView, *, repair_error: str | None = None
+    ) -> LearningDecision:
+        if repair_error is None:
+            prompt = json.dumps(trajectory.model_dump(mode="json"), default=str)
+            system = (
                 "Decide whether this successful trajectory teaches nothing, a durable fact, a new "
                 "reusable procedure, or an update. For update_skill, identify the exact existing "
                 "target_skill_id and target_version. Skills must generalize beyond the current "
-                "run and preserve useful helper artifacts as package scripts when applicable."
-            ),
-            user_prompt=json.dumps(trajectory.model_dump(mode="json"), default=str),
+                "run and preserve useful helper artifacts as package scripts when applicable. "
+                "When proposing a skill, fill candidate_skill.spec (purpose, when_to_use, "
+                "procedure, pitfalls, verification, bundled_resources). Do not write SKILL.md; "
+                "the runtime renders it. Scripts must be Python."
+            )
+        else:
+            prompt = (
+                f"{json.dumps(trajectory.model_dump(mode='json'), default=str)}\n\n"
+                f"Previous structured output failed validation: {repair_error}. "
+                "Return a complete LearningDecision. If proposing a skill, include a valid spec "
+                "with every required field."
+            )
+            system = (
+                "Repair the previous invalid skill or memory decision. Fill SkillSpec "
+                "fields instead of SKILL.md. This is a content repair, not a network retry."
+            )
+        return await self.gateway.complete(
+            system_prompt=system,
+            user_prompt=prompt,
             response_model=LearningDecision,
             agent_id="experience-miner",
         )
+
+    async def decide(self, trajectory: TrajectoryView) -> LearningDecision:
+        try:
+            return await self._complete(trajectory)
+        except Exception as exc:
+            return await self._complete(trajectory, repair_error=str(exc))

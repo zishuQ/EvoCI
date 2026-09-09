@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ def run_skill_script(
     workspace: Path,
     timeout: float = 30.0,
     max_chars: int = 32_000,
+    observed_revision: int | None = None,
 ) -> ScriptExecutionResult:
     record = registry.get(skill_id, version)
     if record is None:
@@ -37,32 +39,38 @@ def run_skill_script(
     declared = {file.path for file in record.manifest.files}
     if str(script.relative_to(package)) not in declared:
         raise PolicyViolation("script is not declared in manifest")
+    if script.suffix != ".py":
+        raise PolicyViolation(f"unsupported_runner: {script.name}")
     resolved_workspace = WorkspaceBoundary(workspace).resolve(".", must_exist=True)
     environment = {
         key: value
         for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
     }
+    process = subprocess.Popen(
+        [sys.executable, str(script), *args],
+        cwd=resolved_workspace,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
     try:
-        result = subprocess.run(
-            [sys.executable, str(script), *args],
-            cwd=resolved_workspace,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        return ScriptExecutionResult(
-            exit_code=result.returncode,
-            stdout=result.stdout[-max_chars:],
-            stderr=result.stderr[-max_chars:],
-            timed_out=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return ScriptExecutionResult(
-            exit_code=-1,
-            stdout=(exc.stdout or "")[-max_chars:] if isinstance(exc.stdout, str) else "",
-            stderr=(exc.stderr or "")[-max_chars:] if isinstance(exc.stderr, str) else "",
-            timed_out=True,
-        )
+        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            process.kill()
+        stdout_bytes, stderr_bytes = process.communicate(timeout=2)
+    stdout = (stdout_bytes or b"").decode(errors="replace")[-max_chars:]
+    stderr = (stderr_bytes or b"").decode(errors="replace")[-max_chars:]
+    return ScriptExecutionResult(
+        exit_code=process.returncode if process.returncode is not None else -1,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+        observed_revision=observed_revision,
+    )

@@ -83,8 +83,10 @@ def _tool_context_prompt(context: AgentContext) -> str:
     return (
         "Available reusable capabilities are included in the task JSON under `skills`. "
         "Follow an applicable SKILL.md procedure. If it exposes a bundled script, call "
-        "run_skill_script instead of recreating it. Report only memory IDs and skill "
-        "versions that materially influenced the final answer.\n\n"
+        "run_skill_script instead of recreating it. Read declared references or templates "
+        "with read_skill_resource(skill_id, version, path); do not use read_file for "
+        "skill package files. Report only memory IDs and skill versions that materially "
+        "influenced the final answer.\n\n"
         f"Selected capability details:\n{json.dumps(skills, default=str)}"
     )
 

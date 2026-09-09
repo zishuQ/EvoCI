@@ -12,10 +12,45 @@ from evoci.domain.models import SkillHit
 from evoci.tools.policy import PolicyViolation
 
 
+def resolve_capability_runtime_root(
+    runtime_root: Path,
+    workspace: Path,
+    *,
+    allow_relocate: bool,
+) -> Path:
+    target = workspace.resolve()
+    resolved = runtime_root.resolve()
+    inside = resolved == target or target in resolved.parents
+    if not inside:
+        return resolved
+    if not allow_relocate:
+        raise PolicyViolation(
+            "capability runtime root must be outside target workspace; "
+            f"set EVO_RUNTIME_DIR to a directory outside {target}"
+        )
+    digest = hashlib.sha256(str(target).encode()).hexdigest()[:12]
+    relocated = (target.parent / f".evoci-runtime-{digest}").resolve()
+    if relocated == target or target in relocated.parents:
+        relocated = (Path.home() / ".evoci" / "runtime" / digest).resolve()
+    return relocated
+
+
 class CapabilityMaterializer:
-    def __init__(self, registry: CapabilityRegistry, runtime_root: Path) -> None:
+    def __init__(
+        self,
+        registry: CapabilityRegistry,
+        runtime_root: Path,
+        *,
+        allow_relocate: bool = False,
+    ) -> None:
         self.registry = registry
         self.runtime_root = runtime_root.resolve()
+        self.allow_relocate = allow_relocate
+
+    def resolve_runtime_root(self, workspace: Path) -> Path:
+        return resolve_capability_runtime_root(
+            self.runtime_root, workspace, allow_relocate=self.allow_relocate
+        )
 
     def materialize(
         self,
@@ -27,7 +62,7 @@ class CapabilityMaterializer:
         """Materialize immutable skills outside the target repository tree."""
 
         target = workspace.resolve()
-        runtime_root = self.runtime_root
+        runtime_root = self.resolve_runtime_root(target)
         if runtime_root == target or target in runtime_root.parents:
             raise PolicyViolation("capability runtime root must be outside target workspace")
         run_key = hashlib.sha256(run_id.encode()).hexdigest()[:20]
