@@ -31,6 +31,7 @@ class EventType(StrEnum):
     MEMORY_CREATED = "MemoryCreated"
     SKILL_RETRIEVED = "SkillRetrieved"
     SKILL_SELECTED = "SkillSelected"
+    SKILL_INVOCATION_REJECTED = "SkillInvocationRejected"
     SKILL_USED = "SkillUsed"
     SKILL_CANDIDATE_CREATED = "SkillCandidateCreated"
     SKILL_PROMOTED = "SkillPromoted"

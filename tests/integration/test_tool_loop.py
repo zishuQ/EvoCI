@@ -279,6 +279,124 @@ async def test_run_skill_script_is_formal_tool_and_emits_skill_used(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_unselected_skill_invocation_is_rejected_not_counted(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_candidate(skill_candidate())
+    assert (
+        CandidateValidator(registry)
+        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
+        .passed
+    )
+    ref = SkillRef(skill_id=created.manifest.skill_id, version=created.manifest.version)
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="skill-rejected",
+                        name="run_skill_script",
+                        arguments={
+                            "skill_id": ref.skill_id,
+                            "version": ref.version,
+                            "script_name": "inspect.py",
+                            "args": [],
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=registry,
+        allowed_skill_refs=set(),
+    )
+    result = await BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4).run(
+        run_id="skill-reject",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="Use a skill.",
+        task_prompt="Inspect.",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    assert result.used_skill_refs == []
+    events = recorder.events("skill-reject")
+    assert any(event.type == EventType.SKILL_INVOCATION_REJECTED for event in events)
+    assert not any(event.type == EventType.SKILL_USED for event in events)
+    assert registry.stats(ref.skill_id, ref.version).use_count == 0
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_candidate(
+        skill_candidate().model_copy(
+            update={
+                "scripts": [
+                    GeneratedFile(
+                        path="scripts/inspect.py",
+                        content="raise SystemExit(1)\n",
+                    )
+                ]
+            }
+        )
+    )
+    assert (
+        CandidateValidator(registry)
+        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
+        .passed
+    )
+    ref = SkillRef(skill_id=created.manifest.skill_id, version=created.manifest.version)
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="skill-fail",
+                        name="run_skill_script",
+                        arguments={
+                            "skill_id": ref.skill_id,
+                            "version": ref.version,
+                            "script_name": "inspect.py",
+                            "args": [],
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=registry,
+        allowed_skill_refs={(ref.skill_id, ref.version)},
+    )
+    await BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4).run(
+        run_id="skill-fail",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="Use the selected capability.",
+        task_prompt="Inspect.",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    used = [
+        event for event in recorder.events("skill-fail") if event.type == EventType.SKILL_USED
+    ]
+    assert used[0].payload["success"] is False
+    registry.close()
+
+
+@pytest.mark.asyncio
 async def test_trajectory_detects_reusable_helper_created_by_real_tool(tmp_path: Path) -> None:
     gateway = ScriptedToolGateway(
         [

@@ -14,6 +14,7 @@ from evoci.model.gateway import ToolLoopGateway, ToolLoopMessage
 from evoci.runtime.budget import RunBudgetManager
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
+from evoci.tools.policy import PolicyViolation
 from evoci.tools.registry import ToolRegistry
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -180,9 +181,13 @@ class BoundedToolAgent:
                 exit_code: int | None = None
                 error: str | None = None
                 result: Any = None
+                rejected = False
                 try:
                     result = await tools.ainvoke(call.name, **call.arguments)
                     success, exit_code, error = _result_success(result)
+                except PolicyViolation as exc:
+                    rejected = True
+                    error = f"{type(exc).__name__}: {exc}"
                 except (KeyError, ValueError, TypeError, RuntimeError, OSError) as exc:
                     error = f"{type(exc).__name__}: {exc}"
                 serialized = _serializable(result)
@@ -211,20 +216,35 @@ class BoundedToolAgent:
                     skill_id = str(call.arguments.get("skill_id", ""))
                     version = int(call.arguments.get("version", 0))
                     if skill_id and version > 0:
-                        used_skills.add((skill_id, version))
-                        self.recorder.emit(
-                            run_id=run_id,
-                            event_type=EventType.SKILL_USED,
-                            agent_id=agent_id,
-                            invocation_id=invocation_id,
-                            event_key=call.call_id,
-                            payload={
-                                "skill_id": skill_id,
-                                "version": version,
-                                "resource": call.arguments.get("script_name"),
-                                "success": success,
-                            },
-                        )
+                        if rejected:
+                            self.recorder.emit(
+                                run_id=run_id,
+                                event_type=EventType.SKILL_INVOCATION_REJECTED,
+                                agent_id=agent_id,
+                                invocation_id=invocation_id,
+                                event_key=call.call_id,
+                                payload={
+                                    "skill_id": skill_id,
+                                    "version": version,
+                                    "resource": call.arguments.get("script_name"),
+                                    "reason": error,
+                                },
+                            )
+                        else:
+                            used_skills.add((skill_id, version))
+                            self.recorder.emit(
+                                run_id=run_id,
+                                event_type=EventType.SKILL_USED,
+                                agent_id=agent_id,
+                                invocation_id=invocation_id,
+                                event_key=call.call_id,
+                                payload={
+                                    "skill_id": skill_id,
+                                    "version": version,
+                                    "resource": call.arguments.get("script_name"),
+                                    "success": success,
+                                },
+                            )
                 tool_content = {"ok": success, "result": serialized, "error": error}
                 messages.append(
                     ToolLoopMessage(

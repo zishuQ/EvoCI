@@ -42,6 +42,63 @@ def test_memory_retrieval_respects_repo_namespace(tmp_path: Path) -> None:
     store.close()
 
 
+def test_failed_episode_search_keeps_outcome_and_counterevidence(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    store.add_episode(
+        Episode(
+            id="episode-fail",
+            run_id="run-fail",
+            repo="org/a",
+            task_family="test",
+            failure_summary="assertion still fails",
+            root_cause="guessed missing import",
+            attempts=2,
+            hypotheses_attempted=["guessed missing import", "wrong operator"],
+            verification_failures=["TEST_STILL_FAILS", "DO_NOT_REPEAT"],
+            failure_reason="TEST_STILL_FAILS",
+            success=False,
+        )
+    )
+    hits = store.search_episodes("assertion still fails", repo="org/a", limit=3)
+    assert hits
+    content = hits[0].content
+    assert "OUTCOME=failed" in content
+    assert "TEST_STILL_FAILS" in content
+    assert "DO_NOT_REPEAT" in content
+    assert "HYPOTHESIS (unverified)" in content
+    store.close()
+
+
+def test_retrieval_truncation_keeps_outcome_prefix(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    store.add_episode(
+        Episode(
+            id="episode-long",
+            run_id="run-long",
+            repo="org/a",
+            task_family="test",
+            failure_summary="x" * 400,
+            root_cause="unverified cause",
+            attempts=1,
+            verification_failures=["TEST_STILL_FAILS"],
+            failure_reason="TEST_STILL_FAILS",
+            success=False,
+        )
+    )
+    failure = CIFailure(
+        summary="assertion still fails xxxx",
+        log_excerpt="TEST_STILL_FAILS",
+        task_family="test",
+    )
+    retrieved = MemoryRetriever(store, context_limit_chars=80).retrieve(
+        RepoSpec(owner="org", name="a"), failure
+    )
+    episode_hits = [hit for hit in retrieved.hits if hit.memory_id == "episode-long"]
+    assert episode_hits
+    assert episode_hits[0].content.startswith("OUTCOME=failed")
+    store.close()
+
+
 def test_episode_search_is_repo_scoped(tmp_path: Path) -> None:
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
     store.add_episode(

@@ -39,6 +39,46 @@ def _fts_query(text: str) -> str:
     return " OR ".join(f'"{token}"' for token in dict.fromkeys(tokens))
 
 
+def format_episode_content(
+    *,
+    success: bool,
+    failure_summary: str,
+    root_cause: str | None = None,
+    successful_fix: str | None = None,
+    failure_reason: str | None = None,
+    hypotheses: list[str] | None = None,
+    verification_failures: list[str] | None = None,
+) -> str:
+    """Keep outcome and counterevidence visible; mark unverified causes as hypotheses."""
+
+    hypotheses = hypotheses or []
+    verification_failures = verification_failures or []
+    parts = [
+        f"OUTCOME={'success' if success else 'failed'}",
+        failure_summary,
+    ]
+    if failure_reason:
+        parts.append(f"FAILURE_REASON={failure_reason}")
+    if verification_failures:
+        joined = "; ".join(str(item) for item in verification_failures)
+        parts.append(f"VERIFICATION_FAILURES={joined}")
+    if success:
+        if root_cause:
+            parts.append(f"ROOT_CAUSE={root_cause}")
+        if successful_fix:
+            parts.append(f"SUCCESSFUL_FIX={successful_fix}")
+    else:
+        if root_cause:
+            parts.append(f"HYPOTHESIS (unverified): {root_cause}")
+        if hypotheses:
+            parts.append(
+                "HYPOTHESES_ATTEMPTED (unverified): " + "; ".join(str(item) for item in hypotheses)
+            )
+        if successful_fix:
+            parts.append(f"UNCONFIRMED_FIX_SUMMARY={successful_fix}")
+    return " | ".join(part for part in parts if part)
+
+
 class SQLiteMemoryStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,18 +172,14 @@ class SQLiteMemoryStore:
             ),
         )
         if self._connection.execute("SELECT changes()").fetchone()[0]:
-            content = " ".join(
-                filter(
-                    None,
-                    (
-                        episode.failure_summary,
-                        episode.root_cause,
-                        episode.successful_fix_summary,
-                        episode.failure_reason,
-                        *episode.hypotheses_attempted,
-                        *episode.verification_failures,
-                    ),
-                )
+            content = format_episode_content(
+                success=episode.success,
+                failure_summary=episode.failure_summary,
+                root_cause=episode.root_cause,
+                successful_fix=episode.successful_fix_summary,
+                failure_reason=episode.failure_reason,
+                hypotheses=list(episode.hypotheses_attempted),
+                verification_failures=list(episode.verification_failures),
             )
             self._connection.execute(
                 "INSERT INTO episodes_fts(episode_id, content) VALUES (?, ?)",
@@ -280,7 +316,8 @@ class SQLiteMemoryStore:
         rows = self._connection.execute(
             """
             SELECT e.id, e.failure_summary, e.root_cause, e.successful_fix_summary,
-                   bm25(episodes_fts) AS rank
+                   e.hypotheses_attempted, e.verification_failures, e.failure_reason,
+                   e.success, bm25(episodes_fts) AS rank
             FROM episodes_fts
             JOIN episodes e ON e.id = episodes_fts.episode_id
             WHERE episodes_fts MATCH ? AND e.repo = ?
@@ -289,23 +326,42 @@ class SQLiteMemoryStore:
             """,
             (expression, repo, limit),
         ).fetchall()
-        return [
-            MemoryHit(
-                memory_id=str(row["id"]),
-                namespace=f"episode:{repo}",
-                content=" | ".join(
-                    str(value)
-                    for value in (
-                        row["failure_summary"],
-                        row["root_cause"],
-                        row["successful_fix_summary"],
-                    )
-                    if value
+        hits: list[MemoryHit] = []
+        for row in rows:
+            payload = dict(row)
+            for field in ("hypotheses_attempted", "verification_failures"):
+                raw = payload.get(field) or "[]"
+                payload[field] = json.loads(str(raw)) if not isinstance(raw, list) else raw
+            payload["success"] = bool(payload["success"])
+            hits.append(
+                MemoryHit(
+                    memory_id=str(row["id"]),
+                    namespace=f"episode:{repo}",
+                    content=format_episode_content(
+                success=bool(payload["success"]),
+                failure_summary=str(payload.get("failure_summary") or ""),
+                root_cause=(
+                    None if not payload.get("root_cause") else str(payload.get("root_cause"))
                 ),
-                score=1.0 / (1.0 + abs(float(row["rank"]))),
+                successful_fix=(
+                    None
+                    if payload.get("successful_fix_summary") is None
+                    else str(payload.get("successful_fix_summary"))
+                ),
+                failure_reason=(
+                    None
+                    if payload.get("failure_reason") is None
+                    else str(payload.get("failure_reason"))
+                ),
+                hypotheses=[str(item) for item in payload.get("hypotheses_attempted") or []],
+                verification_failures=[
+                    str(item) for item in payload.get("verification_failures") or []
+                ],
+            ),
+                    score=1.0 / (1.0 + abs(float(row["rank"]))),
+                )
             )
-            for row in rows
-        ]
+        return hits
 
     def archive(self, memory_id: str) -> None:
         self._connection.execute(

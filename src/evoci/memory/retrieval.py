@@ -32,8 +32,16 @@ class MemoryRetriever:
         selected: list[MemoryHit] = []
         used_chars = 0
         for hit in retrieved:
-            if used_chars + len(hit.content) > self.context_limit_chars:
-                continue
+            remaining = self.context_limit_chars - used_chars
+            if remaining <= 0:
+                break
+            content = hit.content
+            if len(content) > remaining:
+                marker = "\n[truncated]"
+                keep = max(0, remaining - len(marker))
+                content = content[:keep] + marker
+            if content != hit.content:
+                hit = hit.model_copy(update={"content": content})
             selected.append(hit)
             used_chars += len(hit.content)
         return MemoryRetrieval(
