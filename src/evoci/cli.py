@@ -64,6 +64,7 @@ from evoci.domain.models import (
 )
 from evoci.graph.builder import GraphRuntime, build_graph, persist_run_outcome
 from evoci.graph.routing import contains_review_bypass, contains_workspace_review_bypass
+from evoci.local_task import inspect_repository, parse_verification_command, prepare_local_task
 from evoci.memory.consolidation import ModelMemoryConsolidator
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import SQLiteMemoryStore
@@ -956,6 +957,67 @@ def demo() -> None:
     console.print(f"investigation rounds: {result.get('investigation_round', 0)}")
     console.print(f"repair attempts: {result.get('repair_attempt', 0)}")
     console.print(f"episode: {result.get('episode_id')}")
+
+
+@app.command("fix")
+def fix_repository(
+    command: Annotated[str, typer.Option("--command", "-c", help="Original verification command")],
+    repo: Annotated[Path, typer.Option(help="Repository directory (defaults to current directory)")]
+    = Path("."),
+    description: Annotated[str | None, typer.Option(help="Optional description of the failure")]
+    = None,
+    prepare_only: Annotated[
+        bool, typer.Option(help="Reproduce and save a task without model calls")
+    ] = False,
+) -> None:
+    """Reproduce a command failure and repair the current repository; no task JSON required."""
+    try:
+        argv = parse_verification_command(command)
+        repository = inspect_repository(repo)
+        config = EvoCIConfig.from_env(cwd=repository.root)
+        resolve_capability_runtime_root(
+            config.runtime_dir, repository.root, allow_relocate=not config.runtime_dir_explicit,
+        )
+    except (OSError, ValueError, PolicyViolation) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Repository: {repository.root}")
+    if repository.dirty_status:
+        console.print("检测到已有本地修改; 复现将使用包含这些修改的隔离副本。")
+    console.print("正在隔离副本中复现失败命令...")
+
+    async def execute() -> dict[str, Any]:
+        prepared = await prepare_local_task(repository, argv, config, description=description)
+        console.print(f"Task saved: {prepared.task_file}")
+        console.print(f"Preflight report: {prepared.report_file}")
+        if prepared.preflight.exit_code == 0 and not prepared.preflight.timed_out:
+            console.print("命令已通过, 无需修复; 未调用模型。")
+            return {"status": "already_passing"}
+        if prepare_only:
+            console.print("失败已复现, 任务已保存; 未调用模型。")
+            return {"status": "prepared"}
+        if not config.model_name or not config.model_api_key:
+            console.print("任务已准备。请配置 EVO_MODEL_NAME 和 EVO_MODEL_API_KEY 后重新运行。")
+            return {"status": "configuration_required"}
+        run_id = str(prepared.initial["run_id"])
+        console.print("失败已复现, 开始修复。通过验证的修改将保留在当前仓库。")
+        resources = await _live_resources(config)
+        try:
+            result = await _drive_graph(resources, prepared.initial, run_id)
+            _print_run_summary(result, task_id=run_id)
+            return {"run_id": run_id, "status": result.get("status")}
+        finally:
+            await resources.close()
+
+    try:
+        outcome = asyncio.run(execute())
+    except (OSError, ValueError, PolicyViolation) as exc:
+        console.print(f"无法准备修复任务: {exc}")
+        raise typer.Exit(2) from exc
+    console.print_json(data=outcome)
+    if outcome["status"] == "configuration_required":
+        raise typer.Exit(2)
+    if outcome["status"] not in {"success", "prepared", "already_passing"}:
+        raise typer.Exit(1)
 
 
 @app.command("run")

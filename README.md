@@ -100,6 +100,27 @@ reviewer, checkpoints the run, and writes a condensed episode.
 
 ## CLI
 
+For a local Git repository, provide its normal verification command. EvoCI reproduces the
+failure in a disposable copy, captures the logs, prepares the task automatically, and enters
+the existing repair and learning workflow. A command that already passes uses no model calls.
+
+```bash
+evoci fix --command "python -m pytest -q"
+evoci fix --repo /path/to/repository --command "python -m pytest -q"
+evoci fix --command "python -m pytest -q" --prepare-only
+```
+
+Install with `uv tool install .` to use `evoci` from other repositories. Install the target
+project's test dependencies first and activate its environment. Model settings are read from
+exported `EVO_*` variables or the target repository's `.env`. If using `.env.example`, remove
+`EVO_RUNTIME_DIR` to allow automatic runtime relocation, or set it to an absolute directory
+outside the target repository. `--prepare-only` needs no model credentials and saves a task
+and preflight report under the configured state directory. Existing local edits are included
+in reproduction; successful repair edits are kept in the target repository.
+
+This entrance accepts one argv command, without shell pipes, redirection, or chaining. It
+is intended for reproducible command failures; it does not introduce an interactive chat UI.
+
 ```bash
 evoci doctor
 evoci run TASK_ID --task-file task.json
