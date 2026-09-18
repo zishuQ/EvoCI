@@ -20,7 +20,7 @@ from evoci.capability.curator import DeterministicCurator
 from evoci.capability.promotion import TrialPromotionPolicy
 from evoci.capability.registry import CapabilityRegistry
 from evoci.config import EvoCIConfig
-from evoci.memory.store import SQLiteMemoryStore
+from evoci.memory.store import SQLiteMemoryStore, format_episode_content
 
 
 class CampaignError(RuntimeError):
@@ -184,6 +184,15 @@ class CampaignManager:
         )
         return {name: getattr(self.base_config, name) for name in names}
 
+    def _model_summary(self) -> dict[str, Any]:
+        return {
+            "base_url": self.base_config.model_base_url,
+            "model_name": self.base_config.model_name,
+            "fast_model_name": self.base_config.fast_model_name,
+            "strong_model_name": self.base_config.strong_model_name,
+            "aux_model_name": self.base_config.aux_model_name,
+        }
+
     def prepare_round(
         self,
         round_number: int,
@@ -193,6 +202,16 @@ class CampaignManager:
     ) -> tuple[Path, list[str]]:
         if round_number < 1:
             raise CampaignError("round must be >= 1")
+        for entry in entries:
+            task_path = Path(entry.task_id)
+            if (
+                not entry.task_id
+                or task_path.is_absolute()
+                or ".." in task_path.parts
+                or "/" in entry.task_id
+                or "\\" in entry.task_id
+            ):
+                raise CampaignError(f"unsafe task_id for campaign staging: {entry.task_id!r}")
         metadata = self.initialize()
         parent = self.generations / f"generation-{round_number - 1}"
         parent_meta = _safe_json(parent / "metadata.json", {})
@@ -215,7 +234,10 @@ class CampaignManager:
             if existing.get("parent_generation") != round_number - 1:
                 raise CampaignError("round parent generation does not match campaign lineage")
             warnings = list(existing.get("warnings", []))
-            if existing.get("config") != self._config_summary():
+            if (
+                existing.get("config") != self._config_summary()
+                or existing.get("model") != self._model_summary()
+            ):
                 warning = "critical model budget or campaign configuration changed on resume"
                 if warning not in warnings:
                     warnings.append(warning)
@@ -241,6 +263,7 @@ class CampaignManager:
             "task_ids": [entry.task_id for entry in entries],
             "warnings": warnings,
             "config": self._config_summary(),
+            "model": self._model_summary(),
         }
         _write_json(round_dir / "metadata.json", payload)
         _write_json(round_dir / "status.json", {"status": "running", "completed_tasks": []})
@@ -280,7 +303,15 @@ class CampaignManager:
             task_id = str(row.get("task_id") or row.get("id") or "")
             if task_id not in wanted:
                 continue
-            repo = str(row.get("repo") or row.get("repository") or "")
+            repo_value = row.get("repo") or row.get("repository") or {}
+            if isinstance(repo_value, dict):
+                repo = "/".join(
+                    str(repo_value.get(key, "")).strip("/")
+                    for key in ("owner", "name")
+                    if repo_value.get(key)
+                )
+            else:
+                repo = str(repo_value)
             fail = str(row.get("sha_fail") or row.get("failing_commit") or "")
             if repo and fail:
                 pairs.add((repo, fail))
@@ -293,6 +324,15 @@ class CampaignManager:
         return warnings
 
     def task_config(self, round_number: int, task_id: str, run_id: str) -> EvoCIConfig:
+        task_path = Path(task_id)
+        if (
+            not task_id
+            or task_path.is_absolute()
+            or ".." in task_path.parts
+            or "/" in task_id
+            or "\\" in task_id
+        ):
+            raise CampaignError(f"unsafe task_id for campaign staging: {task_id!r}")
         parent = self.generations / f"generation-{round_number - 1}"
         branch = self.rounds / f"round-{round_number}" / "learning-delta" / task_id
         state = branch / "state"
@@ -392,7 +432,8 @@ class CampaignManager:
         aggregate_path = round_dir / "aggregate.json"
         if not aggregate_path.is_file():
             evaluable = [
-                result for result in results
+                result
+                for result in results
                 if result.metrics is not None
                 and result.metrics.benchmark_verification_status in {"passed", "failed"}
             ]
@@ -401,18 +442,46 @@ class CampaignManager:
                 and result.metrics.benchmark_verification_status == "passed"
                 for result in evaluable
             )
-            _write_json(aggregate_path, {
-                "selected_tasks": len(results),
-                "completed_tasks": len(results),
-                "evaluable_tasks": len(evaluable),
-                "evaluation_coverage": (
-                    len(evaluable) / len(results) if results else None
+            _write_json(
+                aggregate_path,
+                {
+                    "selected_tasks": len(results),
+                    "completed_tasks": len(results),
+                    "evaluable_tasks": len(evaluable),
+                    "evaluation_coverage": (len(evaluable) / len(results) if results else None),
+                    "benchmark_resolved": resolved,
+                    "benchmark_success_rate": (resolved / len(evaluable) if evaluable else None),
+                },
+            )
+        aggregate = _safe_json(aggregate_path, {})
+        inventory = self._skill_inventory(destination)
+        parent_inventory = self._skill_inventory(parent)
+        parent_by_ref = {(item["skill_id"], item["version"]): item for item in parent_inventory}
+        aggregate.update(
+            {
+                "registry_size": len(inventory),
+                "active_skill_count": sum(item["status"] == "active" for item in inventory),
+                "skills_promoted": sum(
+                    item["status"] == "active"
+                    and parent_by_ref.get((item["skill_id"], item["version"]), {}).get("status")
+                    != "active"
+                    for item in inventory
                 ),
-                "benchmark_resolved": resolved,
-                "benchmark_success_rate": (
-                    resolved / len(evaluable) if evaluable else None
+                "skills_rejected": sum(
+                    item["status"] == "rejected"
+                    and parent_by_ref.get((item["skill_id"], item["version"]), {}).get("status")
+                    != "rejected"
+                    for item in inventory
                 ),
-            })
+                "skills_superseded": sum(
+                    item["status"] == "superseded"
+                    and parent_by_ref.get((item["skill_id"], item["version"]), {}).get("status")
+                    != "superseded"
+                    for item in inventory
+                ),
+            }
+        )
+        _write_json(aggregate_path, aggregate)
         _write_json(self.metadata_path, campaign)
         self.write_summary()
         return destination
@@ -423,19 +492,65 @@ class CampaignManager:
             self.generations / f"generation-{round_number - 1}" / "state" / "capabilities.sqlite"
         )
         for branch in sorted(path for path in delta.iterdir() if path.is_dir()):
-            self._merge_sqlite(
-                branch / "state" / "memory.sqlite",
-                target / "state" / "memory.sqlite",
-                (
-                    "episodes",
-                    "episodes_fts",
-                    "semantic_memories",
-                    "semantic_fts",
-                    "applied_operations",
-                ),
+            self._merge_memory(
+                branch / "state" / "memory.sqlite", target / "state" / "memory.sqlite"
             )
             self._merge_skills(branch, target, parent_db)
         self._finalize_skill_lifecycle(round_number, target)
+
+    @staticmethod
+    def _merge_memory(source: Path, target: Path) -> None:
+        if not source.is_file():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(target)
+        try:
+            connection.execute("ATTACH DATABASE ? AS delta", (str(source),))
+            connection.execute("INSERT OR IGNORE INTO main.episodes SELECT * FROM delta.episodes")
+            memory_rows = connection.execute("SELECT * FROM delta.semantic_memories").fetchall()
+            for row in memory_rows:
+                connection.execute(
+                    """
+                    INSERT INTO main.semantic_memories
+                        (id, namespace, content, importance, confidence, source_run_ids,
+                         created_at, updated_at, last_accessed_at, archived)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        namespace=excluded.namespace, content=excluded.content,
+                        importance=excluded.importance, confidence=excluded.confidence,
+                        source_run_ids=excluded.source_run_ids, updated_at=excluded.updated_at,
+                        last_accessed_at=excluded.last_accessed_at, archived=excluded.archived
+                    """,
+                    tuple(row),
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO main.applied_operations "
+                "SELECT * FROM delta.applied_operations"
+            )
+            connection.execute("DELETE FROM main.episodes_fts")
+            connection.execute("DELETE FROM main.semantic_fts")
+            rows = connection.execute(
+                "SELECT id, success, failure_summary, root_cause, "
+                "successful_fix_summary, failure_reason, hypotheses_attempted, "
+                "verification_failures FROM main.episodes"
+            ).fetchall()
+            for row in rows:
+                content = format_episode_content(
+                    success=bool(row[1]),
+                    failure_summary=str(row[2]),
+                    root_cause=row[3],
+                    successful_fix=row[4],
+                    failure_reason=row[5],
+                    hypotheses=json.loads(row[6]),
+                    verification_failures=json.loads(row[7]),
+                )
+                connection.execute("INSERT INTO main.episodes_fts VALUES (?, ?)", (row[0], content))
+            connection.execute(
+                "INSERT INTO main.semantic_fts SELECT id, content FROM main.semantic_memories"
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     @staticmethod
     def _merge_sqlite(source: Path, target: Path, tables: tuple[str, ...]) -> None:
@@ -466,11 +581,7 @@ class CampaignManager:
         target_db = target / "state" / "capabilities.sqlite"
         if not source_db.is_file():
             return
-        # Registry operation keys make independently mined candidates stable. Merge rows whose
-        # version key is free; colliding equivalents are deliberately deduplicated.
-        CampaignManager._merge_sqlite(
-            source_db, target_db, ("skills", "skill_fts", "skill_stats", "applied_operations")
-        )
+        CampaignManager._merge_skill_rows(source_db, target_db, branch, target)
         CampaignManager._merge_existing_skill_stat_deltas(source_db, target_db, parent_db)
         for package in sorted((branch / "skills").glob("*/v*")):
             relative = package.relative_to(branch / "skills")
@@ -478,7 +589,99 @@ class CampaignManager:
             if not destination.exists():
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(package, destination)
+        target_connection = sqlite3.connect(target_db)
+        try:
+            target_connection.execute("DELETE FROM skill_fts")
+            for row in target_connection.execute(
+                "SELECT skill_id,version,manifest_json FROM skills"
+            ):
+                manifest = json.loads(str(row[2]))
+                content = " ".join(
+                    [
+                        manifest["name"],
+                        manifest["description"],
+                        *manifest["triggers"],
+                        *manifest["task_families"],
+                    ]
+                )
+                target_connection.execute(
+                    "INSERT INTO skill_fts(skill_key,content) VALUES (?,?)",
+                    (f"{row[0]}:{row[1]}", content),
+                )
+            target_connection.commit()
+        finally:
+            target_connection.close()
         CampaignManager._relocate_skill_paths(target / "state", target / "skills")
+
+    @staticmethod
+    def _merge_skill_rows(source: Path, target: Path, branch: Path, target_root: Path) -> None:
+        connection = sqlite3.connect(target)
+        connection.row_factory = sqlite3.Row
+        source_connection = sqlite3.connect(source)
+        source_connection.row_factory = sqlite3.Row
+        try:
+            for row in source_connection.execute("SELECT * FROM skills"):
+                skill_id, version = str(row["skill_id"]), int(row["version"])
+                manifest_json = str(row["manifest_json"])
+                existing = connection.execute(
+                    "SELECT manifest_json FROM skills WHERE skill_id=? AND version=?",
+                    (skill_id, version),
+                ).fetchone()
+                if existing is not None:
+                    if json.loads(str(existing[0])) == json.loads(manifest_json):
+                        continue
+                    digest = hashlib.sha256(manifest_json.encode()).hexdigest()[:10]
+                    skill_id = f"{skill_id}-variant-{digest}"
+                    manifest = json.loads(manifest_json)
+                    manifest["skill_id"] = skill_id
+                    manifest_json = json.dumps(manifest, sort_keys=True)
+                    version = 1
+                    source_package = branch / "skills" / str(row["skill_id"]) / f"v{row['version']}"
+                    variant_package = target_root / "skills" / skill_id / "v1"
+                    if source_package.is_dir() and not variant_package.exists():
+                        variant_package.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(source_package, variant_package)
+                connection.execute(
+                    "INSERT OR IGNORE INTO skills "
+                    "(skill_id,version,status,manifest_json,package_path) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        skill_id,
+                        version,
+                        row["status"],
+                        manifest_json,
+                        str(target_root / "skills" / skill_id / f"v{version}"),
+                    ),
+                )
+                stats = source_connection.execute(
+                    "SELECT * FROM skill_stats WHERE skill_id=? AND version=?",
+                    (row["skill_id"], int(row["version"])),
+                ).fetchone()
+                if stats is not None:
+                    values = list(stats)
+                    values[0], values[1] = skill_id, version
+                    columns = [
+                        item[1]
+                        for item in source_connection.execute("PRAGMA table_info(skill_stats)")
+                    ]
+                    connection.execute(
+                        f"INSERT OR IGNORE INTO skill_stats ({','.join(columns)}) "
+                        f"VALUES ({','.join('?' for _ in columns)})",
+                        values,
+                    )
+                operation = source_connection.execute(
+                    "SELECT operation_key,result_json,created_at "
+                    "FROM applied_operations WHERE result_json LIKE ?",
+                    (f'%"skill_id": "{row["skill_id"]}"%',),
+                ).fetchall()
+                for item in operation:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO applied_operations VALUES (?,?,?)", tuple(item)
+                    )
+            connection.commit()
+        finally:
+            source_connection.close()
+            connection.close()
 
     @staticmethod
     def _merge_existing_skill_stat_deltas(source: Path, target: Path, parent: Path) -> None:
