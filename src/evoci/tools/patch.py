@@ -146,7 +146,7 @@ def _file_digest(target: Path) -> str:
     return hashlib.sha256(target.read_bytes()).hexdigest()
 
 
-def precheck_edits(root: Path, edits: list[FileEdit]) -> None:
+def precheck_edits(root: Path, edits: list[FileEdit], *, hash_strict: bool = True) -> None:
     tools = FileTools(root)
     seen: set[str] = set()
     for edit in edits:
@@ -159,7 +159,7 @@ def precheck_edits(root: Path, edits: list[FileEdit]) -> None:
         # Desired-state replay: an already-applied create/update/delete is not a conflict.
         if _read_text_or_none(target) == _intended_content(edit):
             continue
-        if edit.expected_sha256:
+        if edit.expected_sha256 and hash_strict:
             if not target.exists():
                 raise PatchConflict(f"file changed since proposal: {edit.path}")
             actual = _file_digest(target)
@@ -169,13 +169,15 @@ def precheck_edits(root: Path, edits: list[FileEdit]) -> None:
             continue
 
 
-def apply_edit(root: Path, tools: FileTools, edit: FileEdit) -> tuple[list[str], list[str]]:
+def apply_edit(
+    root: Path, tools: FileTools, edit: FileEdit, *, hash_strict: bool = True
+) -> tuple[list[str], list[str]]:
     target = tools.boundary.resolve(edit.path)
     existed = target.exists()
     if edit.delete:
         if not target.exists():
             return [], []
-        if edit.expected_sha256:
+        if edit.expected_sha256 and hash_strict:
             actual = _file_digest(target)
             if actual != edit.expected_sha256:
                 raise PatchConflict(f"file changed since proposal: {edit.path}")
@@ -184,7 +186,7 @@ def apply_edit(root: Path, tools: FileTools, edit: FileEdit) -> tuple[list[str],
     assert edit.content is not None
     if target.exists() and target.read_text(encoding="utf-8") == edit.content:
         return [], []
-    if edit.expected_sha256:
+    if edit.expected_sha256 and hash_strict:
         if not target.exists():
             raise PatchConflict(f"file changed since proposal: {edit.path}")
         actual = _file_digest(target)
@@ -195,13 +197,17 @@ def apply_edit(root: Path, tools: FileTools, edit: FileEdit) -> tuple[list[str],
 
 
 def apply_edits(
-    root: Path, edits: list[FileEdit], *, max_chars: int = 32_000
+    root: Path,
+    edits: list[FileEdit],
+    *,
+    max_chars: int = 32_000,
+    hash_strict: bool = True,
 ) -> tuple[list[str], list[str]]:
     tools = FileTools(root, writable=True, max_chars=max_chars)
     created: list[str] = []
     modified: list[str] = []
     for edit in edits:
-        new_files, changed_files = apply_edit(root, tools, edit)
+        new_files, changed_files = apply_edit(root, tools, edit, hash_strict=hash_strict)
         created.extend(new_files)
         modified.extend(changed_files)
     return created, modified

@@ -1,5 +1,6 @@
 .env
 .evoci/
+quixbugs20/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

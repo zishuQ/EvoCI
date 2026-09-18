@@ -407,8 +407,13 @@ class FakeExperienceMiner:
         del tool_calls, failed_attempts, reusable_script_created, repeated_pattern_detected
         return success
 
-    async def decide(self, trajectory_summary: dict[str, object]) -> LearningDecision:
-        del trajectory_summary
+    async def decide(
+        self,
+        trajectory_summary: dict[str, object],
+        *,
+        existing_skills: object = None,
+    ) -> LearningDecision:
+        del trajectory_summary, existing_skills
         skill_md = """---
 name: assertion-repair
 description: Repair arithmetic assertion failures
@@ -462,8 +467,13 @@ No bundled files are required.
 
 
 class FakeUpdateMiner(FakeExperienceMiner):
-    async def decide(self, trajectory_summary: object) -> LearningDecision:
-        del trajectory_summary
+    async def decide(
+        self,
+        trajectory_summary: object,
+        *,
+        existing_skills: object = None,
+    ) -> LearningDecision:
+        del trajectory_summary, existing_skills
         skill_md = """---
 name: assertion-repair
 description: Improved arithmetic assertion repair
@@ -881,8 +891,13 @@ class RaisingExperienceMiner:
         del kwargs
         return True
 
-    async def decide(self, trajectory: object) -> LearningDecision:
-        del trajectory
+    async def decide(
+        self,
+        trajectory: object,
+        *,
+        existing_skills: object = None,
+    ) -> LearningDecision:
+        del trajectory, existing_skills
         raise RuntimeError("experience mining exploded")
 
 

@@ -320,8 +320,8 @@ class SQLiteMemoryStore:
                    e.success, bm25(episodes_fts) AS rank
             FROM episodes_fts
             JOIN episodes e ON e.id = episodes_fts.episode_id
-            WHERE episodes_fts MATCH ? AND e.repo = ?
-            ORDER BY rank, e.created_at DESC
+            WHERE episodes_fts MATCH ?
+            ORDER BY (e.repo = ?) DESC, rank, e.created_at DESC
             LIMIT ?
             """,
             (expression, repo, limit),

@@ -90,7 +90,8 @@ async def test_n03_validation_obeys_scheduled_cancellation(tmp_path):
     timers = []
 
     class SlowValidationMiner(FakeExperienceMiner):
-        async def decide(self, trajectory_summary):
+        async def decide(self, trajectory_summary, *, existing_skills=None):
+            del existing_skills
             decision = await super().decide(trajectory_summary)
             timers.append(
                 asyncio.get_running_loop().call_later(0.05, asyncio.current_task().cancel)

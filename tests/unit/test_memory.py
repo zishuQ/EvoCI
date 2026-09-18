@@ -99,7 +99,7 @@ def test_retrieval_truncation_keeps_outcome_prefix(tmp_path: Path) -> None:
     store.close()
 
 
-def test_episode_search_is_repo_scoped(tmp_path: Path) -> None:
+def test_episode_search_recalls_across_repos_with_same_repo_priority(tmp_path: Path) -> None:
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
     store.add_episode(
         Episode(
@@ -114,8 +114,23 @@ def test_episode_search_is_repo_scoped(tmp_path: Path) -> None:
             success=True,
         )
     )
-    assert store.search_episodes("pytest import", repo="org/a", limit=3)
-    assert store.search_episodes("pytest import", repo="org/b", limit=3) == []
+    store.add_episode(
+        Episode(
+            id="episode-b",
+            run_id="run-b",
+            repo="org/b",
+            task_family="test",
+            failure_summary="pytest import error in another service",
+            root_cause="module not on sys.path",
+            attempts=1,
+            successful_fix_summary="add src directory to pythonpath",
+            success=True,
+        )
+    )
+    hits_a = store.search_episodes("pytest import", repo="org/a", limit=3)
+    hits_b = store.search_episodes("pytest import", repo="org/b", limit=3)
+    assert [hit.memory_id for hit in hits_a] == ["episode-a", "episode-b"]
+    assert [hit.memory_id for hit in hits_b] == ["episode-b", "episode-a"]
     store.close()
 
 

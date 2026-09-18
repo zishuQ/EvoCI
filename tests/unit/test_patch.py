@@ -31,6 +31,16 @@ def test_hash_mismatch_precheck_does_not_write(tmp_path: Path) -> None:
     assert (tmp_path / "b.txt").read_text() == "keep-b\n"
 
 
+def test_hash_mismatch_is_advisory_when_not_strict(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("keep-a\n")
+    edits = [
+        FileEdit(path="a.txt", content="new-a\n", expected_sha256="0" * 64),
+    ]
+    precheck_edits(tmp_path, edits, hash_strict=False)
+    apply_edits(tmp_path, edits, hash_strict=False)
+    assert (tmp_path / "a.txt").read_text() == "new-a\n"
+
+
 def test_restore_covers_create_update_and_delete(tmp_path: Path) -> None:
     (tmp_path / "update.txt").write_text("old\n")
     (tmp_path / "delete.txt").write_text("gone-later\n")

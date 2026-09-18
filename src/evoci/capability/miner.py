@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Literal, Protocol
+from collections.abc import Sequence
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -49,7 +50,12 @@ class ExperienceMining(Protocol):
         repeated_pattern_detected: bool,
     ) -> bool: ...
 
-    async def decide(self, trajectory: TrajectoryView) -> LearningDecision: ...
+    async def decide(
+        self,
+        trajectory: TrajectoryView,
+        *,
+        existing_skills: Sequence[dict[str, Any]] | None = None,
+    ) -> LearningDecision: ...
 
 
 class ExperienceMiner:
@@ -74,18 +80,36 @@ class ExperienceMiner:
         )
 
     async def _complete(
-        self, trajectory: TrajectoryView, *, repair_error: str | None = None
+        self,
+        trajectory: TrajectoryView,
+        *,
+        existing_skills: Sequence[dict[str, Any]] | None = None,
+        repair_error: str | None = None,
     ) -> LearningDecision:
+        skills = list(existing_skills or [])
+        if skills:
+            registry_block = (
+                "Current skill registry (the only valid update_skill targets):\n"
+                f"{json.dumps(skills)}\n"
+                "For update_skill, set target_skill_id and target_version from this list."
+            )
+        else:
+            registry_block = (
+                "The skill registry is empty. update_skill is not available; "
+                "choose none, memory, or new_skill."
+            )
         if repair_error is None:
             prompt = json.dumps(trajectory.model_dump(mode="json"), default=str)
             system = (
                 "Decide whether this successful trajectory teaches nothing, a durable fact, a new "
-                "reusable procedure, or an update. For update_skill, identify the exact existing "
-                "target_skill_id and target_version. Skills must generalize beyond the current "
+                "reusable procedure, or an update. Skills must generalize beyond the current "
                 "run and preserve useful helper artifacts as package scripts when applicable. "
                 "When proposing a skill, fill candidate_skill.spec (purpose, when_to_use, "
                 "procedure, pitfalls, verification, bundled_resources). Do not write SKILL.md; "
-                "the runtime renders it. Scripts must be Python."
+                "the runtime renders it. Scripts must be Python. Proposing is low-cost: every "
+                "candidate must pass an isolated pytest validator and curator review before it "
+                "is registered, so prefer new_skill over none when the trajectory contains a "
+                f"reusable procedure.\n{registry_block}"
             )
         else:
             prompt = (
@@ -96,7 +120,8 @@ class ExperienceMiner:
             )
             system = (
                 "Repair the previous invalid skill or memory decision. Fill SkillSpec "
-                "fields instead of SKILL.md. This is a content repair, not a network retry."
+                f"fields instead of SKILL.md. This is a content repair, not a network retry.\n"
+                f"{registry_block}"
             )
         return await self.gateway.complete(
             system_prompt=system,
@@ -105,8 +130,15 @@ class ExperienceMiner:
             agent_id="experience-miner",
         )
 
-    async def decide(self, trajectory: TrajectoryView) -> LearningDecision:
+    async def decide(
+        self,
+        trajectory: TrajectoryView,
+        *,
+        existing_skills: Sequence[dict[str, Any]] | None = None,
+    ) -> LearningDecision:
         try:
-            return await self._complete(trajectory)
+            return await self._complete(trajectory, existing_skills=existing_skills)
         except Exception as exc:
-            return await self._complete(trajectory, repair_error=str(exc))
+            return await self._complete(
+                trajectory, existing_skills=existing_skills, repair_error=str(exc)
+            )

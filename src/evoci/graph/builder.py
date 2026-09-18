@@ -433,7 +433,20 @@ async def persist_run_outcome(
                     discriminator="final",
                     payload={"phase": "structured", "budget_scope": "post_run"},
                 )
-                decision = await experience_miner.decide(trajectory)
+                existing_skills = [
+                    {
+                        "skill_id": skill.manifest.skill_id,
+                        "version": skill.manifest.version,
+                        "name": skill.manifest.name,
+                        "description": skill.manifest.description,
+                        "triggers": skill.manifest.triggers,
+                        "task_families": skill.manifest.task_families,
+                    }
+                    for skill in capability_registry.list(statuses={"trial", "active"})
+                ]
+                decision = await experience_miner.decide(
+                    trajectory, existing_skills=existing_skills
+                )
                 capability_registry.record_operation(
                     decision_key, decision.model_dump(mode="json")
                 )
@@ -1080,7 +1093,7 @@ def build_graph(
             }
 
         try:
-            precheck_edits(root, output.edits)
+            precheck_edits(root, output.edits, hash_strict=config.patch_hash_strict)
             if output.edits:
                 assert runtime.budget_manager is not None
                 runtime.budget_manager.for_run(state["run_id"]).ensure_tool_calls(len(output.edits))
@@ -1106,7 +1119,9 @@ def build_graph(
                 )
                 started = monotonic()
                 try:
-                    created, modified = _apply_edit(root, tools, edit)
+                    created, modified = _apply_edit(
+                        root, tools, edit, hash_strict=config.patch_hash_strict
+                    )
                 except Exception as exc:
                     events.append(
                         _event(

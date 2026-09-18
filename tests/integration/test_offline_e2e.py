@@ -32,7 +32,8 @@ from tests.integration.test_graph import (
 
 
 class E2EMiner(FakeExperienceMiner):
-    async def decide(self, trajectory_summary: object) -> object:
+    async def decide(self, trajectory_summary: object, *, existing_skills: object = None) -> object:
+        del existing_skills
         decision = await super().decide(trajectory_summary)
         assert decision.candidate_skill is not None
         skill = decision.candidate_skill.model_copy(

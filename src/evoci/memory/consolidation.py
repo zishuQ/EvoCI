@@ -49,9 +49,11 @@ class ModelMemoryConsolidator:
         }
         return await self.gateway.complete(
             system_prompt=(
-                "Extract one durable fact useful in future CI runs, or none. Keep repo-specific "
-                "facts in repo:<owner>/<repo>, family knowledge in family:<type>, and only truly "
-                "universal knowledge in global:ci."
+                "Extract one durable fact useful in future CI runs, or none. When a non-obvious "
+                "root cause or fix pattern was confirmed, prefer extracting it over returning "
+                "none. Facts that apply to more than one repo must go in family:<type>; use "
+                "global:ci only for truly universal knowledge, and repo:<owner>/<repo> only for "
+                "facts that can never transfer."
             ),
             user_prompt=json.dumps(payload),
             response_model=MemoryCandidate,

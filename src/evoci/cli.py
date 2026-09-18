@@ -665,8 +665,9 @@ async def _drive_single(
         baseline = snapshot_edit_baseline(workspace, output.edits)
         written = recover_attempt_writes(workspace, output.edits)
         apply_failed = False
+        hash_strict = resources.runtime.config.patch_hash_strict
         try:
-            precheck_edits(workspace, output.edits)
+            precheck_edits(workspace, output.edits, hash_strict=hash_strict)
             if output.edits:
                 budget.ensure_tool_calls(len(output.edits))
         except (RepairBudgetExhausted, PatchConflict, PatchError) as exc:
@@ -701,7 +702,9 @@ async def _drive_single(
                 )
                 started = monotonic()
                 try:
-                    created, modified = apply_edit(workspace, files, edit)
+                    created, modified = apply_edit(
+                        workspace, files, edit, hash_strict=hash_strict
+                    )
                     written[edit.path] = None if edit.delete else edit.content
                 except Exception as exc:
                     failure_reason = f"patch apply failed: {exc}"

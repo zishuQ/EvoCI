@@ -37,7 +37,7 @@ class OpenAICompatibleGateway:
         config: EvoCIConfig,
         *,
         model_name: str | None = None,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
     ) -> None:
         resolved_model = model_name or config.model_name
         if not resolved_model:
@@ -139,7 +139,7 @@ class OpenAICompatibleGateway:
             ) as exc:
                 last_error = exc
                 if attempt < self._max_attempts:
-                    await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+                    await asyncio.sleep(2.0 * (2 ** (attempt - 1)))
         raise ModelGatewayError(
             f"model call failed after {self._max_attempts} attempts: {last_error}"
         ) from last_error
