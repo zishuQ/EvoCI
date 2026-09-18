@@ -28,6 +28,7 @@ from evoci.agents.model_agents import (
     ModelReviewer,
 )
 from evoci.benchmark.adapters import CIRepairBenchAdapter
+from evoci.benchmark.campaign import CampaignError, CampaignManager
 from evoci.benchmark.execution import (
     FailedCommandReplayVerifier,
     attach_learning_metrics,
@@ -447,9 +448,7 @@ def _progress_line(
             return _investigation_plan_progress(tasks)
         if agent.startswith("investigator:"):
             count = payload.get("evidence_count", 0)
-            return _investigation_evidence_progress(
-                agent.split(":", 1)[1], count, evidence or []
-            )
+            return _investigation_evidence_progress(agent.split(":", 1)[1], count, evidence or [])
     if event_type == EventType.DIAGNOSIS_CREATED:
         primary = payload.get("diagnosis", {}).get("primary", {})
         root_cause = str(primary.get("root_cause", "根因已确定"))
@@ -457,8 +456,7 @@ def _progress_line(
     if event_type == EventType.PATCH_CREATED:
         files = payload.get("fixer_output", {}).get("proposal", {}).get("changed_files", [])
         summary = (
-            payload.get("fixer_output", {}).get("proposal", {}).get("summary", "")
-            or "未提供说明"
+            payload.get("fixer_output", {}).get("proposal", {}).get("summary", "") or "未提供说明"
         )
         return f"修复方案: {summary} (文件: {', '.join(files) or '无'})"
     if event_type == EventType.VERIFICATION_STARTED:
@@ -673,9 +671,7 @@ async def _drive_single(
         except (RepairBudgetExhausted, PatchConflict, PatchError) as exc:
             restore_attempt_writes(workspace, baseline, written)
             failure_reason = (
-                str(exc)
-                if isinstance(exc, RepairBudgetExhausted)
-                else f"patch apply failed: {exc}"
+                str(exc) if isinstance(exc, RepairBudgetExhausted) else f"patch apply failed: {exc}"
             )
             previous_summary = failure_reason
             continue
@@ -702,9 +698,7 @@ async def _drive_single(
                 )
                 started = monotonic()
                 try:
-                    created, modified = apply_edit(
-                        workspace, files, edit, hash_strict=hash_strict
-                    )
+                    created, modified = apply_edit(workspace, files, edit, hash_strict=hash_strict)
                     written[edit.path] = None if edit.delete else edit.content
                 except Exception as exc:
                     failure_reason = f"patch apply failed: {exc}"
@@ -965,10 +959,12 @@ def demo() -> None:
 @app.command("fix")
 def fix_repository(
     command: Annotated[str, typer.Option("--command", "-c", help="Original verification command")],
-    repo: Annotated[Path, typer.Option(help="Repository directory (defaults to current directory)")]
-    = Path("."),
-    description: Annotated[str | None, typer.Option(help="Optional description of the failure")]
-    = None,
+    repo: Annotated[
+        Path, typer.Option(help="Repository directory (defaults to current directory)")
+    ] = Path("."),
+    description: Annotated[
+        str | None, typer.Option(help="Optional description of the failure")
+    ] = None,
     prepare_only: Annotated[
         bool, typer.Option(help="Reproduce and save a task without model calls")
     ] = False,
@@ -979,7 +975,9 @@ def fix_repository(
         repository = inspect_repository(repo)
         config = EvoCIConfig.from_env(cwd=repository.root)
         resolve_capability_runtime_root(
-            config.runtime_dir, repository.root, allow_relocate=not config.runtime_dir_explicit,
+            config.runtime_dir,
+            repository.root,
+            allow_relocate=not config.runtime_dir_explicit,
         )
     except (OSError, ValueError, PolicyViolation) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -1203,18 +1201,47 @@ def benchmark(
     variant: Annotated[BenchmarkVariant, typer.Option()] = "multi",
     output_dir: Annotated[Path, typer.Option()] = Path("results"),
     continual: Annotated[bool, typer.Option(help="Preserve learned state across tasks")] = False,
+    campaign_dir: Annotated[Path | None, typer.Option(help="Stable campaign directory")] = None,
+    round_number: Annotated[int | None, typer.Option("--round", min=1)] = None,
+    freeze_learning_within_round: Annotated[
+        bool, typer.Option(help="Freeze reads to the parent Generation")
+    ] = False,
+    campaign_strict: Annotated[
+        bool, typer.Option(help="Reject cross-round task/commit overlap")
+    ] = False,
 ) -> None:
     """Execute real benchmark workspaces through the selected runtime ablation."""
     entries = BenchmarkRunner.load_manifest(manifest)
     adapter = CIRepairBenchAdapter(dataset)
     session_id = uuid4().hex[:10]
+    if (campaign_dir is None) != (round_number is None):
+        raise typer.BadParameter("--campaign-dir and --round must be provided together")
+    if campaign_dir is not None and (variant != "evo" or not freeze_learning_within_round):
+        raise typer.BadParameter(
+            "campaign mode requires --variant evo and --freeze-learning-within-round"
+        )
 
     async def execute_benchmark() -> list[BenchmarkResult]:
         base_config = EvoCIConfig.from_env()
         features = variant_features(variant)
+        campaign = (
+            CampaignManager(
+                campaign_dir, variant=variant, base_config=base_config, strict=campaign_strict
+            )
+            if campaign_dir is not None
+            else None
+        )
+        campaign_round_dir: Path | None = None
+        if campaign is not None:
+            assert round_number is not None
+            campaign_round_dir, warnings = campaign.prepare_round(
+                round_number, manifest, dataset, entries
+            )
+            for warning in warnings:
+                console.print(f"[yellow]Campaign warning:[/yellow] {warning}")
         shared: LiveResources | None = None
         task_index = 0
-        if continual:
+        if continual and campaign is None:
             shared_config = _benchmark_runtime_config(
                 base_config,
                 output_dir=output_dir,
@@ -1222,22 +1249,28 @@ def benchmark(
                 session_id=session_id,
                 task_index=None,
             )
-            shared = await _live_resources(
-                shared_config, features, defer_success_learning=True
-            )
+            shared = await _live_resources(shared_config, features, defer_success_learning=True)
 
         async def execute_entry(
             entry: BenchmarkManifestEntry, selected_variant: BenchmarkVariant
         ) -> RunMetrics:
             nonlocal task_index
             task_index += 1
-            run_id = f"bench-{task_index}-{uuid4().hex[:8]}"
-            active_config = _benchmark_runtime_config(
-                base_config,
-                output_dir=output_dir,
-                variant=selected_variant,
-                session_id=session_id,
-                task_index=None if continual else task_index,
+            run_id = (
+                f"campaign-{campaign.root.name}-r{round_number}-{entry.task_id}"
+                if campaign is not None
+                else f"bench-{task_index}-{uuid4().hex[:8]}"
+            )
+            active_config = (
+                campaign.task_config(round_number, entry.task_id, run_id)
+                if campaign is not None and round_number is not None
+                else _benchmark_runtime_config(
+                    base_config,
+                    output_dir=output_dir,
+                    variant=selected_variant,
+                    session_id=session_id,
+                    task_index=None if continual else task_index,
+                )
             )
             resources = shared or await _live_resources(
                 active_config, features, defer_success_learning=True
@@ -1282,6 +1315,14 @@ def benchmark(
                     ),
                     "workspace_path": str(workspace),
                 }
+                if campaign is not None and round_number is not None:
+                    initial["campaign_provenance"] = {
+                        "campaign_id": campaign.root.name,
+                        "round": round_number,
+                        "task_id": entry.task_id,
+                        "run_id": run_id,
+                        "read_generation": round_number - 1,
+                    }
                 started = monotonic()
                 if selected_variant == "single":
                     result = await _drive_single(resources, initial)
@@ -1323,9 +1364,7 @@ def benchmark(
                         ),
                     )
                     result.update(learned)
-                    registry_size = (
-                        len(resources.registry.list()) if features.capabilities else 0
-                    )
+                    registry_size = len(resources.registry.list()) if features.capabilities else 0
                     active_count = (
                         len(resources.registry.list({"active"})) if features.capabilities else 0
                     )
@@ -1343,15 +1382,31 @@ def benchmark(
                     await resources.close()
 
         try:
-            return await BenchmarkRunner(execute_entry).run(
-                entries, variant=variant, output_dir=output_dir
+            run_output = campaign_round_dir or output_dir
+            results = await BenchmarkRunner(execute_entry).run(
+                entries, variant=variant, output_dir=run_output, resume=campaign is not None
             )
+            if campaign is not None and round_number is not None:
+                campaign.finalize_round(round_number, results)
+            return results
         finally:
             if shared is not None:
                 await shared.close()
 
-    results = asyncio.run(execute_benchmark())
-    console.print(f"wrote {len(results)} results to {output_dir}")
+    try:
+        if campaign_dir is not None:
+            base_config = EvoCIConfig.from_env()
+            manager = CampaignManager(
+                campaign_dir, variant=variant, base_config=base_config, strict=campaign_strict
+            )
+            with manager.writer_lock():
+                results = asyncio.run(execute_benchmark())
+        else:
+            results = asyncio.run(execute_benchmark())
+    except CampaignError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    destination = campaign_dir / "rounds" / f"round-{round_number}" if campaign_dir else output_dir
+    console.print(f"wrote {len(results)} results to {destination}")
 
 
 if __name__ == "__main__":

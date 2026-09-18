@@ -28,13 +28,24 @@ class BenchmarkRunner:
         *,
         variant: BenchmarkVariant,
         output_dir: Path,
+        resume: bool = False,
     ) -> list[BenchmarkResult]:
         output_dir.mkdir(parents=True, exist_ok=True)
         runs_path = output_dir / "runs.jsonl"
-        runs_path.write_text("", encoding="utf-8")
+        prior: dict[str, BenchmarkResult] = {}
+        if resume and runs_path.is_file():
+            for line in runs_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    result = BenchmarkResult.model_validate_json(line)
+                    if result.status != "error":
+                        prior[result.task_id] = result
+        else:
+            runs_path.write_text("", encoding="utf-8")
         results: list[BenchmarkResult] = []
         for entry in entries:
-            if entry.skipped:
+            if entry.task_id in prior:
+                result = prior[entry.task_id]
+            elif entry.skipped:
                 result = BenchmarkResult(
                     task_id=entry.task_id,
                     variant=variant,
@@ -115,6 +126,72 @@ class BenchmarkRunner:
             "benchmark_resolved": resolved,
             "benchmark_success_rate": resolved / len(evaluable) if evaluable else None,
         }
+
+        def total(field: str) -> int:
+            return sum(
+                int(getattr(result.metrics, field)) for result in completed if result.metrics
+            )
+
+        def median(field: str) -> float | None:
+            values = sorted(
+                int(getattr(result.metrics, field)) for result in completed if result.metrics
+            )
+            if not values:
+                return None
+            middle = len(values) // 2
+            return (
+                float(values[middle])
+                if len(values) % 2
+                else (values[middle - 1] + values[middle]) / 2
+            )
+
+        aggregate.update(
+            {
+                "selected_tasks": len(results),
+                "completed_tasks": len(completed),
+                "evaluable_tasks": len(evaluable),
+                "total_model_calls": total("llm_calls"),
+                "median_model_calls": median("llm_calls"),
+                "total_tool_calls": total("tool_calls"),
+                "median_tool_calls": median("tool_calls"),
+                "total_attempts": total("repair_attempts"),
+                "median_attempts": median("repair_attempts"),
+                "input_tokens": total("input_tokens"),
+                "output_tokens": total("output_tokens"),
+                "wall_time": sum(
+                    result.metrics.wall_time for result in completed if result.metrics
+                ),
+                "memory_selected": total("memory_selected_count"),
+                "memory_used": total("memory_used_count"),
+                "skills_retrieved": total("skills_retrieved"),
+                "skills_selected": total("skills_selected"),
+                "skills_used": total("skills_used"),
+                "skills_created": total("skill_created"),
+                "skills_updated": total("skill_updated"),
+                "skills_promoted": total("skills_promoted"),
+                "skills_rejected": total("skills_rejected"),
+                "skills_superseded": total("skills_superseded"),
+                "registry_size": max(
+                    (result.metrics.skill_registry_size for result in completed if result.metrics),
+                    default=0,
+                ),
+                "active_skill_count": max(
+                    (result.metrics.active_skill_count for result in completed if result.metrics),
+                    default=0,
+                ),
+                "tokens_per_resolved_task": (
+                    (total("input_tokens") + total("output_tokens")) / resolved
+                    if resolved
+                    else None
+                ),
+                "tool_calls_per_resolved_task": total("tool_calls") / resolved
+                if resolved
+                else None,
+                "attempts_per_resolved_task": total("repair_attempts") / resolved
+                if resolved
+                else None,
+            }
+        )
         (output_dir / "aggregate.json").write_text(
             json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

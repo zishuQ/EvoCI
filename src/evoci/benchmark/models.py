@@ -156,9 +156,13 @@ class RunMetrics(BaseModel):
     memory_selected_count: int = Field(default=0, ge=0)
     memory_used_count: int = Field(default=0, ge=0)
     skills_retrieved: int = Field(default=0, ge=0)
+    skills_selected: int = Field(default=0, ge=0)
     skills_used: int = Field(default=0, ge=0)
     skill_created: int = Field(default=0, ge=0)
     skill_updated: int = Field(default=0, ge=0)
+    skills_promoted: int = Field(default=0, ge=0)
+    skills_rejected: int = Field(default=0, ge=0)
+    skills_superseded: int = Field(default=0, ge=0)
     skill_registry_size: int = Field(default=0, ge=0)
     active_skill_count: int = Field(default=0, ge=0)
 

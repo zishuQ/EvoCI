@@ -393,11 +393,15 @@ async def collect_metrics(
         memory_selected_count=len(trajectory.memories_selected),
         memory_used_count=len(trajectory.memories_used),
         skills_retrieved=len(trajectory.skills_retrieved),
+        skills_selected=len(trajectory.skills_selected),
         skills_used=len(trajectory.skills_used),
         skill_created=sum(
             event.payload.get("parent_version") is None for event in skill_candidates
         ),
         skill_updated=int(decision.get("action") == "update_skill"),
+        skills_promoted=sum(event.type == EventType.SKILL_PROMOTED for event in events),
+        skills_rejected=sum(event.type == EventType.SKILL_REJECTED for event in events),
+        skills_superseded=0,
         skill_registry_size=skill_registry_size,
         active_skill_count=active_skill_count,
     )
@@ -439,10 +443,13 @@ def attach_learning_metrics(
                 for event in events
             ),
             "skills_used": len(trajectory.skills_used),
+            "skills_selected": len(trajectory.skills_selected),
             "skill_created": sum(
                 event.payload.get("parent_version") is None for event in skill_candidates
             ),
             "skill_updated": int(decision.get("action") == "update_skill"),
+            "skills_promoted": sum(event.type == EventType.SKILL_PROMOTED for event in events),
+            "skills_rejected": sum(event.type == EventType.SKILL_REJECTED for event in events),
             "skill_registry_size": skill_registry_size,
             "active_skill_count": active_skill_count,
         }

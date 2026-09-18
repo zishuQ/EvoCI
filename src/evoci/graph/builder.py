@@ -309,9 +309,7 @@ async def persist_run_outcome(
                     tool_calls=trajectory.tool_call_count,
                     attempts=state.get("repair_attempt", 0),
                     patched=bool(trajectory.created_files or trajectory.modified_files),
-                    operation_key=(
-                        f"skill-use:{state['run_id']}:{ref.skill_id}:v{ref.version}"
-                    ),
+                    operation_key=(f"skill-use:{state['run_id']}:{ref.skill_id}:v{ref.version}"),
                 )
                 stats = runtime.capability_registry.stats(ref.skill_id, ref.version)
                 runtime.capability_registry.set_utility(ref, utility_policy.score(stats))
@@ -401,11 +399,7 @@ async def persist_run_outcome(
             learning_error("memory_consolidation", exc)
 
     should_mine = False
-    if (
-        success
-        and runtime.experience_miner is not None
-        and runtime.capability_registry is not None
-    ):
+    if success and runtime.experience_miner is not None and runtime.capability_registry is not None:
         try:
             should_mine = runtime.experience_miner.should_mine(
                 success=True,
@@ -447,9 +441,7 @@ async def persist_run_outcome(
                 decision = await experience_miner.decide(
                     trajectory, existing_skills=existing_skills
                 )
-                capability_registry.record_operation(
-                    decision_key, decision.model_dump(mode="json")
-                )
+                capability_registry.record_operation(decision_key, decision.model_dump(mode="json"))
             else:
                 decision = LearningDecision.model_validate(previous)
             learning_decision = decision.model_dump()
@@ -505,9 +497,7 @@ async def persist_run_outcome(
                         runtime,
                         state,
                         EventType.SKILL_CANDIDATE_CREATED,
-                        discriminator=(
-                            f"{created.manifest.skill_id}:v{created.manifest.version}"
-                        ),
+                        discriminator=(f"{created.manifest.skill_id}:v{created.manifest.version}"),
                         payload={
                             "skill_id": created.manifest.skill_id,
                             "version": created.manifest.version,
@@ -616,7 +606,15 @@ def build_graph(
             "previous_attempt_summary": state.get("previous_attempt_summary"),
             "learning_errors": state.get("learning_errors", []),
             "events": [
-                _event(runtime, state, EventType.RUN_STARTED, payload={"task": state["task_id"]})
+                _event(
+                    runtime,
+                    state,
+                    EventType.RUN_STARTED,
+                    payload={
+                        "task": state["task_id"],
+                        "campaign_provenance": state.get("campaign_provenance"),
+                    },
+                )
             ],
         }
 
@@ -1196,9 +1194,7 @@ def build_graph(
                 payload={
                     "commands": [item.command for item in planned],
                     "oracle_source": (
-                        "harness"
-                        if any(item.source == "mandatory" for item in planned)
-                        else "none"
+                        "harness" if any(item.source == "mandatory" for item in planned) else "none"
                     ),
                 },
             )
@@ -1301,9 +1297,7 @@ def build_graph(
         if verification.status == "unavailable":
             status_update["status"] = "failed"
             failure_reason = verification.incomplete_reason
-        elif (
-            not verification.passed and attempt >= config.max_repair_attempts
-        ):
+        elif not verification.passed and attempt >= config.max_repair_attempts:
             failure_reason = (
                 verification.incomplete_reason
                 or "verification failed after repair budget was exhausted"

@@ -11,6 +11,7 @@ from evoci.benchmark.manifest import generate_balanced_manifest
 from evoci.benchmark.models import (
     AgentTaskView,
     BenchmarkManifestEntry,
+    BenchmarkResult,
     BenchmarkVerificationResult,
     FinalWorkspaceChanges,
     GroundTruth,
@@ -121,6 +122,55 @@ async def test_benchmark_runner_writes_machine_readable_results(tmp_path: Path) 
     assert (tmp_path / "runs.jsonl").is_file()
     assert '"benchmark_success_rate": 1.0' in (tmp_path / "aggregate.json").read_text()
     assert (tmp_path / "by_error_type.csv").is_file()
+
+
+@pytest.mark.asyncio
+async def test_benchmark_runner_resume_retries_errors_only(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del variant
+        calls.append(entry.task_id)
+        return RunMetrics(
+            agent_declared_success=False,
+            targeted_verification_passed=False,
+            review_passed=False,
+            benchmark_verification=BenchmarkVerificationResult(
+                status="not_available", details="offline"
+            ),
+            benchmark_verification_status="not_available",
+            benchmark_resolved=False,
+            final_workspace_changes=FinalWorkspaceChanges(changed_files=[]),
+            wall_time=0.0,
+        )
+
+    completed = BenchmarkResult(
+        task_id="done",
+        variant="evo",
+        status="not_evaluable",
+        metrics=await run_task(BenchmarkManifestEntry(task_id="x", category="x"), "evo"),
+    )
+    error = BenchmarkResult(
+        task_id="retry",
+        variant="evo",
+        status="error",
+        error_type="RuntimeError",
+        error_message="interrupted",
+    )
+    calls.clear()
+    (tmp_path / "runs.jsonl").write_text(
+        completed.model_dump_json() + "\n" + error.model_dump_json() + "\n"
+    )
+    await BenchmarkRunner(run_task).run(
+        [
+            BenchmarkManifestEntry(task_id="done", category="x"),
+            BenchmarkManifestEntry(task_id="retry", category="x"),
+        ],
+        variant="evo",
+        output_dir=tmp_path,
+        resume=True,
+    )
+    assert calls == ["retry"]
 
 
 def test_balanced_manifest_generator_uses_truth_only_for_selection(tmp_path: Path) -> None:

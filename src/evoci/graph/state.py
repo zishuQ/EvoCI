@@ -29,6 +29,7 @@ class EvoCIState(TypedDict, total=False):
     repo: RepoSpec
     ci_failure: CIFailure
     workspace_path: str
+    campaign_provenance: dict[str, object]
 
     phase: str
     investigation_round: int
