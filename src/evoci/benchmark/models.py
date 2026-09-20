@@ -7,9 +7,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BenchmarkVariant = Literal["single", "multi", "multi-memory", "evo"]
-BenchmarkVerificationStatus = Literal["passed", "failed", "not_available"]
-BenchmarkPreflightStatus = Literal["reproduced", "not_reproduced", "not_available"]
-BenchmarkTaskStatus = Literal["resolved", "unresolved", "not_evaluable", "skipped", "error"]
+BenchmarkVerificationStatus = Literal["passed", "failed", "not_available", "infra_error"]
+BenchmarkPreflightStatus = Literal["reproduced", "not_reproduced", "not_available", "infra_error"]
+BenchmarkTaskStatus = Literal[
+    "resolved", "unresolved", "not_evaluable", "skipped", "error", "infra_error"
+]
 
 
 class FailedStep(BaseModel):
@@ -67,6 +69,21 @@ class GroundTruth(BaseModel):
     error_type: str
 
 
+class DockerTaskSpec(BaseModel):
+    """Evaluator-only container configuration; never nested in AgentTaskView."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str
+    official_image: str
+    fail_to_pass: list[str]
+    pass_to_pass: list[str] = Field(default_factory=list)
+    test_patch: str = ""
+    protected_files: list[str] = Field(default_factory=list)
+    reference_patch: str = ""
+    replay_commands: list[list[str]] = Field(default_factory=list)
+
+
 class PreparedTask(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -104,12 +121,27 @@ class BenchmarkCommandResult(BaseModel):
     timed_out: bool = False
 
 
+class EvalAttempt(BaseModel):
+    """One evaluator container run; retries are recorded, not overwritten."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: str
+    ftp_results: dict[str, str] = Field(default_factory=dict)
+    ptp_results: dict[str, str] = Field(default_factory=dict)
+    infra_reason: str | None = None
+
+
 class BenchmarkVerificationResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     status: BenchmarkVerificationStatus
     commands: list[BenchmarkCommandResult] = Field(default_factory=list)
     details: str
+    failure_class: str | None = None
+    ftp_results: dict[str, str] = Field(default_factory=dict)
+    ptp_results: dict[str, str] = Field(default_factory=dict)
+    attempts: list[EvalAttempt] = Field(default_factory=list)
 
 
 class BenchmarkPreflightResult(BaseModel):
@@ -120,6 +152,8 @@ class BenchmarkPreflightResult(BaseModel):
     status: BenchmarkPreflightStatus
     commands: list[BenchmarkCommandResult] = Field(default_factory=list)
     details: str
+    failure_class: str | None = None
+    ftp_results: dict[str, str] = Field(default_factory=dict)
 
 
 class RunMetrics(BaseModel):
@@ -201,13 +235,14 @@ class BenchmarkResult(BaseModel):
             raise ValueError("skipped status requires skipped=true")
         if self.status == "error" and not self.error_message:
             raise ValueError("error status requires error_message")
-        if self.status in {"resolved", "unresolved", "not_evaluable"}:
+        if self.status in {"resolved", "unresolved", "not_evaluable", "infra_error"}:
             if self.metrics is None:
                 raise ValueError("completed task status requires metrics")
             expected = {
                 "passed": "resolved",
                 "failed": "unresolved",
                 "not_available": "not_evaluable",
+                "infra_error": "infra_error",
             }[self.metrics.benchmark_verification_status]
             if self.status != expected:
                 raise ValueError("task status disagrees with benchmark verification")

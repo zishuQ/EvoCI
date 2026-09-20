@@ -45,6 +45,7 @@ class ToolLoopMessage(BaseModel):
 
     role: Literal["system", "user", "assistant", "tool"]
     content: str = ""
+    reasoning_content: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCallRequest] = Field(default_factory=list)
 
@@ -53,6 +54,7 @@ class ToolModelResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     content: str = ""
+    reasoning_content: str | None = None
     tool_calls: list[ToolCallRequest] = Field(default_factory=list)
     input_tokens: int | None = None
     output_tokens: int | None = None

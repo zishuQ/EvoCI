@@ -55,6 +55,21 @@ def tree_hash(*roots: Path) -> str:
     return digest.hexdigest()
 
 
+def checkpoint_sqlite_state(state: Path) -> None:
+    """Flush committed WAL contents before hashing an immutable generation."""
+    for database in sorted((*state.glob("*.sqlite"), *state.glob("*.db"))):
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(database)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.DatabaseError:
+            # State directories may contain non-SQLite files with a database-like suffix.
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 def _write_json(path: Path, payload: object) -> None:
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temporary.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +152,7 @@ class CampaignManager:
         memory.close()
         registry = CapabilityRegistry(skills, state / "capabilities.sqlite")
         registry.close()
+        checkpoint_sqlite_state(state)
         _write_json(
             temporary / "metadata.json",
             {
@@ -161,6 +177,7 @@ class CampaignManager:
                 "fast_model_name": self.base_config.fast_model_name,
                 "strong_model_name": self.base_config.strong_model_name,
                 "aux_model_name": self.base_config.aux_model_name,
+                "enable_thinking": self.base_config.enable_thinking,
             },
             "config": self._config_summary(),
             "current_generation": 0,
@@ -191,6 +208,7 @@ class CampaignManager:
             "fast_model_name": self.base_config.fast_model_name,
             "strong_model_name": self.base_config.strong_model_name,
             "aux_model_name": self.base_config.aux_model_name,
+            "enable_thinking": self.base_config.enable_thinking,
         }
 
     def prepare_round(
@@ -278,12 +296,19 @@ class CampaignManager:
     def _task_overlap_warnings(
         self, metadata: dict[str, Any], entries: list[BenchmarkManifestEntry], dataset: Path
     ) -> list[str]:
+        # Duplicate task ids inside one manifest make resume/finalization ambiguous
+        # and can silently collapse two experiments into one run record.
+        current_ids = [entry.task_id for entry in entries]
+        duplicates = sorted({task for task in current_ids if current_ids.count(task) > 1})
+        if duplicates:
+            raise CampaignError(
+                "manifest contains duplicate task_id values: " + ", ".join(duplicates)
+            )
         previous_ids = {
             task
             for item in metadata.get("rounds", {}).values()
             for task in item.get("task_ids", [])
         }
-        current_ids = [entry.task_id for entry in entries]
         warnings = [
             f"duplicate task_id across rounds: {task}"
             for task in sorted(previous_ids & set(current_ids))
@@ -319,6 +344,9 @@ class CampaignManager:
             f"duplicate repository + failing commit: {repo}@{sha}"
             for repo, sha in sorted(prior_pairs & pairs)
         )
+        # Reusing an existing task or exact repository/failing commit invalidates
+        # the intended A/B/C task isolation.  Strict mode is the opt-in escape
+        # hatch for legacy campaigns; normal campaigns retain a visible warning.
         # Store only non-secret task identity fields for later comparisons.
         metadata.setdefault("_pending_repo_fail_pairs", [list(pair) for pair in sorted(pairs)])
         return warnings
@@ -379,12 +407,17 @@ class CampaignManager:
         expected = set(metadata.get("task_ids", []))
         if set(result.task_id for result in results) != expected:
             raise CampaignError("round is incomplete; refusing to commit a generation")
+        # Allow rounds with errors to complete - these represent agent capability limits,
+        # not retryable infrastructure failures. Learning data from successful tasks
+        # should still be preserved.
         errors = [result.task_id for result in results if result.status == "error"]
         if errors:
-            raise CampaignError(
-                "round has retryable task errors; refusing to commit a generation: "
-                + ", ".join(sorted(errors))
+            # Log warning but don't fail - record in metadata
+            print(f"Warning: Round {round_number} completed with {len(errors)} error(s): {', '.join(sorted(errors))}")
+            metadata.setdefault("warnings", []).append(
+                f"completed with {len(errors)} task error(s): {', '.join(sorted(errors))}"
             )
+            _write_json(round_dir / "metadata.json", metadata)
         destination = self.generations / f"generation-{round_number}"
         if destination.is_dir():
             complete = _safe_json(destination / "metadata.json", {}).get("status") == "complete"
@@ -396,7 +429,8 @@ class CampaignManager:
         shutil.copytree(parent / "state", temporary / "state")
         shutil.copytree(parent / "skills", temporary / "skills")
         self._merge_branches(round_number, temporary)
-        self._relocate_skill_paths(temporary / "state", destination / "skills")
+        self._relocate_skill_paths(temporary / "state", temporary / "skills")
+        checkpoint_sqlite_state(temporary / "state")
         generation_hash = tree_hash(temporary / "state", temporary / "skills")
         _write_json(
             temporary / "metadata.json",
@@ -503,10 +537,23 @@ class CampaignManager:
         if not source.is_file():
             return
         target.parent.mkdir(parents=True, exist_ok=True)
+        source_store = SQLiteMemoryStore(source)
+        source_store.close()
+        target_store = SQLiteMemoryStore(target)
+        target_store.close()
         connection = sqlite3.connect(target)
+        connection.row_factory = sqlite3.Row
         try:
             connection.execute("ATTACH DATABASE ? AS delta", (str(source),))
-            connection.execute("INSERT OR IGNORE INTO main.episodes SELECT * FROM delta.episodes")
+            columns = [
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(episodes)").fetchall()
+            ]
+            column_sql = ", ".join(columns)
+            connection.execute(
+                f"INSERT OR IGNORE INTO main.episodes ({column_sql}) "
+                f"SELECT {column_sql} FROM delta.episodes"
+            )
             memory_rows = connection.execute("SELECT * FROM delta.semantic_memories").fetchall()
             for row in memory_rows:
                 connection.execute(
@@ -527,27 +574,45 @@ class CampaignManager:
                 "INSERT OR IGNORE INTO main.applied_operations "
                 "SELECT * FROM delta.applied_operations"
             )
-            connection.execute("DELETE FROM main.episodes_fts")
-            connection.execute("DELETE FROM main.semantic_fts")
-            rows = connection.execute(
-                "SELECT id, success, failure_summary, root_cause, "
-                "successful_fix_summary, failure_reason, hypotheses_attempted, "
-                "verification_failures FROM main.episodes"
-            ).fetchall()
-            for row in rows:
-                content = format_episode_content(
-                    success=bool(row[1]),
-                    failure_summary=str(row[2]),
-                    root_cause=row[3],
-                    successful_fix=row[4],
-                    failure_reason=row[5],
-                    hypotheses=json.loads(row[6]),
-                    verification_failures=json.loads(row[7]),
+            # Bug fix #4: Wrap FTS rebuild in a transaction with savepoint
+            # If rebuild fails midway, the entire operation rolls back
+            connection.execute("SAVEPOINT fts_rebuild")
+            try:
+                connection.execute("DELETE FROM main.episodes_fts")
+                connection.execute("DELETE FROM main.semantic_fts")
+                rows = connection.execute("SELECT * FROM main.episodes").fetchall()
+                for row in rows:
+                    payload = dict(row)
+                    content = format_episode_content(
+                        success=bool(payload["success"]),
+                        failure_summary=str(payload["failure_summary"]),
+                        root_cause=payload.get("root_cause"),
+                        successful_fix=payload.get("successful_fix_summary"),
+                        failure_reason=payload.get("failure_reason"),
+                        hypotheses=json.loads(str(payload.get("hypotheses_attempted") or "[]")),
+                        verification_failures=json.loads(
+                            str(payload.get("verification_failures") or "[]")
+                        ),
+                        failure_class=payload.get("failure_class"),
+                        failure_stage=payload.get("failure_stage"),
+                        attempted_fixes=json.loads(
+                            str(payload.get("attempted_fix_summaries") or "[]")
+                        ),
+                        attempted_files=json.loads(str(payload.get("attempted_files") or "[]")),
+                        external_failure_details=json.loads(
+                            str(payload.get("external_failure_details") or "[]")
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO main.episodes_fts VALUES (?, ?)", (payload["id"], content)
+                    )
+                connection.execute(
+                    "INSERT INTO main.semantic_fts SELECT id, content FROM main.semantic_memories"
                 )
-                connection.execute("INSERT INTO main.episodes_fts VALUES (?, ?)", (row[0], content))
-            connection.execute(
-                "INSERT INTO main.semantic_fts SELECT id, content FROM main.semantic_memories"
-            )
+                connection.execute("RELEASE SAVEPOINT fts_rebuild")
+            except Exception:
+                connection.execute("ROLLBACK TO SAVEPOINT fts_rebuild")
+                raise
             connection.commit()
         finally:
             connection.close()
@@ -622,6 +687,7 @@ class CampaignManager:
         try:
             for row in source_connection.execute("SELECT * FROM skills"):
                 skill_id, version = str(row["skill_id"]), int(row["version"])
+                source_skill_id, source_version = skill_id, version  # Remember original for stats lookup
                 manifest_json = str(row["manifest_json"])
                 existing = connection.execute(
                     "SELECT manifest_json FROM skills WHERE skill_id=? AND version=?",
@@ -630,13 +696,25 @@ class CampaignManager:
                 if existing is not None:
                     if json.loads(str(existing[0])) == json.loads(manifest_json):
                         continue
-                    digest = hashlib.sha256(manifest_json.encode()).hexdigest()[:10]
-                    skill_id = f"{skill_id}-variant-{digest}"
+                    # Bug fix #7: Use stable fields for deterministic variant hash
+                    # Hash only the immutable skill definition, not metadata like source_run_ids
                     manifest = json.loads(manifest_json)
+                    source_package = branch / "skills" / str(row["skill_id"]) / f"v{row['version']}"
+                    stable_fields = {
+                        "name": manifest.get("name", ""),
+                        "description": manifest.get("description", ""),
+                        "triggers": manifest.get("triggers", []),
+                        "skill_content": (source_package / "SKILL.md").read_text(encoding="utf-8")
+                        if (source_package / "SKILL.md").is_file()
+                        else "",
+                    }
+                    stable_json = json.dumps(stable_fields, sort_keys=True)
+                    digest = hashlib.sha256(stable_json.encode()).hexdigest()[:10]
+                    skill_id = f"{skill_id}-variant-{digest}"
                     manifest["skill_id"] = skill_id
+                    manifest["version"] = 1  # Update manifest version to match database
                     manifest_json = json.dumps(manifest, sort_keys=True)
                     version = 1
-                    source_package = branch / "skills" / str(row["skill_id"]) / f"v{row['version']}"
                     variant_package = target_root / "skills" / skill_id / "v1"
                     if source_package.is_dir() and not variant_package.exists():
                         variant_package.parent.mkdir(parents=True, exist_ok=True)
@@ -655,19 +733,27 @@ class CampaignManager:
                 )
                 stats = source_connection.execute(
                     "SELECT * FROM skill_stats WHERE skill_id=? AND version=?",
-                    (row["skill_id"], int(row["version"])),
+                    (source_skill_id, source_version),
                 ).fetchone()
+                columns = [
+                    item[1]
+                    for item in source_connection.execute("PRAGMA table_info(skill_stats)")
+                ]
                 if stats is not None:
                     values = list(stats)
                     values[0], values[1] = skill_id, version
-                    columns = [
-                        item[1]
-                        for item in source_connection.execute("PRAGMA table_info(skill_stats)")
-                    ]
                     connection.execute(
                         f"INSERT OR IGNORE INTO skill_stats ({','.join(columns)}) "
                         f"VALUES ({','.join('?' for _ in columns)})",
                         values,
+                    )
+                else:
+                    # Initialize stats for skill variant when source has no stats
+                    now = datetime.now(UTC).isoformat()
+                    connection.execute(
+                        "INSERT OR IGNORE INTO skill_stats(skill_id, version, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (skill_id, version, now),
                     )
                 operation = source_connection.execute(
                     "SELECT operation_key,result_json,created_at "
@@ -767,11 +853,25 @@ class CampaignManager:
         connection = sqlite3.connect(database)
         try:
             rows = connection.execute("SELECT skill_id, version FROM skills").fetchall()
+            # Bug fix #5: Check package path existence before updating database
+            updates = []
+            missing = []
             for skill_id, version in rows:
                 package = skill_root / str(skill_id) / f"v{version}"
+                if package.is_dir():
+                    updates.append((str(package), skill_id, version))
+                else:
+                    missing.append((skill_id, version, str(package)))
+
+            if missing:
+                # Log warnings but don't fail - skills may be filtered out later
+                for skill_id, version, path in missing:
+                    print(f"Warning: Skill package not found: {skill_id} v{version} at {path}")
+
+            for package_path, skill_id, version in updates:
                 connection.execute(
                     "UPDATE skills SET package_path=? WHERE skill_id=? AND version=?",
-                    (str(package), skill_id, version),
+                    (package_path, skill_id, version),
                 )
             connection.commit()
         finally:

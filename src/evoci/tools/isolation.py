@@ -32,7 +32,9 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
     shutil.copytree(
         source,
         destination,
-        ignore=shutil.ignore_patterns(".git", ".evoci", ".evoci_runtime"),
+        ignore=shutil.ignore_patterns(
+            ".git", ".evoci", ".evoci_runtime", "__pycache__", "*.pyc", ".pytest_cache"
+        ),
     )
     if not (source / ".git").exists():
         return destination
@@ -44,29 +46,30 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
             raise WorkspaceCopyError(initialized.stderr.strip() or "git init failed")
         return destination
 
-    metadata_clone = destination.parent / f".{destination.name}-git-metadata"
-    if metadata_clone.exists():
-        raise FileExistsError(metadata_clone)
-    cloned = _run_git(
-        "clone",
-        "--no-local",
-        "--no-hardlinks",
-        "--no-checkout",
-        str(source),
-        str(metadata_clone),
-    )
-    if cloned.returncode != 0:
-        raise WorkspaceCopyError(cloned.stderr.strip() or "git metadata clone failed")
-    try:
-        shutil.move(str(metadata_clone / ".git"), str(destination / ".git"))
-    finally:
-        shutil.rmtree(metadata_clone, ignore_errors=True)
+    # Copy the repository metadata locally.  Calling `git clone` here can ask the
+    # source's origin for missing shallow objects, which is both non-deterministic
+    # and invalid for prepared offline benchmark workspaces.
+    git_metadata = source / ".git"
+    preserve_head = git_metadata.is_dir()
+    if git_metadata.is_dir():
+        shutil.copytree(git_metadata, destination / ".git")
+    else:
+        initialized = _run_git("init", "-q", str(destination))
+        if initialized.returncode != 0:
+            raise WorkspaceCopyError(initialized.stderr.strip() or "git init failed")
+        _run_git("-C", str(destination), "config", "user.name", "EvoCI isolated workspace")
+        _run_git("-C", str(destination), "config", "user.email", "evoci-isolated@example.invalid")
+        added = _run_git("-C", str(destination), "add", "--all")
+        committed = _run_git("-C", str(destination), "commit", "-qm", "isolated baseline")
+        if added.returncode != 0 or committed.returncode != 0:
+            raise WorkspaceCopyError(committed.stderr.strip() or "git baseline commit failed")
 
-    updated = _run_git("-C", str(destination), "update-ref", "HEAD", head.stdout.strip())
-    if updated.returncode != 0:
-        raise WorkspaceCopyError(updated.stderr.strip() or "git update-ref failed")
-    reset = _run_git("-C", str(destination), "reset", "--mixed", "HEAD")
-    if reset.returncode != 0:
-        raise WorkspaceCopyError(reset.stderr.strip() or "git reset failed")
+    if preserve_head:
+        updated = _run_git("-C", str(destination), "update-ref", "HEAD", head.stdout.strip())
+        if updated.returncode != 0:
+            raise WorkspaceCopyError(updated.stderr.strip() or "git update-ref failed")
+        reset = _run_git("-C", str(destination), "reset", "--mixed", "HEAD")
+        if reset.returncode != 0:
+            raise WorkspaceCopyError(reset.stderr.strip() or "git reset failed")
     _run_git("-C", str(destination), "remote", "remove", "origin")
     return destination

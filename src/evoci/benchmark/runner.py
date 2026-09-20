@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 from evoci.benchmark.models import (
     BenchmarkManifestEntry,
@@ -29,7 +31,10 @@ class BenchmarkRunner:
         variant: BenchmarkVariant,
         output_dir: Path,
         resume: bool = False,
+        parallelism: int = 1,
     ) -> list[BenchmarkResult]:
+        if parallelism < 1:
+            raise ValueError("parallelism must be >= 1")
         output_dir.mkdir(parents=True, exist_ok=True)
         runs_path = output_dir / "runs.jsonl"
         prior: dict[str, BenchmarkResult] = {}
@@ -37,16 +42,17 @@ class BenchmarkRunner:
             for line in runs_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     result = BenchmarkResult.model_validate_json(line)
-                    if result.status != "error":
+                    if result.status not in {"error", "infra_error"}:
                         prior[result.task_id] = result
         else:
             runs_path.write_text("", encoding="utf-8")
-        results: list[BenchmarkResult] = []
+        results_by_id: dict[str, BenchmarkResult] = {}
+        pending: list[BenchmarkManifestEntry] = []
         for entry in entries:
             if entry.task_id in prior:
-                result = prior[entry.task_id]
+                results_by_id[entry.task_id] = prior[entry.task_id]
             elif entry.skipped:
-                result = BenchmarkResult(
+                results_by_id[entry.task_id] = BenchmarkResult(
                     task_id=entry.task_id,
                     variant=variant,
                     status="skipped",
@@ -55,24 +61,32 @@ class BenchmarkRunner:
                     skip_reason=entry.skip_reason,
                 )
             else:
+                pending.append(entry)
+
+        semaphore = asyncio.Semaphore(parallelism)
+
+        async def execute(entry: BenchmarkManifestEntry) -> BenchmarkResult:
+            async with semaphore:
                 try:
                     metrics = await self.run_task(entry, variant)
-                    task_status: BenchmarkTaskStatus
-                    if metrics.benchmark_verification_status == "passed":
-                        task_status = "resolved"
-                    elif metrics.benchmark_verification_status == "failed":
-                        task_status = "unresolved"
-                    else:
-                        task_status = "not_evaluable"
-                    result = BenchmarkResult(
+                    status = cast(
+                        BenchmarkTaskStatus,
+                        {
+                            "passed": "resolved",
+                            "failed": "unresolved",
+                            "not_available": "not_evaluable",
+                            "infra_error": "infra_error",
+                        }[metrics.benchmark_verification_status],
+                    )
+                    return BenchmarkResult(
                         task_id=entry.task_id,
                         variant=variant,
-                        status=task_status,
+                        status=status,
                         category=entry.category,
                         metrics=metrics,
                     )
                 except Exception as exc:
-                    result = BenchmarkResult(
+                    return BenchmarkResult(
                         task_id=entry.task_id,
                         variant=variant,
                         status="error",
@@ -80,9 +94,14 @@ class BenchmarkRunner:
                         error_type=type(exc).__name__,
                         error_message=str(exc) or type(exc).__name__,
                     )
-            results.append(result)
+
+        tasks = [asyncio.create_task(execute(entry)) for entry in pending]
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            results_by_id[result.task_id] = result
             with runs_path.open("a", encoding="utf-8") as handle:
                 handle.write(result.model_dump_json() + "\n")
+        results = [results_by_id[entry.task_id] for entry in entries]
         self._write_outputs(results, output_dir)
         return results
 
@@ -115,6 +134,11 @@ class BenchmarkRunner:
             and result.metrics.benchmark_verification_status == "not_available"
             for result in completed
         )
+        infra_errors = sum(
+            result.metrics is not None
+            and result.metrics.benchmark_verification_status == "infra_error"
+            for result in completed
+        )
         aggregate = {
             "tasks": len(results),
             "completed": len(completed),
@@ -122,6 +146,7 @@ class BenchmarkRunner:
             "errors": sum(result.status == "error" for result in results),
             "evaluable": len(evaluable),
             "not_available": not_available,
+            "infra_errors": infra_errors,
             "evaluation_coverage": (len(evaluable) / len(completed) if completed else None),
             "benchmark_resolved": resolved,
             "benchmark_success_rate": resolved / len(evaluable) if evaluable else None,

@@ -67,6 +67,25 @@ class ApplyPatchArgs(BaseModel):
     files: dict[str, str]
 
 
+class ReplaceTextArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    old_text: str
+    new_text: str
+    expected_replacements: int = 1
+
+
+class CreateFileArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    content: str
+
+
+class DeleteFileArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+
+
 class RunSkillScriptArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     skill_id: str
@@ -92,6 +111,12 @@ class ToolSpec:
     args_model: type[BaseModel] | None
 
 
+_WRITE_PATH_TOOLS = frozenset(
+    {"apply_patch", "replace_text", "create_file", "delete_file", "run_skill_script"}
+)
+_WRITE_PATH_KEYS = ("created_files", "modified_files", "deleted_files")
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -104,6 +129,34 @@ class ToolRegistry:
         self._tools: dict[str, ToolSpec] = {}
         self._temporary_workspaces: list[tempfile.TemporaryDirectory[str]] = []
         self.execution_workspace: Path | None = None
+        self._changed_paths: set[str] = set()
+
+    def changed_paths(self) -> list[str]:
+        return sorted(self._changed_paths)
+
+    def _record_changed_paths(self, name: str, result: Any) -> None:
+        if name not in _WRITE_PATH_TOOLS:
+            return
+        if isinstance(result, BaseModel):
+            payload = result.model_dump()
+        elif isinstance(result, dict):
+            payload = result
+        else:
+            return
+        if name == "run_skill_script":
+            if not self.capabilities.write_files:
+                return
+            if payload.get("exit_code") not in {0, None} or payload.get("timed_out"):
+                return
+            if not any(key in payload for key in _WRITE_PATH_KEYS):
+                return
+        for key in _WRITE_PATH_KEYS:
+            paths = payload.get(key) or []
+            if not isinstance(paths, list):
+                continue
+            for path in paths:
+                if isinstance(path, str) and path:
+                    self._changed_paths.add(path)
 
     def own_temporary_workspace(
         self, temporary: tempfile.TemporaryDirectory[str], workspace: Path
@@ -150,15 +203,18 @@ class ToolRegistry:
         result = spec.function(**validated)
         if inspect.isawaitable(result):
             raise RuntimeError(f"tool {name} is asynchronous; use ainvoke")
+        self._record_changed_paths(name, result)
         return result
 
     async def ainvoke(self, name: str, **kwargs: Any) -> Any:
         spec, validated = self._resolve(name, kwargs)
         if name == "run_skill_script":
-            return await run_cancellable(spec.function, **validated)
-        result = spec.function(**validated)
-        if inspect.isawaitable(result):
-            return await result
+            result = await run_cancellable(spec.function, **validated)
+        else:
+            result = spec.function(**validated)
+            if inspect.isawaitable(result):
+                result = await result
+        self._record_changed_paths(name, result)
         return result
 
     def available(self) -> list[str]:
@@ -302,12 +358,61 @@ def create_worker_registry(
         invalidate_snapshots()
         return result
 
+    def replace_text(
+        path: str,
+        old_text: str,
+        new_text: str,
+        expected_replacements: int = 1,
+    ) -> Any:
+        result = file_tools.replace_text(
+            path, old_text, new_text, expected_replacements=expected_replacements
+        )
+        invalidate_snapshots()
+        return result
+
+    def create_file(path: str, content: str) -> Any:
+        result = file_tools.create_file(path, content)
+        invalidate_snapshots()
+        return result
+
+    def delete_file(path: str) -> Any:
+        result = file_tools.delete_file(path)
+        invalidate_snapshots()
+        return result
+
     registry.register(
         "apply_patch",
         "write_files",
         apply_patch,
-        description="Apply full-file replacements inside the workspace.",
+        description=(
+            "Apply full-file replacements for new or small files. Prefer replace_text "
+            "for modifying existing large files."
+        ),
         args_model=ApplyPatchArgs,
+    )
+    registry.register(
+        "replace_text",
+        "write_files",
+        replace_text,
+        description=(
+            "Replace exact text in an existing UTF-8 workspace file. Fails unless "
+            "old_text occurs expected_replacements times."
+        ),
+        args_model=ReplaceTextArgs,
+    )
+    registry.register(
+        "create_file",
+        "write_files",
+        create_file,
+        description="Create a new UTF-8 file. Fails if the path already exists.",
+        args_model=CreateFileArgs,
+    )
+    registry.register(
+        "delete_file",
+        "write_files",
+        delete_file,
+        description="Delete an existing regular file. Fails for directories and symbolic links.",
+        args_model=DeleteFileArgs,
     )
     if capability_registry is not None:
         from evoci.capability.execution import run_skill_script

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from evoci.benchmark.campaign import CampaignError, CampaignManager
+from evoci.benchmark.campaign import CampaignError, CampaignManager, tree_hash
 from evoci.benchmark.models import (
     BenchmarkManifestEntry,
     BenchmarkResult,
@@ -78,6 +78,9 @@ def _add_episode(config: EvoCIConfig, run_id: str, task: str, success: bool = Tr
                 successful_fix_summary="fixed" if success else None,
                 success=success,
                 failure_reason=None if success else "oracle failed",
+                failure_fingerprint=f"fp-{task}",
+                attempted_fix_summaries=["try operator"] if not success else [],
+                attempted_files=["app.py"] if not success else [],
             )
         )
     finally:
@@ -135,7 +138,9 @@ def test_campaign_freezes_round_and_inherits_across_manager_instances(tmp_path: 
     store = SQLiteMemoryStore(c.state_dir / "memory.sqlite")
     registry = CapabilityRegistry(c.capability_dir, c.state_dir / "capabilities.sqlite")
     try:
-        assert store.get_episode("run-a") is not None
+        merged = store.get_episode("run-a")
+        assert merged is not None
+        assert merged.failure_fingerprint == "fp-a"
         skill = registry.list()[0]
         assert skill.manifest.source_run_ids == ["run-a"]
         assert Path(skill.package_path).is_relative_to(c.capability_dir)
@@ -188,6 +193,13 @@ def test_campaign_refuses_missing_parent_and_strict_overlap(tmp_path: Path) -> N
         strict.prepare_round(2, manifest2, dataset2, _entries(["a"]))
 
 
+def test_campaign_rejects_duplicate_task_ids_in_manifest(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manifest, dataset = _files(tmp_path, ["a"])
+    with pytest.raises(CampaignError, match="duplicate task_id"):
+        manager.prepare_round(1, manifest, dataset, _entries(["a", "a"]))
+
+
 def test_campaign_metadata_has_no_ground_truth(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manifest, dataset = _files(tmp_path, ["a"])
@@ -212,6 +224,25 @@ def test_generation_hash_ignores_sqlite_sidecars_but_detects_mutation(
     database.write_bytes(database.read_bytes() + b"tampered")
     with pytest.raises(CampaignError, match="modified after commit"):
         manager.prepare_round(2, manifest2, dataset2, _entries(["b"]))
+
+
+def test_generation_hash_remains_stable_after_sqlite_wal_reopen(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manifest, dataset = _files(tmp_path, ["a"])
+    manager.prepare_round(1, manifest, dataset, _entries(["a"]))
+    config = manager.task_config(1, "a", "run-a")
+    _add_skill(config, "run-a")
+    generation = manager.finalize_round(1, [_result("a")])
+    expected = json.loads((generation / "metadata.json").read_text())["content_sha256"]
+
+    registry = CapabilityRegistry(
+        generation / "skills", generation / "state" / "capabilities.sqlite"
+    )
+    registry.close()
+
+    assert tree_hash(generation / "state", generation / "skills") == expected
+    manifest2, dataset2 = _files(tmp_path, ["b"])
+    manager.prepare_round(2, manifest2, dataset2, _entries(["b"]))
 
 
 def test_campaign_aggregates_frozen_branch_skill_usage(tmp_path: Path) -> None:

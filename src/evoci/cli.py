@@ -18,6 +18,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from rich.console import Console
 from rich.table import Table
+from typer._click.core import Command as ClickCommand
+from typer._click.core import Context as ClickContext
 
 from evoci.agents.base import AgentContext, AgentSuite
 from evoci.agents.model_agents import (
@@ -29,6 +31,7 @@ from evoci.agents.model_agents import (
 )
 from evoci.benchmark.adapters import CIRepairBenchAdapter
 from evoci.benchmark.campaign import CampaignError, CampaignManager
+from evoci.benchmark.docker import DockerError, DockerImageManager, DockerReplayVerifier
 from evoci.benchmark.execution import (
     FailedCommandReplayVerifier,
     attach_learning_metrics,
@@ -42,6 +45,7 @@ from evoci.benchmark.models import (
     RunMetrics,
 )
 from evoci.benchmark.runner import BenchmarkRunner
+from evoci.benchmark.validate import validate_reference
 from evoci.benchmark.variants import VariantFeatures, variant_features
 from evoci.capability.curator import CuratorPipeline, ModelCurator
 from evoci.capability.materializer import (
@@ -88,15 +92,36 @@ from evoci.tools.patch import (
     snapshot_edit_baseline,
 )
 from evoci.tools.policy import PolicyViolation
+from evoci.tools.shell import reset_container_executor, set_container_executor
 from evoci.verification.service import VerificationService
 
 app = typer.Typer(help="Durable, self-improving multi-agent CI recovery")
 runs_app = typer.Typer(help="Inspect durable runs")
 memory_app = typer.Typer(help="Search long-term memory")
 skills_app = typer.Typer(help="Inspect and curate capability packages")
+
+
+class _BenchmarkGroup(typer.core.TyperGroup):
+    """`evoci benchmark --manifest ...` still runs; `validate` is a subcommand."""
+
+    def resolve_command(
+        self, ctx: ClickContext, args: list[str]
+    ) -> tuple[str | None, ClickCommand | None, list[str]]:
+        if args and args[0] in self.commands:
+            return super().resolve_command(ctx, args)
+        return super().resolve_command(ctx, ["run", *args])
+
+
+benchmark_app = typer.Typer(
+    cls=_BenchmarkGroup,
+    help="Execute and validate benchmark workspaces",
+    invoke_without_command=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(memory_app, name="memory")
 app.add_typer(skills_app, name="skills")
+app.add_typer(benchmark_app, name="benchmark")
 console = Console()
 
 
@@ -1194,8 +1219,8 @@ def curate_skills() -> None:
         registry.close()
 
 
-@app.command()
-def benchmark(
+@benchmark_app.command("run")
+def benchmark_run(
     manifest: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
     dataset: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
     variant: Annotated[BenchmarkVariant, typer.Option()] = "multi",
@@ -1208,6 +1233,16 @@ def benchmark(
     ] = False,
     campaign_strict: Annotated[
         bool, typer.Option(help="Reject cross-round task/commit overlap")
+    ] = False,
+    docker_official_images: Annotated[
+        bool,
+        typer.Option(help="Pull, pin, and verify tasks in dataset official images"),
+    ] = False,
+    parallelism: Annotated[
+        int, typer.Option(min=1, help="Maximum tasks to execute concurrently within a round")
+    ] = 1,
+    enable_thinking: Annotated[
+        bool, typer.Option(help="Enable extended thinking for the model")
     ] = False,
 ) -> None:
     """Execute real benchmark workspaces through the selected runtime ablation."""
@@ -1223,6 +1258,8 @@ def benchmark(
 
     async def execute_benchmark() -> list[BenchmarkResult]:
         base_config = EvoCIConfig.from_env()
+        if enable_thinking:
+            base_config = base_config.model_copy(update={"enable_thinking": True})
         features = variant_features(variant)
         campaign = (
             CampaignManager(
@@ -1239,6 +1276,22 @@ def benchmark(
             )
             for warning in warnings:
                 console.print(f"[yellow]Campaign warning:[/yellow] {warning}")
+        docker_specs = {
+            entry.task_id: spec
+            for entry in entries
+            if not entry.skipped and (spec := adapter.docker_task_spec(entry.task_id)) is not None
+        }
+        pinned_images: dict[str, str] = {}
+        if docker_official_images and docker_specs:
+            docker_audit = (campaign_round_dir or output_dir) / "docker-images.json"
+            console.print(
+                "[cyan]Docker:[/cyan] pulling and pinning "
+                f"{len(docker_specs)} official task images..."
+            )
+            pinned_images = DockerImageManager().prepare(
+                list(docker_specs.values()), audit_path=docker_audit
+            )
+            console.print("[green]Docker:[/green] all official images pinned")
         shared: LiveResources | None = None
         task_index = 0
         if continual and campaign is None:
@@ -1275,19 +1328,24 @@ def benchmark(
             resources = shared or await _live_resources(
                 active_config, features, defer_success_learning=True
             )
-            try:
+            console.print(f"[cyan]Task {entry.task_id}:[/cyan] starting")
+            verifier: FailedCommandReplayVerifier | DockerReplayVerifier
+            docker_spec = docker_specs.get(entry.task_id) if docker_official_images else None
+            if docker_spec is not None:
+                verifier = DockerReplayVerifier(
+                    docker_spec,
+                    pinned_images[entry.task_id],
+                    timeout=max(1800.0, active_config.command_timeout_seconds),
+                    work_timeout=active_config.command_timeout_seconds,
+                    max_chars=max(500_000, active_config.output_limit_chars),
+                )
+            else:
                 verifier = FailedCommandReplayVerifier(
                     timeout=active_config.command_timeout_seconds,
                     max_chars=active_config.output_limit_chars,
                 )
-                preflight_workspace, preflight_task = prepare_workspace(
-                    adapter,
-                    entry,
-                    worktrees_dir=active_config.workspace_dir,
-                    repo_cache_dir=active_config.repo_cache_dir,
-                    run_id=f"{run_id}-preflight",
-                )
-                benchmark_preflight = await verifier.preflight(preflight_task, preflight_workspace)
+            executor_token = None
+            try:
                 workspace, prepared = prepare_workspace(
                     adapter,
                     entry,
@@ -1295,6 +1353,22 @@ def benchmark(
                     repo_cache_dir=active_config.repo_cache_dir,
                     run_id=run_id,
                 )
+                if isinstance(verifier, DockerReplayVerifier):
+                    verifier.protect(workspace)
+                    benchmark_preflight = await verifier.preflight(prepared, workspace)
+                    verifier.start_work_container(workspace)
+                    executor_token = set_container_executor(verifier.execute_agent_command)
+                else:
+                    preflight_workspace, preflight_task = prepare_workspace(
+                        adapter,
+                        entry,
+                        worktrees_dir=active_config.workspace_dir,
+                        repo_cache_dir=active_config.repo_cache_dir,
+                        run_id=f"{run_id}-preflight",
+                    )
+                    benchmark_preflight = await verifier.preflight(
+                        preflight_task, preflight_workspace
+                    )
                 view = prepared.agent_view
                 failure = view.ci_failure
                 initial: dict[str, object] = {
@@ -1347,7 +1421,11 @@ def benchmark(
                     skill_registry_size=registry_size,
                     active_skill_count=active_count,
                 )
-                if result.get("learning_deferred") and result.get("status") == "success":
+                if (
+                    result.get("learning_deferred")
+                    and result.get("status") == "success"
+                    and metrics.benchmark_verification_status != "infra_error"
+                ):
                     independent_ok = metrics.benchmark_resolved
                     learned = await persist_run_outcome(
                         resources.runtime,
@@ -1376,15 +1454,29 @@ def benchmark(
                         skill_registry_size=registry_size,
                         active_skill_count=active_count,
                     )
+                console.print(
+                    f"[green]Task {entry.task_id}:[/green] {metrics.benchmark_verification_status}"
+                )
                 return metrics
+            except Exception as exc:
+                console.print(f"[red]Task {entry.task_id}:[/red] error: {exc}")
+                raise
             finally:
+                if executor_token is not None:
+                    reset_container_executor(executor_token)
+                if isinstance(verifier, DockerReplayVerifier):
+                    verifier.close()
                 if shared is None:
                     await resources.close()
 
         try:
             run_output = campaign_round_dir or output_dir
             results = await BenchmarkRunner(execute_entry).run(
-                entries, variant=variant, output_dir=run_output, resume=campaign is not None
+                entries,
+                variant=variant,
+                output_dir=run_output,
+                resume=campaign is not None,
+                parallelism=parallelism,
             )
             if campaign is not None and round_number is not None:
                 campaign.finalize_round(round_number, results)
@@ -1403,10 +1495,63 @@ def benchmark(
                 results = asyncio.run(execute_benchmark())
         else:
             results = asyncio.run(execute_benchmark())
-    except CampaignError as exc:
+    except (CampaignError, DockerError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     destination = campaign_dir / "rounds" / f"round-{round_number}" if campaign_dir else output_dir
     console.print(f"wrote {len(results)} results to {destination}")
+
+
+def benchmark(*args: object, **kwargs: object) -> None:
+    """Programmatic alias used by tests; CLI entry is `evoci benchmark run`."""
+
+    benchmark_run(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@benchmark_app.command("validate")
+def benchmark_validate(
+    manifest: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    dataset: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    docker_official_images: Annotated[
+        bool,
+        typer.Option(help="Pin and score tasks in dataset official images"),
+    ] = False,
+    apply_reference_patch: Annotated[
+        bool,
+        typer.Option(help="Apply the withheld reference patch after baseline"),
+    ] = False,
+    task_id: Annotated[
+        list[str] | None,
+        typer.Option(help="Limit validation to these task ids"),
+    ] = None,
+    output_dir: Annotated[Path, typer.Option()] = Path("results"),
+    timeout: Annotated[float, typer.Option(help="Per-command eval timeout in seconds")] = 1800.0,
+) -> None:
+    """Gold-patch validation. Never calls a model and never writes Memory/Skill."""
+
+    try:
+        report = validate_reference(
+            dataset=dataset,
+            manifest=manifest,
+            docker_official_images=docker_official_images,
+            apply_reference_patch=apply_reference_patch,
+            task_ids=task_id,
+            timeout=timeout,
+            audit_path=output_dir / "docker-images.json",
+        )
+    except (DockerError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = report.as_dict()
+    (output_dir / "reference-validation.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    console.print_json(data=payload)
+    console.print(
+        f"[cyan]reference validation:[/cyan] {report.valid} valid, "
+        f"{report.invalid} invalid, {report.infra_error} infra_error"
+    )
+    if report.invalid or report.infra_error:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

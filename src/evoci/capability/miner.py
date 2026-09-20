@@ -72,9 +72,10 @@ class ExperienceMiner:
         reusable_script_created: bool,
         repeated_pattern_detected: bool,
     ) -> bool:
-        return success and (
+        if not success:
+            return False
+        return (
             tool_calls >= self.tool_call_threshold
-            or failed_attempts >= 1
             or reusable_script_created
             or repeated_pattern_detected
         )
@@ -136,9 +137,19 @@ class ExperienceMiner:
         *,
         existing_skills: Sequence[dict[str, Any]] | None = None,
     ) -> LearningDecision:
+        total_tool_calls = sum(agent.tool_calls for agent in trajectory.agents)
+        if total_tool_calls == 0 and not trajectory.reusable_script_created:
+            return LearningDecision(
+                action="none",
+                rationale="trajectory has no tool usage or reusable scripts to learn from",
+            )
+
         try:
             return await self._complete(trajectory, existing_skills=existing_skills)
         except Exception as exc:
-            return await self._complete(
-                trajectory, existing_skills=existing_skills, repair_error=str(exc)
-            )
+            try:
+                return await self._complete(
+                    trajectory, existing_skills=existing_skills, repair_error=str(exc)
+                )
+            except Exception:
+                raise exc from None

@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 InvestigationRole = Literal["log", "repository", "workflow", "dependency", "test", "specialist"]
+FailureClass = Literal["repair", "model", "budget", "policy", "infrastructure"]
 EvidenceKind = Literal[
     "ci_log",
     "source_code",

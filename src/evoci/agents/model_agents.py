@@ -6,9 +6,9 @@ import json
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from evoci.agents.base import AgentContext
 from evoci.agents.tool_loop import BoundedToolAgent
@@ -19,6 +19,7 @@ from evoci.domain.models import (
     FixerOutput,
     InvestigationPlan,
     InvestigationTask,
+    PatchProposal,
     ReviewResult,
     SkillRef,
     VerificationResult,
@@ -29,12 +30,24 @@ from evoci.runtime.budget import RunBudgetManager
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
 from evoci.tools.isolation import copy_workspace_with_independent_git
+from evoci.tools.patch import collect_staged_edits
 from evoci.tools.policy import (
     FIXER_CAPABILITIES,
     REVIEWER_CAPABILITIES,
     WorkerCapabilities,
 )
 from evoci.tools.registry import create_worker_registry
+
+
+class StagedFixerPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    summary: str
+    commands_run: list[str] = Field(default_factory=list)
+    risk: Literal["low", "medium", "high"]
+    verification_plan: list[list[str]]
+    used_memory_ids: list[str] = Field(default_factory=list)
+    used_skill_refs: list[SkillRef] = Field(default_factory=list)
 
 
 def _context_payload(context: AgentContext) -> dict[str, object]:
@@ -129,7 +142,10 @@ class ModelCoordinator:
         return await self.gateway.complete(
             system_prompt=(
                 "Plan bounded, independent CI investigation tasks. Do not edit files. "
-                "Prefer tasks that can run in parallel and request structured evidence."
+                "Prefer tasks that can run in parallel and request structured evidence. "
+                "Historical memories marked OUTCOME=failed are counterevidence, not repair "
+                "instructions. Plan investigations that explain why the previous hypothesis or "
+                "attempt failed. Do not repeat an earlier investigation without new evidence."
             ),
             user_prompt=json.dumps(payload, default=str),
             response_model=InvestigationPlan,
@@ -227,7 +243,10 @@ class ModelDiagnoser:
         return await self.gateway.complete(
             system_prompt=(
                 "Diagnose the CI failure using evidence IDs. Set needs_more_evidence when the "
-                "primary hypothesis is not adequately supported."
+                "primary hypothesis is not adequately supported. Treat ROOT_CAUSE and HYPOTHESES "
+                "from failed episodes as unverified. Reuse a previous hypothesis only when "
+                "current repository evidence supports it. Explain how the current diagnosis "
+                "differs from or corrects the failed attempt."
             ),
             user_prompt=json.dumps(payload, default=str),
             response_model=Diagnosis,
@@ -288,21 +307,44 @@ class ModelFixer:
                 allowed_skill_refs={(skill.skill_id, skill.version) for skill in context.skills},
             )
             try:
-                result = await self.loop.run(
+                plan = await self.loop.run(
                     run_id=context.run_id,
                     agent_id="fixer",
                     invocation_id=context.invocation_id,
                     system_prompt=(
                         "Propose the smallest evidence-backed repair. Tool writes occur only in a "
                         "private staging copy; LangGraph remains the authority that applies "
-                        "the final "
-                        "structured edits after its risk gate. Return complete replacement content "
-                        "for every changed file and deterministic verification argv. Never weaken "
-                        f"tests or CI. {_tool_context_prompt(context)}"
+                        "the final structured edits after its risk gate. Use the available write "
+                        "tools to implement the complete repair in the private staging workspace. "
+                        "Prefer replace_text when modifying existing files, especially large "
+                        "files. Use create_file only for new files and delete_file only for "
+                        "intentional deletions. Your final structured response must contain only "
+                        "a concise repair summary, risk, commands already run, verification "
+                        "commands, and materially used memory or skill references. Do not "
+                        "reproduce file contents in the final response. The harness will collect "
+                        "the actual staged changes. Never weaken tests or CI. "
+                        "ATTEMPTED_FIXES from failed episodes are unsuccessful prior attempts, not "
+                        "recommended patches. If choosing a similar approach, cite new evidence "
+                        "showing why it applies to the current code revision. Implement all "
+                        "changes through the private staging write tools. "
+                        f"{_tool_context_prompt(context)}"
                     ),
                     task_prompt=json.dumps(payload, default=str),
                     tools=registry,
-                    output_schema=FixerOutput,
+                    output_schema=StagedFixerPlan,
+                )
+                edits = collect_staged_edits(source, staging, registry.changed_paths())
+                result = FixerOutput(
+                    proposal=PatchProposal(
+                        summary=plan.summary,
+                        changed_files=[edit.path for edit in edits],
+                        commands_run=plan.commands_run,
+                        risk=plan.risk,
+                        verification_plan=plan.verification_plan,
+                    ),
+                    edits=edits,
+                    used_memory_ids=plan.used_memory_ids,
+                    used_skill_refs=plan.used_skill_refs,
                 )
             finally:
                 registry.close()
@@ -369,7 +411,9 @@ class ModelReviewer:
                 system_prompt=(
                     "Independently review scope, safety, test integrity, hard-coded workarounds, "
                     "and CI bypasses. You cannot write files. Inspect the real diff and rerun a "
-                    f"targeted check when useful. {_tool_context_prompt(context)}"
+                    "targeted check when useful. Do not treat failed episodes as verified "
+                    "knowledge. Check whether the proposed repair actually addresses the current "
+                    f"evidence and current code revision. {_tool_context_prompt(context)}"
                 ),
                 task_prompt=json.dumps(payload, default=str),
                 tools=registry,

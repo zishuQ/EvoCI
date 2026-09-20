@@ -8,6 +8,7 @@ from evoci.capability.registry import CapabilityRegistry
 from evoci.capability.validator import CandidateValidator
 from evoci.tools.filesystem import FileTools
 from evoci.tools.policy import (
+    FIXER_CAPABILITIES,
     INVESTIGATOR_CAPABILITIES,
     REVIEWER_CAPABILITIES,
     PolicyViolation,
@@ -29,9 +30,24 @@ def test_read_only_worker_cannot_write(tmp_path: Path) -> None:
         tools.write_file("change.py", "pass")
 
 
+@pytest.mark.asyncio
+async def test_invalid_search_regex_is_returned_as_tool_error(tmp_path: Path) -> None:
+    (tmp_path / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    registry = create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path)
+    try:
+        with pytest.raises(Exception, match="unterminated character set"):
+            await registry.ainvoke("search_code", pattern="[invalid", path=".")
+    finally:
+        registry.close()
+
+
 def test_command_policy_rejects_unbounded_shell() -> None:
     with pytest.raises(PolicyViolation):
         validate_command(["bash", "-lc", "anything"])
+
+
+def test_command_policy_accepts_versioned_python() -> None:
+    validate_command(["python3.12", "-c", "print('ok')"])
 
 
 def test_investigator_registry_exposes_reads_but_not_patch(tmp_path: Path) -> None:
@@ -39,7 +55,30 @@ def test_investigator_registry_exposes_reads_but_not_patch(tmp_path: Path) -> No
     assert "read_file" in registry.available()
     assert "run_test" in registry.available()
     assert "apply_patch" not in registry.available()
+    assert "replace_text" not in registry.available()
+    assert "create_file" not in registry.available()
+    assert "delete_file" not in registry.available()
     registry.close()
+
+
+def test_write_tools_reject_path_escape_through_registry(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    registry = create_worker_registry(FIXER_CAPABILITIES, tmp_path)
+    try:
+        with pytest.raises(PolicyViolation, match="escapes workspace"):
+            registry.invoke(
+                "replace_text",
+                path="../../etc/passwd",
+                old_text="root",
+                new_text="x",
+            )
+        with pytest.raises(PolicyViolation, match="escapes workspace"):
+            registry.invoke("create_file", path="../../tmp/evoci-escape", content="x")
+        with pytest.raises(PolicyViolation, match="escapes workspace"):
+            registry.invoke("delete_file", path="../../etc/passwd")
+        assert registry.changed_paths() == []
+    finally:
+        registry.close()
 
 
 @pytest.mark.asyncio

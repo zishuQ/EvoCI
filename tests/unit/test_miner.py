@@ -75,6 +75,17 @@ def _trajectory() -> TrajectoryView:
     )
 
 
+def test_failed_trajectory_never_creates_a_skill_candidate() -> None:
+    miner = ExperienceMiner(CaptureGateway([]))
+    assert not miner.should_mine(
+        success=False,
+        tool_calls=100,
+        failed_attempts=5,
+        reusable_script_created=True,
+        repeated_pattern_detected=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_empty_registry_blocks_update_skill_in_prompt() -> None:
     decision = LearningDecision(

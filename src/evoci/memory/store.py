@@ -29,14 +29,28 @@ class MemoryStore(Protocol):
         self, query: str, *, namespaces: Sequence[str], limit: int
     ) -> list[MemoryHit]: ...
 
-    def search_episodes(self, query: str, *, repo: str, limit: int) -> list[MemoryHit]: ...
+    def search_episodes(
+        self, query: str, *, repo: str, limit: int
+    ) -> list[MemoryHit]: ...
+
+    def search_episodes_by_fingerprint(
+        self, *, repo: str, fingerprint: str, limit: int = 2
+    ) -> list[MemoryHit]: ...
 
     def archive(self, memory_id: str) -> None: ...
 
 
 def _fts_query(text: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9_]{2,}", text.lower())[:24]
-    return " OR ".join(f'"{token}"' for token in dict.fromkeys(tokens))
+    ascii_tokens = re.findall(r"[A-Za-z0-9_]{2,}", text.lower())
+    unicode_tokens = re.findall(r"[\u0080-\uffff]{2,}", text)
+    tokens = list(dict.fromkeys([*ascii_tokens, *unicode_tokens]))[:24]
+    if not tokens:
+        tokens = re.findall(r"[A-Za-z0-9\u0080-\uffff]", text.lower())[:24]
+    return " OR ".join(f'"{token}"' for token in tokens)
+
+
+def _join(items: list[str] | None) -> str:
+    return "; ".join(str(item) for item in items or [] if item)
 
 
 def format_episode_content(
@@ -48,35 +62,87 @@ def format_episode_content(
     failure_reason: str | None = None,
     hypotheses: list[str] | None = None,
     verification_failures: list[str] | None = None,
+    failure_class: str | None = None,
+    failure_stage: str | None = None,
+    attempted_fixes: list[str] | None = None,
+    attempted_files: list[str] | None = None,
+    external_failure_details: list[str] | None = None,
 ) -> str:
     """Keep outcome and counterevidence visible; mark unverified causes as hypotheses."""
 
-    hypotheses = hypotheses or []
-    verification_failures = verification_failures or []
     parts = [
         f"OUTCOME={'success' if success else 'failed'}",
         failure_summary,
     ]
-    if failure_reason:
-        parts.append(f"FAILURE_REASON={failure_reason}")
-    if verification_failures:
-        joined = "; ".join(str(item) for item in verification_failures)
-        parts.append(f"VERIFICATION_FAILURES={joined}")
     if success:
         if root_cause:
             parts.append(f"ROOT_CAUSE={root_cause}")
         if successful_fix:
             parts.append(f"SUCCESSFUL_FIX={successful_fix}")
-    else:
-        if root_cause:
-            parts.append(f"HYPOTHESIS (unverified): {root_cause}")
-        if hypotheses:
-            parts.append(
-                "HYPOTHESES_ATTEMPTED (unverified): " + "; ".join(str(item) for item in hypotheses)
-            )
-        if successful_fix:
-            parts.append(f"UNCONFIRMED_FIX_SUMMARY={successful_fix}")
-    return " | ".join(part for part in parts if part)
+        return "\n".join(part for part in parts if part)
+
+    parts.insert(1, f"FAILURE_CLASS={failure_class or 'repair'}")
+    if failure_stage:
+        parts.append(f"FAILURE_STAGE={failure_stage}")
+    if failure_reason:
+        parts.append(f"FAILURE_REASON={failure_reason}")
+    if attempted_fixes:
+        marked = [
+            item
+            if "failed" in item.lower() or "unconfirmed" in item.lower()
+            else f"{item} (failed/unconfirmed)"
+            for item in attempted_fixes
+        ]
+        parts.append(f"ATTEMPTED_FIXES={_join(marked)}")
+    if attempted_files:
+        parts.append(f"ATTEMPTED_FILES={_join(attempted_files)}")
+    if verification_failures:
+        parts.append(f"VERIFICATION_FAILURES={_join(verification_failures)}")
+    if external_failure_details:
+        parts.append(f"EXTERNAL_FAILURE_DETAILS={_join(external_failure_details)}")
+    if root_cause:
+        parts.append(f"HYPOTHESIS (unverified): {root_cause}")
+    if hypotheses:
+        parts.append(f"HYPOTHESES_ATTEMPTED (unverified): {_join(hypotheses)}")
+    return "\n".join(part for part in parts if part)
+
+
+_JSON_LIST_FIELDS = (
+    "important_evidence",
+    "tools_used",
+    "hypotheses_attempted",
+    "verification_failures",
+    "attempted_fix_summaries",
+    "attempted_files",
+    "external_failure_details",
+)
+
+
+def _episode_from_row(row: sqlite3.Row) -> Episode:
+    payload = dict(zip(row.keys(), tuple(row), strict=True))
+    payload.pop("rank", None)
+    for field in _JSON_LIST_FIELDS:
+        raw = payload.get(field)
+        payload[field] = json.loads(str(raw or "[]")) if not isinstance(raw, list) else raw
+    payload["success"] = bool(payload.get("success"))
+    return Episode.model_validate(payload)
+
+
+def _episode_content(episode: Episode) -> str:
+    return format_episode_content(
+        success=episode.success,
+        failure_summary=episode.failure_summary,
+        root_cause=episode.root_cause,
+        successful_fix=episode.successful_fix_summary,
+        failure_reason=episode.failure_reason,
+        hypotheses=list(episode.hypotheses_attempted),
+        verification_failures=list(episode.verification_failures),
+        failure_class=episode.failure_class,
+        failure_stage=episode.failure_stage,
+        attempted_fixes=list(episode.attempted_fix_summaries),
+        attempted_files=list(episode.attempted_files),
+        external_failure_details=list(episode.external_failure_details),
+    )
 
 
 class SQLiteMemoryStore:
@@ -102,6 +168,13 @@ class SQLiteMemoryStore:
                 verification_failures TEXT NOT NULL DEFAULT '[]',
                 failure_reason TEXT,
                 success INTEGER NOT NULL,
+                failure_fingerprint TEXT NOT NULL DEFAULT '',
+                repo_revision TEXT,
+                failure_class TEXT NOT NULL DEFAULT 'repair',
+                failure_stage TEXT,
+                attempted_fix_summaries TEXT NOT NULL DEFAULT '[]',
+                attempted_files TEXT NOT NULL DEFAULT '[]',
+                external_failure_details TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
@@ -139,9 +212,22 @@ class SQLiteMemoryStore:
             ("hypotheses_attempted", "TEXT NOT NULL DEFAULT '[]'"),
             ("verification_failures", "TEXT NOT NULL DEFAULT '[]'"),
             ("failure_reason", "TEXT"),
+            ("failure_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+            ("repo_revision", "TEXT"),
+            ("failure_class", "TEXT NOT NULL DEFAULT 'repair'"),
+            ("failure_stage", "TEXT"),
+            ("attempted_fix_summaries", "TEXT NOT NULL DEFAULT '[]'"),
+            ("attempted_files", "TEXT NOT NULL DEFAULT '[]'"),
+            ("external_failure_details", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             if name not in episode_columns:
                 self._connection.execute(f"ALTER TABLE episodes ADD COLUMN {name} {declaration}")
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episode_fingerprint
+            ON episodes(failure_fingerprint, created_at)
+            """
+        )
         self._connection.commit()
 
     def add_episode(self, episode: Episode) -> None:
@@ -150,8 +236,10 @@ class SQLiteMemoryStore:
             INSERT OR IGNORE INTO episodes (
                 id, run_id, repo, task_family, failure_summary, root_cause,
                 important_evidence, attempts, successful_fix_summary, tools_used,
-                hypotheses_attempted, verification_failures, failure_reason, success, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                hypotheses_attempted, verification_failures, failure_reason, success,
+                failure_fingerprint, repo_revision, failure_class, failure_stage,
+                attempted_fix_summaries, attempted_files, external_failure_details, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode.id,
@@ -168,22 +256,20 @@ class SQLiteMemoryStore:
                 json.dumps(episode.verification_failures),
                 episode.failure_reason,
                 int(episode.success),
+                episode.failure_fingerprint,
+                episode.repo_revision,
+                episode.failure_class,
+                episode.failure_stage,
+                json.dumps(episode.attempted_fix_summaries),
+                json.dumps(episode.attempted_files),
+                json.dumps(episode.external_failure_details),
                 episode.created_at.isoformat(),
             ),
         )
         if self._connection.execute("SELECT changes()").fetchone()[0]:
-            content = format_episode_content(
-                success=episode.success,
-                failure_summary=episode.failure_summary,
-                root_cause=episode.root_cause,
-                successful_fix=episode.successful_fix_summary,
-                failure_reason=episode.failure_reason,
-                hypotheses=list(episode.hypotheses_attempted),
-                verification_failures=list(episode.verification_failures),
-            )
             self._connection.execute(
                 "INSERT INTO episodes_fts(episode_id, content) VALUES (?, ?)",
-                (episode.id, content),
+                (episode.id, _episode_content(episode)),
             )
         self._connection.commit()
 
@@ -193,16 +279,7 @@ class SQLiteMemoryStore:
         ).fetchone()
         if row is None:
             return None
-        payload = dict(row)
-        for field in (
-            "important_evidence",
-            "tools_used",
-            "hypotheses_attempted",
-            "verification_failures",
-        ):
-            payload[field] = json.loads(str(payload[field]))
-        payload["success"] = bool(payload["success"])
-        return Episode.model_validate(payload)
+        return _episode_from_row(row)
 
     def operation_result(self, operation_key: str) -> dict[str, object] | None:
         row = self._connection.execute(
@@ -268,9 +345,9 @@ class SQLiteMemoryStore:
                 )
             self._connection.commit()
             return True
-        except Exception:
+        except Exception as exc:
             self._connection.rollback()
-            raise
+            raise RuntimeError(f"Failed to add semantic memory {memory.id}: {exc}") from exc
 
     def search_semantic(
         self, query: str, *, namespaces: Sequence[str], limit: int
@@ -309,59 +386,68 @@ class SQLiteMemoryStore:
             for row in rows
         ]
 
-    def search_episodes(self, query: str, *, repo: str, limit: int) -> list[MemoryHit]:
+    def _hit_from_episode_row(self, row: sqlite3.Row, *, rank: float | None = None) -> MemoryHit:
+        episode = _episode_from_row(row)
+        score = 1.0 if rank is None else 1.0 / (1.0 + abs(rank))
+        return MemoryHit(
+            memory_id=episode.id,
+            namespace=f"episode:{episode.repo}",
+            content=_episode_content(episode),
+            score=score,
+        )
+
+    def search_episodes(
+        self,
+        query: str,
+        *,
+        repo: str,
+        limit: int,
+    ) -> list[MemoryHit]:
         expression = _fts_query(query)
         if not expression or limit <= 0:
             return []
         rows = self._connection.execute(
             """
-            SELECT e.id, e.failure_summary, e.root_cause, e.successful_fix_summary,
-                   e.hypotheses_attempted, e.verification_failures, e.failure_reason,
-                   e.success, bm25(episodes_fts) AS rank
+            SELECT e.*, bm25(episodes_fts) AS rank
             FROM episodes_fts
             JOIN episodes e ON e.id = episodes_fts.episode_id
             WHERE episodes_fts MATCH ?
-            ORDER BY (e.repo = ?) DESC, rank, e.created_at DESC
+            ORDER BY
+                (e.repo = ?) DESC,
+                e.success DESC,
+                rank,
+                e.created_at DESC
             LIMIT ?
             """,
             (expression, repo, limit),
         ).fetchall()
-        hits: list[MemoryHit] = []
+        return [self._hit_from_episode_row(row, rank=float(row["rank"])) for row in rows]
+
+    def search_episodes_by_fingerprint(
+        self, *, repo: str, fingerprint: str, limit: int = 2
+    ) -> list[MemoryHit]:
+        if not fingerprint or limit <= 0:
+            return []
+        rows = self._connection.execute(
+            """
+            SELECT * FROM episodes
+            WHERE repo = ? AND failure_fingerprint = ? AND failure_fingerprint != ''
+            ORDER BY created_at DESC
+            """,
+            (repo, fingerprint),
+        ).fetchall()
+        latest_failed: sqlite3.Row | None = None
+        latest_success: sqlite3.Row | None = None
         for row in rows:
-            payload = dict(row)
-            for field in ("hypotheses_attempted", "verification_failures"):
-                raw = payload.get(field) or "[]"
-                payload[field] = json.loads(str(raw)) if not isinstance(raw, list) else raw
-            payload["success"] = bool(payload["success"])
-            hits.append(
-                MemoryHit(
-                    memory_id=str(row["id"]),
-                    namespace=f"episode:{repo}",
-                    content=format_episode_content(
-                success=bool(payload["success"]),
-                failure_summary=str(payload.get("failure_summary") or ""),
-                root_cause=(
-                    None if not payload.get("root_cause") else str(payload.get("root_cause"))
-                ),
-                successful_fix=(
-                    None
-                    if payload.get("successful_fix_summary") is None
-                    else str(payload.get("successful_fix_summary"))
-                ),
-                failure_reason=(
-                    None
-                    if payload.get("failure_reason") is None
-                    else str(payload.get("failure_reason"))
-                ),
-                hypotheses=[str(item) for item in payload.get("hypotheses_attempted") or []],
-                verification_failures=[
-                    str(item) for item in payload.get("verification_failures") or []
-                ],
-            ),
-                    score=1.0 / (1.0 + abs(float(row["rank"]))),
-                )
-            )
-        return hits
+            if bool(row["success"]):
+                if latest_success is None:
+                    latest_success = row
+            elif latest_failed is None:
+                latest_failed = row
+            if latest_failed is not None and latest_success is not None:
+                break
+        selected = [row for row in (latest_failed, latest_success) if row is not None][:limit]
+        return [self._hit_from_episode_row(row) for row in selected]
 
     def archive(self, memory_id: str) -> None:
         self._connection.execute(

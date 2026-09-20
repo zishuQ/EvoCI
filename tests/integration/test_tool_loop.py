@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
 
-from evoci.agents.base import AgentSuite
-from evoci.agents.model_agents import ModelFixer, ModelInvestigator, ModelReviewer
+from evoci.agents.base import AgentContext, AgentSuite
+from evoci.agents.model_agents import (
+    ModelFixer,
+    ModelInvestigator,
+    ModelReviewer,
+    StagedFixerPlan,
+)
 from evoci.agents.tool_loop import BoundedToolAgent
 from evoci.capability.models import GeneratedFile, SkillCandidate, SkillPermissions
 from evoci.capability.registry import CapabilityRegistry
@@ -15,10 +21,10 @@ from evoci.config import EvoCIConfig
 from evoci.demo import DemoCoordinator, DemoDiagnoser, DemoFixer, DemoReviewer
 from evoci.domain.models import (
     CIFailure,
+    Diagnosis,
     EvidenceItem,
-    FileEdit,
     FixerOutput,
-    PatchProposal,
+    Hypothesis,
     RepoSpec,
     ReviewResult,
     SkillRef,
@@ -102,13 +108,14 @@ async def test_leaf_tool_loop_executes_real_tool_and_projects_events(tmp_path: P
     gateway = ScriptedToolGateway(
         [
             ToolModelResponse(
+                reasoning_content="the fixture file should contain VALUE",
                 tool_calls=[
                     ToolCallRequest(
                         call_id="read-1",
                         name="read_file",
                         arguments={"path": "app.py"},
                     )
-                ]
+                ],
             ),
             ToolModelResponse(content="enough evidence"),
         ],
@@ -129,6 +136,8 @@ async def test_leaf_tool_loop_executes_real_tool_and_projects_events(tmp_path: P
 
     assert result.evidence[0].file_path == "app.py"
     assert "VALUE = 1" in gateway.messages_seen[1][-1].content
+    assistant = next(message for message in gateway.messages_seen[1] if message.role == "assistant")
+    assert assistant.reasoning_content == "the fixture file should contain VALUE"
     events = recorder.events("tool-run")
     assert sum(event.type == EventType.MODEL_CALL for event in events) == 3
     assert sum(event.type == EventType.TOOL_CALL for event in events) == 1
@@ -639,23 +648,12 @@ class FullLeafGateway(ParallelInvestigatorGateway):
                     )
                 ],
             )
-        elif response_model is FixerOutput:
-            output = FixerOutput(
-                proposal=PatchProposal(
-                    summary="replace subtraction with addition",
-                    changed_files=["calculator.py"],
-                    commands_run=["python -m unittest -q"],
-                    risk="low",
-                    verification_plan=[["python", "-m", "unittest", "-q"]],
-                ),
-                edits=[
-                    FileEdit(
-                        path="calculator.py",
-                        content=(
-                            "def add(left: int, right: int) -> int:\n    return left + right\n"
-                        ),
-                    )
-                ],
+        elif response_model is StagedFixerPlan:
+            output = StagedFixerPlan(
+                summary="replace subtraction with addition",
+                commands_run=["python -m unittest -q"],
+                risk="low",
+                verification_plan=[["python", "-m", "unittest", "-q"]],
             )
         elif response_model is ReviewResult:
             output = ReviewResult(accepted=True, confidence=0.99)
@@ -726,3 +724,155 @@ async def test_full_multi_agent_path_uses_tools_in_every_leaf_role(tmp_path: Pat
         failure_reason=None,
     )
     assert view.tool_call_count == sum(event.type == EventType.TOOL_CALL for event in events)
+
+
+def _fixer_context(workspace: Path) -> AgentContext:
+    return AgentContext(
+        run_id="fixer-staging",
+        repo=RepoSpec(name="fixture"),
+        failure=CIFailure(summary="failed", log_excerpt="error"),
+        workspace_path=str(workspace),
+        invocation_id="repair:1",
+    )
+
+
+def _fixer_diagnosis() -> Diagnosis:
+    return Diagnosis(
+        primary=Hypothesis(
+            root_cause="incorrect value",
+            evidence_ids=[],
+            confidence=0.9,
+            affected_files=["app.py"],
+            proposed_action="replace the incorrect assignment",
+        ),
+        needs_more_evidence=False,
+    )
+
+
+def _staged_plan() -> StagedFixerPlan:
+    return StagedFixerPlan(
+        summary="replace the failing assignment",
+        commands_run=["python -m unittest -q"],
+        risk="low",
+        verification_plan=[["python", "-m", "unittest", "-q"]],
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_fixer_keeps_original_workspace_unchanged(tmp_path: Path) -> None:
+    original = "VALUE = 1\n"
+    (tmp_path / "app.py").write_text(original, encoding="utf-8")
+
+    class IsolationGateway(ScriptedToolGateway):
+        async def next_action(
+            self,
+            *,
+            messages: list[ToolLoopMessage],
+            tools: list[ToolDefinition],
+            agent_id: str,
+        ) -> ToolModelResponse:
+            del tools, agent_id
+            if messages:
+                assert (tmp_path / "app.py").read_text(encoding="utf-8") == original
+            return self.turns.pop(0)
+
+    gateway = IsolationGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="fixer:replace",
+                        name="replace_text",
+                        arguments={
+                            "path": "app.py",
+                            "old_text": "VALUE = 1",
+                            "new_text": "VALUE = 2",
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="staged"),
+        ],
+        _staged_plan(),
+    )
+    output = await ModelFixer(gateway, TrajectoryRecorder()).propose(
+        context=_fixer_context(tmp_path),
+        diagnosis=_fixer_diagnosis(),
+        evidence=[],
+        previous_verification=None,
+    )
+    assert isinstance(output, FixerOutput)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == original
+    assert output.proposal.changed_files == ["app.py"]
+    assert [edit.path for edit in output.edits] == ["app.py"]
+    assert output.edits[0].content == "VALUE = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_model_fixer_collects_large_file_without_model_repeating_it(
+    tmp_path: Path,
+) -> None:
+    original = "HEADER = 'keep'\n" + ("x" * 120_000) + "\nMARKER = 'old'\n"
+    (tmp_path / "app.py").write_text(original, encoding="utf-8")
+    plan = StagedFixerPlan(
+        summary="flip the marker",
+        risk="low",
+        verification_plan=[["python", "-c", "raise SystemExit(0)"]],
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="fixer:replace",
+                        name="replace_text",
+                        arguments={
+                            "path": "app.py",
+                            "old_text": "MARKER = 'old'",
+                            "new_text": "MARKER = 'new'",
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        plan,
+    )
+    output = await ModelFixer(gateway, TrajectoryRecorder()).propose(
+        context=_fixer_context(tmp_path),
+        diagnosis=_fixer_diagnosis(),
+        evidence=[],
+        previous_verification=None,
+    )
+    assert isinstance(output, FixerOutput)
+    assert output.proposal.summary == "flip the marker"
+    assert output.proposal.changed_files == [edit.path for edit in output.edits] == ["app.py"]
+    assert output.edits[0].content is not None
+    assert len(output.edits[0].content) > 100_000
+    assert "MARKER = 'new'" in output.edits[0].content
+    assert "MARKER = 'old'" not in output.edits[0].content
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == original
+    dumped_plan = json.dumps(plan.model_dump())
+    assert "x" * 1000 not in dumped_plan
+    assert original not in dumped_plan
+
+
+@pytest.mark.asyncio
+async def test_fixer_prompt_treats_failed_episodes_as_counterevidence(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    gateway = ScriptedToolGateway(
+        [ToolModelResponse(content="done")],
+        _staged_plan(),
+    )
+    await ModelFixer(gateway, TrajectoryRecorder()).propose(
+        context=_fixer_context(tmp_path),
+        diagnosis=_fixer_diagnosis(),
+        evidence=[],
+        previous_verification=None,
+    )
+    system = gateway.messages_seen[0][0].content
+    assert "ATTEMPTED_FIXES from failed episodes are unsuccessful prior attempts" in system
+    assert "Do not reproduce file contents" in system
+    assert "benchmark" not in system.lower()
+    assert "task_id" not in system.lower()
+

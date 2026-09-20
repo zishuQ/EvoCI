@@ -12,3 +12,6 @@ dist/
 results/
 pytest-of-root/
 evoci-skill-test-*/
+campaign13/
+campaign13-python-behavior/
+.ai-bridge/

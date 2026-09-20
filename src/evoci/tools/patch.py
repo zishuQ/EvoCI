@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TypedDict
 
 from evoci.domain.models import FileEdit
 from evoci.tools.filesystem import FileTools
+from evoci.tools.policy import PolicyViolation, WorkspaceBoundary
 
 
 class PatchError(RuntimeError):
@@ -211,3 +212,73 @@ def apply_edits(
         created.extend(new_files)
         modified.extend(changed_files)
     return created, modified
+
+
+def _resolve_staged_path(boundary: WorkspaceBoundary, path: str) -> Path:
+    relative = Path(path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise PolicyViolation(f"path escapes workspace: {path}")
+    raw = boundary.root / relative
+    if raw.is_symlink():
+        raise PolicyViolation(f"refusing to operate on symlink: {path}")
+    target = boundary.resolve(path)
+    if target.is_symlink():
+        raise PolicyViolation(f"refusing to operate on symlink: {path}")
+    if target.exists() and not stat.S_ISREG(target.stat().st_mode):
+        raise PolicyViolation(f"target is not a regular file: {path}")
+    return target
+
+
+def _read_utf8_text(target: Path, path: str) -> str:
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise PolicyViolation(f"staged file is not valid UTF-8 text: {path}") from exc
+
+
+def collect_staged_edits(
+    source: Path,
+    staging: Path,
+    changed_paths: Sequence[str],
+    *,
+    max_files: int = 20,
+    max_total_bytes: int = 4 * 1024 * 1024,
+) -> list[FileEdit]:
+    unique_paths = sorted({path for path in changed_paths if path})
+    if len(unique_paths) > max_files:
+        raise PolicyViolation(f"staged changes include too many files: {len(unique_paths)}")
+    source_boundary = WorkspaceBoundary(source)
+    staging_boundary = WorkspaceBoundary(staging)
+    edits: list[FileEdit] = []
+    total_bytes = 0
+    for path in unique_paths:
+        source_target = _resolve_staged_path(source_boundary, path)
+        staging_target = _resolve_staged_path(staging_boundary, path)
+        source_exists = source_target.exists()
+        staging_exists = staging_target.exists()
+        if source_exists and not staging_exists:
+            edits.append(
+                FileEdit(
+                    path=path,
+                    delete=True,
+                    expected_sha256=_file_digest(source_target),
+                )
+            )
+            continue
+        if not source_exists and not staging_exists:
+            continue
+        staging_content = _read_utf8_text(staging_target, path)
+        if source_exists and source_target.read_bytes() == staging_content.encode("utf-8"):
+            continue
+        size = len(staging_content.encode("utf-8"))
+        if total_bytes + size > max_total_bytes:
+            raise PolicyViolation("staged changes exceed the total byte limit")
+        total_bytes += size
+        edits.append(
+            FileEdit(
+                path=path,
+                content=staging_content,
+                expected_sha256=_file_digest(source_target) if source_exists else None,
+            )
+        )
+    return edits

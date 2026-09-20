@@ -9,6 +9,7 @@ from evoci.domain.models import (
     CIFailure,
     Diagnosis,
     EvidenceItem,
+    FailureClass,
     FixerOutput,
     InvestigationPlan,
     InvestigationTask,
@@ -70,3 +71,6 @@ class EvoCIState(TypedDict, total=False):
 
     status: Literal["running", "waiting_approval", "success", "failed"]
     failure_reason: str | None
+    failure_class: FailureClass | None
+    failure_classes: Annotated[list[str], operator.add]
+    failure_stage: str | None

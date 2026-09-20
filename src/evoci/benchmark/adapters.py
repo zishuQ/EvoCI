@@ -13,6 +13,7 @@ import yaml  # type: ignore[import-untyped]
 
 from evoci.benchmark.models import (
     AgentTaskView,
+    DockerTaskSpec,
     FailedStep,
     GroundTruth,
     NormalizedCIFailure,
@@ -23,6 +24,8 @@ from evoci.benchmark.models import (
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RUN_LINE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}T\S+\s+)?(?:##\[group\])?Run\s+(.+?)\s*$")
 _SHELL_META = re.compile(r"(?:&&|\|\||[;|<>`]|\$\(|\$\{)")
+_NODE_UNSAFE = re.compile(r"[\n\r;|&`$]|\$\(|\$\{")
+_DJANGO_NODE = re.compile(r"^(\S+)\s+\(([^)]+)\)$")
 _LOG_KEYS = ("log", "logs", "message", "output", "text")
 _NAME_KEYS = ("step_name", "name", "step")
 _COMMAND_KEYS = ("command", "failed_command", "run", "argv")
@@ -230,6 +233,57 @@ def _normalize_changed_files(value: Any) -> list[str]:
     return []
 
 
+def is_test_node(node: str) -> bool:
+    """True for pytest node ids, Django labels, or a repository-relative test file."""
+
+    if _DJANGO_NODE.match(node):
+        return True
+    if "::" in node:
+        return True
+    path = Path(node)
+    return node.endswith(".py") and not path.is_absolute() and ".." not in path.parts
+
+
+def _normalize_node_ids(value: Any, *, field: str, allow_empty: bool = False) -> list[str]:
+    """Parse SWE-bench FAIL_TO_PASS / PASS_TO_PASS lists without shell interpolation."""
+
+    if value is None:
+        if allow_empty:
+            return []
+        raise ValueError(f"{field} must be a non-empty list of test node ids")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            if allow_empty:
+                return []
+            raise ValueError(f"{field} must be a non-empty list of test node ids")
+        if raw[0] in "[{":
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field} is not valid JSON") from exc
+        else:
+            raise ValueError(f"{field} must be a list of test node ids")
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field} must be a list of test node ids")
+    nodes: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field} entries must be non-empty strings")
+        node = item.strip()
+        if not is_test_node(node):
+            raise ValueError(f"invalid test node id in {field}: {node}")
+        if node.startswith("-") or _NODE_UNSAFE.search(node):
+            raise ValueError(f"unsafe test node id in {field}: {node}")
+        if node not in nodes:
+            nodes.append(node)
+    if not nodes and not allow_empty:
+        raise ValueError(f"{field} must be a non-empty list of test node ids")
+    return nodes
+
+
 class CIRepairBenchAdapter:
     """Load a local JSON/JSONL export without exposing evaluator fields."""
 
@@ -303,6 +357,63 @@ class CIRepairBenchAdapter:
             changed_files=_normalize_changed_files(row.get("changed_files")),
             error_type=normalize_error_type(row.get("error_type")),
         )
+
+    def fail_to_pass_nodes(self, task_id: str) -> list[str]:
+        """Evaluator-only FAIL_TO_PASS ids; empty when the row has none."""
+
+        row = self._rows[task_id]
+        raw = row.get("fail_to_pass", row.get("FAIL_TO_PASS"))
+        if raw is None:
+            commands = self.prepare_task(task_id).agent_view.ci_failure.candidate_failed_commands
+            return [command[-1] for command in commands if command]
+        return _normalize_node_ids(raw, field="fail_to_pass")
+
+    def docker_task_spec(self, task_id: str) -> DockerTaskSpec | None:
+        """Return evaluator-only Docker data without touching the agent view."""
+
+        row = self._rows[task_id]
+        image = row.get("official_image")
+        if not isinstance(image, str) or not image.strip():
+            return None
+        test_patch = _normalize_log_fragment(row.get("test_patch"))
+        fail_to_pass = _normalize_node_ids(
+            row.get("fail_to_pass", row.get("FAIL_TO_PASS")), field="fail_to_pass"
+        )
+        pass_to_pass = _normalize_node_ids(
+            row.get("pass_to_pass", row.get("PASS_TO_PASS")),
+            field="pass_to_pass",
+        )
+        command = _parse_command(row.get("local_replay_command"))
+        commands = [command] if command is not None else []
+        explicit = _normalize_changed_files(row.get("protected_test_files"))
+        protected = explicit or _paths_from_patch(test_patch)
+        reference = _normalize_log_fragment(
+            row.get("reference_patch", row.get("diff", row.get("patch")))
+        )
+        return DockerTaskSpec(
+            task_id=task_id,
+            official_image=image.strip(),
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
+            test_patch=test_patch,
+            protected_files=protected,
+            reference_patch=reference,
+            replay_commands=commands,
+        )
+
+
+def _paths_from_patch(patch: str) -> list[str]:
+    """Extract repository-relative paths from an evaluator-owned test patch."""
+
+    paths: list[str] = []
+    for match in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, re.MULTILINE):
+        path = match.group(2)
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"unsafe protected test path: {path}")
+        if path not in paths:
+            paths.append(path)
+    return paths
 
 
 class FixtureAdapter(CIRepairBenchAdapter):

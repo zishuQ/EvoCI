@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,7 +62,8 @@ def validate_command(argv: list[str], *, network: bool = False) -> None:
     if not argv:
         raise PolicyViolation("empty command")
     executable = Path(argv[0]).name
-    if executable not in SAFE_COMMANDS:
+    versioned_python = re.fullmatch(r"python3(?:\.\d+)?", executable)
+    if executable not in SAFE_COMMANDS and versioned_python is None:
         raise PolicyViolation(f"command is not allowlisted: {executable}")
     joined = " ".join(argv).lower()
     forbidden = ("sudo ", "rm -rf", "curl ", "wget ", "--privileged", "/etc/", "../")

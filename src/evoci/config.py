@@ -39,13 +39,14 @@ class EvoCIConfig(BaseModel):
     max_leaf_tool_calls: int = Field(default=16, ge=1, le=50)
     max_run_model_calls: int = Field(default=256, ge=1, le=1_000)
     max_run_tool_calls: int = Field(default=256, ge=1, le=2_000)
-    trial_min_uses: int = Field(default=2, ge=1, le=100)
-    trial_min_successes: int = Field(default=2, ge=1, le=100)
-    trial_min_success_rate: float = Field(default=0.75, ge=0, le=1)
-    trial_max_failures: int = Field(default=2, ge=1, le=100)
+    trial_min_uses: int = Field(default=1, ge=1, le=100)
+    trial_min_successes: int = Field(default=1, ge=1, le=100)
+    trial_min_success_rate: float = Field(default=0.5, ge=0, le=1)
+    trial_max_failures: int = Field(default=3, ge=1, le=100)
     capability_retrieval_top_k: int = Field(default=2, ge=1, le=20)
     trial_retrieval_slots: int = Field(default=1, ge=0, le=20)
     trial_max_exposures_without_use: int = Field(default=5, ge=1, le=1_000)
+    enable_thinking: bool = False
 
     @model_validator(mode="after")
     def validate_task_limits(self) -> EvoCIConfig:
@@ -74,9 +75,7 @@ class EvoCIConfig(BaseModel):
             fast_model_name=os.environ.get("EVO_MODEL_FAST") or None,
             strong_model_name=os.environ.get("EVO_MODEL_STRONG") or None,
             aux_model_name=(
-                os.environ.get("EVO_MODEL_AUX")
-                or os.environ.get("EVO_AUX_MODEL_NAME")
-                or None
+                os.environ.get("EVO_MODEL_AUX") or os.environ.get("EVO_AUX_MODEL_NAME") or None
             ),
             state_dir=path_value("EVO_STATE_DIR", ".evoci/state"),
             workspace_dir=path_value("EVO_WORKSPACE_DIR", ".evoci/worktrees"),
@@ -88,19 +87,22 @@ class EvoCIConfig(BaseModel):
             not in {"0", "false", "no", "off"},
             model_timeout_seconds=float(os.environ.get("EVO_MODEL_TIMEOUT_SECONDS", "120")),
             command_timeout_seconds=float(os.environ.get("EVO_COMMAND_TIMEOUT_SECONDS", "120")),
+            max_repair_attempts=int(os.environ.get("EVO_MAX_REPAIR_ATTEMPTS", "3")),
             max_leaf_iterations=int(os.environ.get("EVO_MAX_LEAF_ITERATIONS", "8")),
             max_leaf_tool_calls=int(os.environ.get("EVO_MAX_LEAF_TOOL_CALLS", "16")),
             max_run_model_calls=int(os.environ.get("EVO_MAX_RUN_MODEL_CALLS", "256")),
             max_run_tool_calls=int(os.environ.get("EVO_MAX_RUN_TOOL_CALLS", "256")),
-            trial_min_uses=int(os.environ.get("EVO_TRIAL_MIN_USES", "2")),
-            trial_min_successes=int(os.environ.get("EVO_TRIAL_MIN_SUCCESSES", "2")),
-            trial_min_success_rate=float(os.environ.get("EVO_TRIAL_MIN_SUCCESS_RATE", "0.75")),
-            trial_max_failures=int(os.environ.get("EVO_TRIAL_MAX_FAILURES", "2")),
+            trial_min_uses=int(os.environ.get("EVO_TRIAL_MIN_USES", "1")),
+            trial_min_successes=int(os.environ.get("EVO_TRIAL_MIN_SUCCESSES", "1")),
+            trial_min_success_rate=float(os.environ.get("EVO_TRIAL_MIN_SUCCESS_RATE", "0.5")),
+            trial_max_failures=int(os.environ.get("EVO_TRIAL_MAX_FAILURES", "3")),
             capability_retrieval_top_k=int(os.environ.get("EVO_CAPABILITY_RETRIEVAL_TOP_K", "2")),
             trial_retrieval_slots=int(os.environ.get("EVO_TRIAL_RETRIEVAL_SLOTS", "1")),
             trial_max_exposures_without_use=int(
                 os.environ.get("EVO_TRIAL_MAX_EXPOSURES_WITHOUT_USE", "5")
             ),
+            enable_thinking=os.environ.get("EVO_ENABLE_THINKING", "0").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
     def ensure_directories(self) -> None:

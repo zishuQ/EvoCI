@@ -8,6 +8,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 import evoci.cli as cli
+from evoci.agents.model_agents import StagedFixerPlan
 from evoci.benchmark.models import BenchmarkVariant
 from evoci.benchmark.variants import variant_features
 from evoci.capability.curator import CuratorReview
@@ -17,12 +18,9 @@ from evoci.domain.models import (
     CIFailure,
     Diagnosis,
     EvidenceItem,
-    FileEdit,
-    FixerOutput,
     Hypothesis,
     InvestigationPlan,
     InvestigationTask,
-    PatchProposal,
     RepoSpec,
     ReviewResult,
     WorkerResult,
@@ -166,23 +164,12 @@ class OfflineBenchmarkGateway:
                     )
                 ],
             )
-        elif response_model is FixerOutput:
-            output = FixerOutput(
-                proposal=PatchProposal(
-                    summary="correct calculator addition",
-                    changed_files=["calculator.py"],
-                    commands_run=["python -m unittest -q"],
-                    risk="low",
-                    verification_plan=[["python", "-m", "unittest", "-q"]],
-                ),
-                edits=[
-                    FileEdit(
-                        path="calculator.py",
-                        content=(
-                            "def add(left: int, right: int) -> int:\n    return left + right\n"
-                        ),
-                    )
-                ],
+        elif response_model is StagedFixerPlan:
+            output = StagedFixerPlan(
+                summary="correct calculator addition",
+                commands_run=["python -m unittest -q"],
+                risk="low",
+                verification_plan=[["python", "-m", "unittest", "-q"]],
             )
         elif response_model is ReviewResult:
             output = ReviewResult(accepted=True, confidence=0.99)
@@ -271,6 +258,7 @@ class RetrySingleGateway(OfflineBenchmarkGateway):
     def __init__(self, *_: object, **__: object) -> None:
         super().__init__()
         self.fixer_finalizations = 0
+        self._wrote_this_attempt = False
 
     async def next_action(
         self,
@@ -280,6 +268,25 @@ class RetrySingleGateway(OfflineBenchmarkGateway):
         agent_id: str,
     ) -> ToolModelResponse:
         del messages, tools, agent_id
+        if not self._wrote_this_attempt:
+            self._wrote_this_attempt = True
+            operator = "+" if self.fixer_finalizations >= 1 else "-"
+            return ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id=f"fixer:patch:{self.fixer_finalizations}",
+                        name="apply_patch",
+                        arguments={
+                            "files": {
+                                "calculator.py": (
+                                    "def add(left: int, right: int) -> int:\n"
+                                    f"    return left {operator} right\n"
+                                )
+                            }
+                        },
+                    )
+                ]
+            )
         return ToolModelResponse(content="finalize")
 
     async def finalize(
@@ -290,31 +297,20 @@ class RetrySingleGateway(OfflineBenchmarkGateway):
         agent_id: str,
     ) -> ResponseT:
         del messages, agent_id
-        if response_model is not FixerOutput:
+        if response_model is not StagedFixerPlan:
             raise AssertionError(response_model)
         self.fixer_finalizations += 1
+        self._wrote_this_attempt = False
         succeeds = self.fixer_finalizations > 1
-        output = FixerOutput(
-            proposal=PatchProposal(
-                summary="retry fixture",
-                changed_files=["calculator.py"],
-                risk="low",
-                verification_plan=[
-                    [
-                        "python",
-                        "-c",
-                        f"raise SystemExit({0 if succeeds else 1})",
-                    ]
-                ],
-            ),
-            edits=[
-                FileEdit(
-                    path="calculator.py",
-                    content=(
-                        "def add(left: int, right: int) -> int:\n"
-                        f"    return left {'+' if succeeds else '-'} right\n"
-                    ),
-                )
+        output = StagedFixerPlan(
+            summary="retry fixture",
+            risk="low",
+            verification_plan=[
+                [
+                    "python",
+                    "-c",
+                    f"raise SystemExit({0 if succeeds else 1})",
+                ]
             ],
         )
         return response_model.model_validate(output.model_dump())
@@ -334,8 +330,8 @@ async def test_single_variant_uses_feedback_and_retries_with_shared_budget(
             "capability_dir": tmp_path / "single-retry-skills",
             "runtime_dir": tmp_path / "single-retry-runtime",
             "max_repair_attempts": 3,
-            "max_run_model_calls": 6,
-            "max_run_tool_calls": 6,
+            "max_run_model_calls": 10,
+            "max_run_tool_calls": 10,
         }
     )
     resources = await cli._live_resources(config, variant_features("single"))
@@ -359,8 +355,8 @@ async def test_single_variant_uses_feedback_and_retries_with_shared_budget(
         assert (workspace / "calculator.py").read_text().endswith("return left + right\n")
         assert resources.runtime.budget_manager is not None
         budget = resources.runtime.budget_manager.for_run("single-retry").snapshot()
-        assert budget.model_calls <= 6
-        assert budget.tool_calls <= 6
+        assert budget.model_calls <= 10
+        assert budget.tool_calls <= 10
     finally:
         await resources.close()
 

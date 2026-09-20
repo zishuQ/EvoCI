@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from evoci.domain.models import FailureClass
+
 
 class Episode(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -26,6 +28,13 @@ class Episode(BaseModel):
     verification_failures: list[str] = Field(default_factory=list)
     failure_reason: str | None = None
     success: bool
+    failure_fingerprint: str = ""
+    repo_revision: str | None = None
+    failure_class: FailureClass = "repair"
+    failure_stage: str | None = None
+    attempted_fix_summaries: list[str] = Field(default_factory=list)
+    attempted_files: list[str] = Field(default_factory=list)
+    external_failure_details: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

@@ -390,9 +390,11 @@ class CapabilityRegistry:
                 )
             self._connection.commit()
             return True
-        except Exception:
+        except Exception as exc:
             self._connection.rollback()
-            raise
+            raise RuntimeError(
+                f"Failed to record retrieval for {len(refs)} skills: {exc}"
+            ) from exc
 
     def record_use(
         self,
@@ -404,19 +406,18 @@ class CapabilityRegistry:
         patched: bool,
         operation_key: str | None = None,
     ) -> bool:
-        if operation_key and self.operation_result(operation_key) is not None:
-            return False
-        stats = self.stats(ref.skill_id, ref.version)
-        uses = stats.use_count + 1
-
-        def average(previous: float | None, value: int) -> float:
-            return ((previous or 0.0) * stats.use_count + value) / uses
-
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             if operation_key and self.operation_result(operation_key) is not None:
                 self._connection.rollback()
                 return False
+
+            stats = self.stats(ref.skill_id, ref.version)
+            uses = stats.use_count + 1
+
+            def average(previous: float | None, value: int) -> float:
+                return ((previous or 0.0) * stats.use_count + value) / uses
+
             self._connection.execute(
                 """
             UPDATE skill_stats SET

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from evoci.domain.models import CIFailure, RepoSpec
+from evoci.memory.fingerprint import failure_fingerprint
 from evoci.memory.models import Episode, SemanticMemory
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import SQLiteMemoryStore
@@ -131,6 +132,183 @@ def test_episode_search_recalls_across_repos_with_same_repo_priority(tmp_path: P
     hits_b = store.search_episodes("pytest import", repo="org/b", limit=3)
     assert [hit.memory_id for hit in hits_a] == ["episode-a", "episode-b"]
     assert [hit.memory_id for hit in hits_b] == ["episode-b", "episode-a"]
+    store.close()
+
+
+def test_same_fingerprint_returns_latest_failure_and_success(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    fingerprint = "abc123"
+    store.add_episode(
+        Episode(
+            id="old-fail",
+            run_id="run-old-fail",
+            repo="org/example",
+            task_family="test",
+            failure_summary="assertion still fails",
+            attempts=1,
+            success=False,
+            failure_fingerprint=fingerprint,
+        )
+    )
+    store.add_episode(
+        Episode(
+            id="new-fail",
+            run_id="run-new-fail",
+            repo="org/example",
+            task_family="test",
+            failure_summary="assertion still fails",
+            attempts=2,
+            success=False,
+            failure_fingerprint=fingerprint,
+        )
+    )
+    store.add_episode(
+        Episode(
+            id="new-success",
+            run_id="run-new-success",
+            repo="org/example",
+            task_family="test",
+            failure_summary="assertion still fails",
+            attempts=1,
+            success=True,
+            failure_fingerprint=fingerprint,
+        )
+    )
+    hits = store.search_episodes_by_fingerprint(
+        repo="org/example", fingerprint=fingerprint, limit=2
+    )
+    assert [hit.memory_id for hit in hits] == ["new-fail", "new-success"]
+    store.close()
+
+
+def test_unicode_error_summary_is_searchable(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    store.add_episode(
+        Episode(
+            id="zh-fail",
+            run_id="run-zh",
+            repo="org/a",
+            task_family="test",
+            failure_summary="类型错误 期望整数",
+            attempts=1,
+            success=False,
+        )
+    )
+    hits = store.search_episodes("类型错误", repo="org/a", limit=3)
+    assert hits
+    assert hits[0].memory_id == "zh-fail"
+    store.close()
+
+
+def test_old_database_migrates_new_episode_columns(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE episodes (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL UNIQUE,
+            repo TEXT NOT NULL,
+            task_family TEXT NOT NULL,
+            failure_summary TEXT NOT NULL,
+            root_cause TEXT,
+            important_evidence TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            successful_fix_summary TEXT,
+            tools_used TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO episodes VALUES (
+            'legacy', 'run-legacy', 'org/a', 'test', 'old failure', NULL, '[]',
+            1, NULL, '[]', 0, '2026-01-01T00:00:00+00:00'
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+    store = SQLiteMemoryStore(path)
+    store = SQLiteMemoryStore(path)
+    episode = store.get_episode("run-legacy")
+    assert episode is not None
+    assert episode.failure_class == "repair"
+    assert episode.attempted_files == []
+    assert episode.failure_fingerprint == ""
+    store.close()
+
+
+def test_empty_fts_query_still_allows_fingerprint_retrieval(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    fingerprint = "fp-empty-query"
+    store.add_episode(
+        Episode(
+            id="exact",
+            run_id="run-exact",
+            repo="org/a",
+            task_family="test",
+            failure_summary="!!",
+            attempts=1,
+            success=False,
+            failure_fingerprint=fingerprint,
+        )
+    )
+    hits = store.search_episodes("??", repo="org/a", limit=3)
+    exact = store.search_episodes_by_fingerprint(
+        repo="org/a", fingerprint=fingerprint, limit=2
+    )
+    assert exact and exact[0].memory_id == "exact"
+    del hits
+    store.close()
+
+
+def test_related_failure_uses_repo_fts_not_exact_fingerprint(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    repo = RepoSpec(owner="org", name="example")
+    original = CIFailure(
+        summary="tests/test_add.py::test_add failed AssertionError",
+        log_excerpt="tests/test_add.py::test_add FAILED\nAssertionError: 1 != 2\n",
+        failed_commands=[["python", "-m", "pytest", "tests/test_add.py::test_add"]],
+        task_family="test",
+    )
+    related = CIFailure(
+        summary="tests/test_add.py::test_add failed TypeError",
+        log_excerpt="tests/test_add.py::test_add FAILED\nTypeError: bad operand\n",
+        failed_commands=[["python", "-m", "pytest", "tests/test_add.py::test_add"]],
+        task_family="test",
+    )
+    store.add_episode(
+        Episode(
+            id="add-assert",
+            run_id="run-assert",
+            repo=repo.full_name,
+            task_family="test",
+            failure_summary=original.summary,
+            attempts=1,
+            success=False,
+            failure_fingerprint=failure_fingerprint(repo, original),
+            attempted_fix_summaries=["change operator"],
+            attempted_files=["src/app.py"],
+            verification_failures=["AssertionError"],
+        )
+    )
+    assert failure_fingerprint(repo, original) != failure_fingerprint(repo, related)
+    exact = store.search_episodes_by_fingerprint(
+        repo=repo.full_name,
+        fingerprint=failure_fingerprint(repo, related),
+        limit=2,
+    )
+    fts = store.search_episodes(related.summary, repo=repo.full_name, limit=3)
+    retrieved = MemoryRetriever(store).retrieve(repo, related)
+    assert exact == []
+    assert any(hit.memory_id == "add-assert" for hit in fts)
+    assert any(hit.memory_id == "add-assert" for hit in retrieved.hits)
+    assert all("def add" not in hit.content for hit in retrieved.hits)
     store.close()
 
 

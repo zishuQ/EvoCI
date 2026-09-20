@@ -25,6 +25,7 @@ from evoci.capability.utility import SkillUtilityPolicy, WeightedUtilityPolicy
 from evoci.capability.validator import CandidateValidator
 from evoci.config import EvoCIConfig
 from evoci.domain.models import (
+    FailureClass,
     ReviewResult,
     SkillRef,
 )
@@ -36,6 +37,7 @@ from evoci.graph.routing import (
 )
 from evoci.graph.state import EvoCIState
 from evoci.memory.consolidation import MemoryConsolidator, commit_candidate
+from evoci.memory.fingerprint import failure_fingerprint
 from evoci.memory.models import Episode, MemoryCandidate
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import MemoryStore
@@ -98,6 +100,17 @@ def _context(state: EvoCIState, *, invocation_id: str = "graph:0") -> AgentConte
         previous_review_blockers=tuple(state.get("previous_review_blockers", [])),
         previous_attempt_summary=state.get("previous_attempt_summary"),
     )
+
+
+def _operation_key(state: EvoCIState, key_type: str, *components: str) -> str:
+    """Build an idempotency key scoped to one logical run.
+
+    Replaying the same run reuses the key. Running the same task in a later
+    campaign round produces a different key, allowing learning to continue.
+    """
+    prefix = f"{key_type}:{state['run_id']}"
+    suffix = ":".join(components)
+    return f"{prefix}:{suffix}" if suffix else prefix
 
 
 def _event(
@@ -182,6 +195,95 @@ def _attribution(
 _apply_edit = apply_edit
 _snapshot_edit_baseline = snapshot_edit_baseline
 _restore_edit_baseline = restore_edit_baseline
+_FIELD_LIMIT = 2_000
+_LIST_LIMIT = 20
+_ITEM_LIMIT = 400
+
+
+def _clip_text(value: str | None, limit: int = _FIELD_LIMIT) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 15] + "\n[truncated]"
+
+
+def _clip_list(
+    values: Sequence[str], *, limit: int = _LIST_LIMIT, item_limit: int = _ITEM_LIMIT
+) -> list[str]:
+    clipped: list[str] = []
+    for item in values[:limit]:
+        text = _clip_text(str(item), item_limit)
+        if text:
+            clipped.append(text)
+    return clipped
+
+
+def _classified_failure(exc: Exception, *, phase: str, **extra: Any) -> dict[str, Any]:
+    if isinstance(exc, RepairBudgetExhausted):
+        failure_class: FailureClass = "budget"
+    elif isinstance(exc, ModelGatewayError):
+        failure_class = "model"
+    else:
+        raise exc
+    payload = {
+        "phase": phase,
+        "status": "failed",
+        "failure_class": failure_class,
+        "failure_reason": str(exc),
+        **extra,
+    }
+    payload.setdefault("failure_stage", phase)
+    return payload
+
+
+def _has_domain_attempt(state: EvoCIState) -> bool:
+    return bool(
+        state.get("fixer_output")
+        or state.get("verification")
+        or state.get("verification_history")
+        or state.get("diagnosis")
+        or state.get("evidence")
+    )
+
+
+def _should_persist_episode(
+    *,
+    success: bool,
+    failure_class: FailureClass | None,
+    state: EvoCIState,
+) -> bool:
+    if success:
+        return True
+    has_patch = state.get("fixer_output") is not None
+    has_verification = bool(state.get("verification") or state.get("verification_history"))
+    if failure_class in {"model", "infrastructure"}:
+        return has_patch and has_verification
+    if failure_class == "budget":
+        return _has_domain_attempt(state)
+    if failure_class == "policy":
+        return has_patch
+    return True
+
+
+def _resolve_failure_class(state: EvoCIState, *, success: bool) -> FailureClass | None:
+    if success:
+        return None
+    recorded = state.get("failure_class")
+    if recorded is not None:
+        return recorded
+    classes = state.get("failure_classes") or []
+    if classes:
+        last = classes[-1]
+        if last in {"repair", "model", "budget", "policy", "infrastructure"}:
+            return last  # type: ignore[return-value]
+    if state.get("fixer_output") is not None:
+        return "repair"
+    reason = (state.get("failure_reason") or "").lower()
+    if "exhausted" in reason or "budget" in reason:
+        return "budget"
+    return "repair"
 
 
 async def persist_run_outcome(
@@ -190,15 +292,22 @@ async def persist_run_outcome(
     *,
     success: bool,
     failure_reason: str | None,
+    failure_class: str | None = None,
+    external_failure_details: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     config = runtime.config
     status: Literal["success", "failed"] = "success" if success else "failed"
+    resolved_class = failure_class or _resolve_failure_class(state, success=success)
     terminal = _event(
         runtime,
         state,
         EventType.RUN_COMPLETED if success else EventType.RUN_FAILED,
         discriminator="terminal",
-        payload={"status": status, "reason": failure_reason},
+        payload={
+            "status": status,
+            "reason": failure_reason,
+            "failure_class": resolved_class,
+        },
     )
     if runtime.run_store is not None:
         runtime.run_store.update_status(state["run_id"], status)
@@ -235,37 +344,69 @@ async def persist_run_outcome(
             )
         )
 
-    if runtime.memory_store is not None:
+    persist_episode = runtime.memory_store is not None and _should_persist_episode(
+        success=success,
+        failure_class=resolved_class,
+        state=state,
+    )
+    if persist_episode:
+        assert runtime.memory_store is not None
         try:
-            verification_failures = [
-                command.stderr or f"exit code {command.exit_code}"
-                for history in state.get("verification_history", [])
-                for command in history.commands
-                if command.exit_code != 0 or command.timed_out
-            ]
+            verification_failures = _clip_list(
+                [
+                    command.stderr or f"exit code {command.exit_code}"
+                    for history in state.get("verification_history", [])
+                    for command in history.commands
+                    if command.exit_code != 0 or command.timed_out
+                ]
+            )
             hypotheses = []
             if diagnosis is not None:
-                hypotheses = [
-                    diagnosis.primary.root_cause,
-                    *[alternative.root_cause for alternative in diagnosis.alternatives],
+                hypotheses = _clip_list(
+                    [
+                        diagnosis.primary.root_cause,
+                        *[alternative.root_cause for alternative in diagnosis.alternatives],
+                    ]
+                )
+            attempted_fixes = _clip_list(
+                [
+                    str((patch.get("proposal") or {}).get("summary") or "")
+                    for patch in trajectory.patch_history
+                    if isinstance(patch, dict)
                 ]
+            )
             episode = Episode(
                 id=f"episode:{state['run_id']}",
                 run_id=state["run_id"],
                 repo=state["repo"].full_name,
                 task_family=state["ci_failure"].task_family,
-                failure_summary=state["ci_failure"].summary,
-                root_cause=diagnosis.primary.root_cause if diagnosis else None,
+                failure_summary=_clip_text(state["ci_failure"].summary) or "",
+                root_cause=None if diagnosis is None else _clip_text(diagnosis.primary.root_cause),
                 important_evidence=[item.id for item in state.get("evidence", [])[:10]],
                 attempts=state.get("repair_attempt", 0),
                 successful_fix_summary=(
-                    output.proposal.summary if success and output is not None else None
+                    _clip_text(output.proposal.summary)
+                    if success and output is not None
+                    else None
                 ),
-                tools_used=[tool.tool_name for tool in trajectory.tool_calls],
+                tools_used=_clip_list([tool.tool_name for tool in trajectory.tool_calls]),
                 hypotheses_attempted=hypotheses,
                 verification_failures=verification_failures,
-                failure_reason=failure_reason,
+                failure_reason=_clip_text(failure_reason),
                 success=success,
+                failure_fingerprint=failure_fingerprint(state["repo"], state["ci_failure"]),
+                repo_revision=state["repo"].base_commit,
+                failure_class=resolved_class or "repair",
+                failure_stage=(
+                    None
+                    if success
+                    else (state.get("failure_stage") or state.get("phase"))
+                ),
+                attempted_fix_summaries=attempted_fixes,
+                attempted_files=_clip_list(
+                    [*trajectory.created_files, *trajectory.modified_files]
+                ),
+                external_failure_details=_clip_list(list(external_failure_details or ())),
             )
             runtime.memory_store.add_episode(episode)
             episode_id = episode.id
@@ -275,11 +416,16 @@ async def persist_run_outcome(
                     state,
                     EventType.MEMORY_CREATED,
                     discriminator="episode",
-                    payload={"episode_id": episode.id, "success": success},
+                    payload={
+                        "episode_id": episode.id,
+                        "success": success,
+                        "failure_class": resolved_class,
+                    },
                 )
             )
         except Exception as exc:
             learning_error("episode", exc)
+            raise RuntimeError(f"Critical: failed to persist episode: {exc}") from exc
 
     if runtime.capability_registry is not None:
         try:
@@ -303,16 +449,19 @@ async def persist_run_outcome(
                 ]
                 explicit_failure = any(trace.execution_success is False for trace in traces)
                 attributed_success = success and not explicit_failure
-                runtime.capability_registry.record_use(
-                    ref,
-                    success=attributed_success,
-                    tool_calls=trajectory.tool_call_count,
-                    attempts=state.get("repair_attempt", 0),
-                    patched=bool(trajectory.created_files or trajectory.modified_files),
-                    operation_key=(f"skill-use:{state['run_id']}:{ref.skill_id}:v{ref.version}"),
-                )
-                stats = runtime.capability_registry.stats(ref.skill_id, ref.version)
-                runtime.capability_registry.set_utility(ref, utility_policy.score(stats))
+                try:
+                    runtime.capability_registry.record_use(
+                        ref,
+                        success=attributed_success,
+                        tool_calls=trajectory.tool_call_count,
+                        attempts=state.get("repair_attempt", 0),
+                        patched=bool(trajectory.created_files or trajectory.modified_files),
+                        operation_key=_operation_key(state, "skill-use", ref.skill_id, f"v{ref.version}"),
+                    )
+                    stats = runtime.capability_registry.stats(ref.skill_id, ref.version)
+                    runtime.capability_registry.set_utility(ref, utility_policy.score(stats))
+                except Exception as exc:
+                    learning_error(f"skill_use_{ref.skill_id}_v{ref.version}", exc)
             selected = [
                 SkillVersionRef(skill_id=ref.skill_id, version=ref.version)
                 for ref in trajectory.skills_selected
@@ -321,28 +470,31 @@ async def persist_run_outcome(
                 record = runtime.capability_registry.get(ref.skill_id, ref.version)
                 if record is None:
                     continue
-                action = promotion_policy.apply(
-                    runtime.capability_registry,
-                    record,
-                    operation_key=(
-                        f"skill-lifecycle:{state['run_id']}:{ref.skill_id}:v{ref.version}"
-                    ),
-                )
-                if action not in {"promote", "reject"}:
-                    continue
-                events.append(
-                    _event(
-                        runtime,
-                        state,
-                        (
-                            EventType.SKILL_PROMOTED
-                            if action == "promote"
-                            else EventType.SKILL_REJECTED
+                try:
+                    action = promotion_policy.apply(
+                        runtime.capability_registry,
+                        record,
+                        operation_key=(
+                            f"skill-lifecycle:{state['run_id']}:{ref.skill_id}:v{ref.version}"
                         ),
-                        discriminator=f"{ref.skill_id}:v{ref.version}",
-                        payload=ref.model_dump(),
                     )
-                )
+                    if action not in {"promote", "reject"}:
+                        continue
+                    events.append(
+                        _event(
+                            runtime,
+                            state,
+                            (
+                                EventType.SKILL_PROMOTED
+                                if action == "promote"
+                                else EventType.SKILL_REJECTED
+                            ),
+                            discriminator=f"{ref.skill_id}:v{ref.version}",
+                            payload=ref.model_dump(),
+                        )
+                    )
+                except Exception as exc:
+                    learning_error(f"skill_promotion_{ref.skill_id}_v{ref.version}", exc)
         except Exception as exc:
             learning_error("skill_outcomes", exc)
 
@@ -383,7 +535,7 @@ async def persist_run_outcome(
                 runtime.memory_store,
                 candidate,
                 run_id=state["run_id"],
-                operation_key=f"memory-commit:{state['run_id']}",
+                operation_key=_operation_key(state, "memory-commit"),
             )
             if memory_id:
                 events.append(
@@ -399,10 +551,10 @@ async def persist_run_outcome(
             learning_error("memory_consolidation", exc)
 
     should_mine = False
-    if success and runtime.experience_miner is not None and runtime.capability_registry is not None:
+    if runtime.experience_miner is not None and runtime.capability_registry is not None:
         try:
             should_mine = runtime.experience_miner.should_mine(
-                success=True,
+                success=success,
                 tool_calls=trajectory.tool_call_count,
                 failed_attempts=len(trajectory.failed_attempts),
                 reusable_script_created=trajectory.reusable_script_created,
@@ -447,22 +599,25 @@ async def persist_run_outcome(
             learning_decision = decision.model_dump()
             if decision.action == "memory" and decision.candidate_memory:
                 if runtime.memory_store is not None:
-                    memory_id = commit_candidate(
-                        runtime.memory_store,
-                        decision.candidate_memory,
-                        run_id=state["run_id"],
-                        operation_key=f"learning-memory:{state['run_id']}",
-                    )
-                    if memory_id:
-                        events.append(
-                            _event(
-                                runtime,
-                                state,
-                                EventType.MEMORY_CREATED,
-                                discriminator="mined",
-                                payload={"memory_id": memory_id},
-                            )
+                    try:
+                        memory_id = commit_candidate(
+                            runtime.memory_store,
+                            decision.candidate_memory,
+                            run_id=state["run_id"],
+                            operation_key=_operation_key(state, "learning-memory"),
                         )
+                        if memory_id:
+                            events.append(
+                                _event(
+                                    runtime,
+                                    state,
+                                    EventType.MEMORY_CREATED,
+                                    discriminator="mined",
+                                    payload={"memory_id": memory_id},
+                                )
+                            )
+                    except Exception as exc:
+                        learning_error("learning_memory_commit", exc)
             elif decision.action in {"new_skill", "update_skill"}:
                 assert decision.candidate_skill is not None
                 create_kwargs: dict[str, Any] = {}
@@ -473,39 +628,42 @@ async def persist_run_outcome(
                         "skill_id": decision.target_skill_id,
                         "parent_version": decision.target_version,
                     }
-                created = capability_registry.create_candidate(
-                    decision.candidate_skill,
-                    operation_key=f"learning-skill:{state['run_id']}",
-                    **create_kwargs,
-                )
-                candidate_skill_id = created.manifest.skill_id
-                validation_passed: bool | None = None
-                if runtime.candidate_validator is not None:
-                    current = capability_registry.get(
-                        created.manifest.skill_id, created.manifest.version
+                try:
+                    created = capability_registry.create_candidate(
+                        decision.candidate_skill,
+                        operation_key=_operation_key(state, "learning-skill"),
+                        **create_kwargs,
                     )
-                    assert current is not None
-                    if current.manifest.status == "candidate":
-                        validation = await runtime.candidate_validator.avalidate_to_trial(
+                    candidate_skill_id = created.manifest.skill_id
+                    validation_passed: bool | None = None
+                    if runtime.candidate_validator is not None:
+                        current = capability_registry.get(
                             created.manifest.skill_id, created.manifest.version
                         )
-                        validation_passed = validation.passed
-                    else:
-                        validation_passed = current.manifest.status == "trial"
-                events.append(
-                    _event(
-                        runtime,
-                        state,
-                        EventType.SKILL_CANDIDATE_CREATED,
-                        discriminator=(f"{created.manifest.skill_id}:v{created.manifest.version}"),
-                        payload={
-                            "skill_id": created.manifest.skill_id,
-                            "version": created.manifest.version,
-                            "parent_version": created.manifest.parent_version,
-                            "validation_passed": validation_passed,
-                        },
+                        assert current is not None
+                        if current.manifest.status == "candidate":
+                            validation = await runtime.candidate_validator.avalidate_to_trial(
+                                created.manifest.skill_id, created.manifest.version
+                            )
+                            validation_passed = validation.passed
+                        else:
+                            validation_passed = current.manifest.status == "trial"
+                    events.append(
+                        _event(
+                            runtime,
+                            state,
+                            EventType.SKILL_CANDIDATE_CREATED,
+                            discriminator=(f"{created.manifest.skill_id}:v{created.manifest.version}"),
+                            payload={
+                                "skill_id": created.manifest.skill_id,
+                                "version": created.manifest.version,
+                                "parent_version": created.manifest.parent_version,
+                                "validation_passed": validation_passed,
+                            },
+                        )
                     )
-                )
+                except Exception as exc:
+                    learning_error("skill_candidate_creation", exc)
         except Exception as exc:
             learning_error("experience_mining", exc)
 
@@ -529,6 +687,8 @@ async def persist_run_outcome(
         "phase": "finalize" if success else "failed",
         "status": status,
         "failure_reason": failure_reason,
+        "failure_class": resolved_class,
+        "failure_stage": None if success else (state.get("failure_stage") or state.get("phase")),
         "episode_id": episode_id,
         "candidate_skill_id": candidate_skill_id,
         "learning_decision": learning_decision,
@@ -605,6 +765,9 @@ def build_graph(
             "previous_review_blockers": state.get("previous_review_blockers", []),
             "previous_attempt_summary": state.get("previous_attempt_summary"),
             "learning_errors": state.get("learning_errors", []),
+            "failure_class": state.get("failure_class"),
+            "failure_classes": [],
+            "failure_stage": state.get("failure_stage"),
             "events": [
                 _event(
                     runtime,
@@ -627,7 +790,10 @@ def build_graph(
         ]
         retrieval_events: list[RunEvent] = []
         if runtime.memory_retriever is not None:
-            retrieval = runtime.memory_retriever.retrieve(state["repo"], state["ci_failure"])
+            retrieval = runtime.memory_retriever.retrieve(
+                state["repo"],
+                state["ci_failure"],
+            )
             memories = retrieval.hits
             selected_memory_ids = retrieval.telemetry.selected_ids
             retrieval_events.append(
@@ -653,7 +819,8 @@ def build_graph(
             skills = runtime.capability_retriever.retrieve(
                 state["repo"],
                 state["ci_failure"],
-                operation_key=f"skill-retrieval:{state['run_id']}",
+                task_id=state["task_id"],
+                operation_key=_operation_key(state, "skill-retrieval"),
             )
             selected_skill_refs = [
                 SkillRef(skill_id=skill.skill_id, version=skill.version) for skill in skills
@@ -671,14 +838,24 @@ def build_graph(
                         for ref in selected_skill_refs
                     ],
                     selected=True,
-                    operation_key=f"skill-selection:{state['run_id']}",
+                    operation_key=_operation_key(state, "skill-selection"),
                 )
             retrieval_events.append(
                 _event(
                     runtime,
                     state,
                     EventType.SKILL_RETRIEVED,
-                    payload={"skills": [ref.model_dump() for ref in selected_skill_refs]},
+                    payload={
+                        "skills": [
+                            {
+                                "skill_id": skill.skill_id,
+                                "version": skill.version,
+                                "name": skill.name,
+                                "score": skill.score,
+                            }
+                            for skill in skills
+                        ]
+                    },
                 )
             )
             retrieval_events.append(
@@ -707,6 +884,8 @@ def build_graph(
             return {
                 "phase": "coordinate",
                 "status": "failed",
+                "failure_class": "budget",
+                "failure_stage": "coordinate",
                 "failure_reason": "investigation budget exhausted",
                 "investigation_plan": None,
             }
@@ -718,12 +897,7 @@ def build_graph(
                 remaining_task_budget=remaining,
             )
         except (RepairBudgetExhausted, ModelGatewayError) as exc:
-            return {
-                "phase": "coordinate",
-                "status": "failed",
-                "failure_reason": str(exc),
-                "investigation_plan": None,
-            }
+            return _classified_failure(exc, phase="coordinate", investigation_plan=None)
         per_round_limit = config.max_initial_workers if round_number == 1 else remaining
         allowed = min(remaining, per_round_limit)
         completed = set(state.get("completed_task_ids", []))
@@ -733,6 +907,8 @@ def build_graph(
             return {
                 "phase": "coordinate",
                 "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "coordinate",
                 "failure_reason": "coordinator produced no new investigation tasks",
                 "investigation_plan": bounded_plan,
                 "investigation_round": round_number,
@@ -782,11 +958,19 @@ def build_graph(
                 context=_context(state, invocation_id=invocation_id),
                 capabilities=INVESTIGATOR_CAPABILITIES,
             )
-        except (RepairBudgetExhausted, ModelGatewayError) as exc:
+        except RepairBudgetExhausted as exc:
             return {
                 "completed_task_ids": [task.task_id],
                 "evidence": [],
                 "budget_failures": [str(exc)],
+                "failure_classes": ["budget"],
+            }
+        except ModelGatewayError as exc:
+            return {
+                "completed_task_ids": [task.task_id],
+                "evidence": [],
+                "budget_failures": [str(exc)],
+                "failure_classes": ["model"],
             }
         usage_events, used_memories, used_skills = _attribution(
             runtime,
@@ -830,10 +1014,17 @@ def build_graph(
 
     async def diagnose(state: EvoCIState) -> dict[str, Any]:
         if state.get("status") == "failed" or state.get("budget_failures"):
+            classes = state.get("failure_classes") or []
+            inherited = classes[-1] if classes else state.get("failure_class")
+            allowed = {"repair", "model", "budget", "policy", "infrastructure"}
+            failure_class: FailureClass = inherited if inherited in allowed else "budget"
             return {
                 "phase": "diagnose",
                 "diagnosis": None,
                 "status": "failed",
+                "failure_class": failure_class,
+                "failure_stage": state.get("failure_stage")
+                or ("investigate" if state.get("budget_failures") else "diagnose"),
                 "failure_reason": (state.get("budget_failures", ["repair budget exhausted"])[0]),
             }
         invocation_id = f"diagnosis:{state.get('investigation_round', 0)}"
@@ -843,12 +1034,7 @@ def build_graph(
                 evidence=state.get("evidence", []),
             )
         except (RepairBudgetExhausted, ModelGatewayError) as exc:
-            return {
-                "phase": "diagnose",
-                "status": "failed",
-                "failure_reason": str(exc),
-                "diagnosis": None,
-            }
+            return _classified_failure(exc, phase="diagnose", diagnosis=None)
         events = [
             _event(
                 runtime,
@@ -890,7 +1076,12 @@ def build_graph(
     async def repair(state: EvoCIState) -> dict[str, Any]:
         diagnosis = state.get("diagnosis")
         if diagnosis is None:
-            return {"status": "failed", "failure_reason": "repair has no diagnosis"}
+            return {
+                "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "repair",
+                "failure_reason": "repair has no diagnosis",
+            }
         attempt = state.get("repair_attempt", 0) + 1
         invocation_id = f"repair:{attempt}"
         try:
@@ -901,13 +1092,9 @@ def build_graph(
                 previous_verification=state.get("verification"),
             )
         except (RepairBudgetExhausted, ModelGatewayError) as exc:
-            return {
-                "phase": "repair",
-                "repair_attempt": attempt,
-                "status": "failed",
-                "failure_reason": str(exc),
-                "fixer_output": None,
-            }
+            return _classified_failure(
+                exc, phase="repair", repair_attempt=attempt, fixer_output=None
+            )
         baseline = _snapshot_edit_baseline(Path(state["workspace_path"]), output.edits)
         targets = attempt_targets(output.edits)
         usage_events, used_memories, used_skills = _attribution(
@@ -946,7 +1133,12 @@ def build_graph(
     async def approval(state: EvoCIState) -> dict[str, Any]:
         output = state.get("fixer_output")
         if output is None:
-            return {"status": "failed", "failure_reason": "approval has no patch"}
+            return {
+                "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "approval",
+                "failure_reason": "approval has no patch",
+            }
         if not requires_approval(output):
             return {"phase": "approval", "approved": True}
         if runtime.run_store is not None:
@@ -987,6 +1179,8 @@ def build_graph(
             "phase": "approval",
             "approved": approved,
             "status": "running" if approved else "failed",
+            "failure_class": None if approved else "policy",
+            "failure_stage": None if approved else "approval",
             "failure_reason": None if approved else "patch rejected by human",
             "events": events,
         }
@@ -1042,6 +1236,8 @@ def build_graph(
             return {
                 "phase": "rollback_attempt",
                 "status": "failed",
+                "failure_class": "infrastructure",
+                "failure_stage": "rollback_attempt",
                 "failure_reason": f"attempt rollback failed: {exc}",
                 "events": events,
             }
@@ -1070,7 +1266,12 @@ def build_graph(
     async def apply_patch(state: EvoCIState) -> dict[str, Any]:
         output = state.get("fixer_output")
         if output is None:
-            return {"status": "failed", "failure_reason": "apply has no patch"}
+            return {
+                "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "apply_patch",
+                "failure_reason": "apply has no patch",
+            }
         root = Path(state["workspace_path"])
         tools = FileTools(root, writable=True, max_chars=config.output_limit_chars)
         events: list[RunEvent] = []
@@ -1080,11 +1281,13 @@ def build_graph(
         def restore() -> None:
             restore_attempt_writes(root, baseline, written)
 
-        def failed(reason: str) -> dict[str, Any]:
+        def failed(reason: str, *, failure_class: FailureClass = "repair") -> dict[str, Any]:
             restore()
             return {
                 "phase": "apply_patch",
                 "status": "failed",
+                "failure_class": failure_class,
+                "failure_stage": "apply_patch",
                 "failure_reason": reason,
                 "attempt_written": written,
                 "events": events,
@@ -1100,7 +1303,7 @@ def build_graph(
                 try:
                     consume_tool(state)
                 except RepairBudgetExhausted as exc:
-                    return failed(str(exc))
+                    return failed(str(exc), failure_class="budget")
                 events.append(
                     _event(
                         runtime,
@@ -1169,7 +1372,7 @@ def build_graph(
                 )
             return {"phase": "apply_patch", "attempt_written": written, "events": events}
         except RepairBudgetExhausted as exc:
-            return failed(str(exc))
+            return failed(str(exc), failure_class="budget")
         except (PatchConflict, PatchError) as exc:
             return failed(f"patch apply failed: {exc}")
         except BaseException:
@@ -1179,7 +1382,12 @@ def build_graph(
     async def verify(state: EvoCIState) -> dict[str, Any]:
         output = state.get("fixer_output")
         if output is None:
-            return {"status": "failed", "failure_reason": "verify has no patch"}
+            return {
+                "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "verify",
+                "failure_reason": "verify has no patch",
+            }
         planned = build_verification_plan(
             state["ci_failure"].failed_commands,
             output.proposal.verification_plan,
@@ -1296,8 +1504,12 @@ def build_graph(
         status_update: dict[str, Any] = {}
         if verification.status == "unavailable":
             status_update["status"] = "failed"
+            status_update["failure_class"] = "repair"
+            status_update["failure_stage"] = "verify"
             failure_reason = verification.incomplete_reason
         elif not verification.passed and attempt >= config.max_repair_attempts:
+            status_update["failure_class"] = "repair"
+            status_update["failure_stage"] = "verify"
             failure_reason = (
                 verification.incomplete_reason
                 or "verification failed after repair budget was exhausted"
@@ -1342,10 +1554,17 @@ def build_graph(
         diagnosis = state.get("diagnosis")
         verification = state.get("verification")
         if output is None or diagnosis is None or verification is None:
-            return {"status": "failed", "failure_reason": "review context incomplete"}
+            return {
+                "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "review",
+                "failure_reason": "review context incomplete",
+            }
         if not verification.passed:
             return {
                 "status": "failed",
+                "failure_class": "repair",
+                "failure_stage": "review",
                 "failure_reason": "review cannot override hard verification failure",
             }
         invocation_id = f"review:{state.get('repair_attempt', 0)}"
@@ -1370,11 +1589,7 @@ def build_graph(
                     verification=verification,
                 )
             except (RepairBudgetExhausted, ModelGatewayError) as exc:
-                return {
-                    "phase": "review",
-                    "status": "failed",
-                    "failure_reason": str(exc),
-                }
+                return _classified_failure(exc, phase="review")
         usage_events, used_memories, used_skills = _attribution(
             runtime,
             state,
@@ -1411,6 +1626,18 @@ def build_graph(
                 if not result.accepted
                 else None
             ),
+            "failure_class": (
+                "repair"
+                if not result.accepted
+                and state.get("repair_attempt", 0) >= config.max_repair_attempts
+                else None
+            ),
+            "failure_stage": (
+                "review"
+                if not result.accepted
+                and state.get("repair_attempt", 0) >= config.max_repair_attempts
+                else None
+            ),
             "failure_reason": (
                 "; ".join(result.blockers) or "review rejected final repair attempt"
                 if not result.accepted
@@ -1440,10 +1667,18 @@ def build_graph(
         return "failed"
 
     async def persist_outcome(
-        state: EvoCIState, *, success: bool, failure_reason: str | None
+        state: EvoCIState,
+        *,
+        success: bool,
+        failure_reason: str | None,
+        failure_class: str | None = None,
     ) -> dict[str, Any]:
         return await persist_run_outcome(
-            runtime, state, success=success, failure_reason=failure_reason
+            runtime,
+            state,
+            success=success,
+            failure_reason=failure_reason,
+            failure_class=failure_class,
         )
 
     async def finalize(state: EvoCIState) -> dict[str, Any]:
@@ -1458,7 +1693,12 @@ def build_graph(
 
     async def failed(state: EvoCIState) -> dict[str, Any]:
         reason = state.get("failure_reason") or "orchestration budget exhausted"
-        return await persist_outcome(state, success=False, failure_reason=reason)
+        return await persist_outcome(
+            state,
+            success=False,
+            failure_reason=reason,
+            failure_class=_resolve_failure_class(state, success=False),
+        )
 
     builder = StateGraph(EvoCIState)
     builder.add_node("bootstrap", bootstrap)

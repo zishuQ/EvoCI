@@ -18,6 +18,7 @@ class PatchApplicationResult(BaseModel):
 
     created_files: list[str] = Field(default_factory=list)
     modified_files: list[str] = Field(default_factory=list)
+    deleted_files: list[str] = Field(default_factory=list)
 
 
 class FileTools:
@@ -25,6 +26,30 @@ class FileTools:
         self.boundary = WorkspaceBoundary(root)
         self.writable = writable
         self.max_chars = max_chars
+
+    def _require_write(self) -> None:
+        if not self.writable:
+            raise PolicyViolation("worker does not have write permission")
+
+    def _resolve_regular_file(self, path: str, *, must_exist: bool) -> Path:
+        relative = Path(path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise PolicyViolation(f"path escapes workspace: {path}")
+        raw = self.boundary.root / relative
+        if raw.is_symlink():
+            raise PolicyViolation(f"refusing to operate on symlink: {path}")
+        target = self.boundary.resolve(path, must_exist=must_exist)
+        if target.is_symlink():
+            raise PolicyViolation(f"refusing to operate on symlink: {path}")
+        if target.exists() and not stat.S_ISREG(target.stat().st_mode):
+            raise PolicyViolation(f"target is not a regular file: {path}")
+        return target
+
+    def _read_utf8_text(self, target: Path, path: str) -> str:
+        try:
+            return target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise PolicyViolation(f"file is not valid UTF-8 text: {path}") from exc
 
     def read_file(self, path: str) -> str:
         target = self.boundary.resolve(path, must_exist=True)
@@ -83,8 +108,7 @@ class FileTools:
 
     def apply_patch(self, files: dict[str, str]) -> PatchApplicationResult:
         """Apply a bounded set of full-file replacements through the writer boundary."""
-        if not self.writable:
-            raise PolicyViolation("worker does not have write permission")
+        self._require_write()
         if len(files) > 20:
             raise PolicyViolation("patch changes too many files")
         created: list[str] = []
@@ -95,3 +119,38 @@ class FileTools:
             self.write_file(path, content)
             (modified if existed else created).append(path)
         return PatchApplicationResult(created_files=created, modified_files=modified)
+
+    def replace_text(
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        expected_replacements: int = 1,
+    ) -> PatchApplicationResult:
+        self._require_write()
+        if not old_text:
+            raise PolicyViolation("old_text must not be empty")
+        target = self._resolve_regular_file(path, must_exist=True)
+        content = self._read_utf8_text(target, path)
+        matches = content.count(old_text)
+        if matches != expected_replacements:
+            raise PolicyViolation(
+                f"replace_text expected {expected_replacements} occurrence(s) of old_text "
+                f"in {path}, found {matches}"
+            )
+        self.write_file(path, content.replace(old_text, new_text, expected_replacements))
+        return PatchApplicationResult(modified_files=[path])
+
+    def create_file(self, path: str, content: str) -> PatchApplicationResult:
+        self._require_write()
+        target = self._resolve_regular_file(path, must_exist=False)
+        if target.exists():
+            raise PolicyViolation(f"file already exists: {path}")
+        self.write_file(path, content)
+        return PatchApplicationResult(created_files=[path])
+
+    def delete_file(self, path: str) -> PatchApplicationResult:
+        self._require_write()
+        target = self._resolve_regular_file(path, must_exist=True)
+        target.unlink()
+        return PatchApplicationResult(deleted_files=[path])

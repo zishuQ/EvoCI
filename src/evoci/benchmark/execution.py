@@ -170,14 +170,21 @@ def prepare_workspace(
         source = Path(prepared.workspace_path).resolve()
         if not source.is_dir():
             raise FileNotFoundError(f"benchmark workspace does not exist: {source}")
-        if not (source / ".git").exists():
-            destination = worktrees_dir.resolve() / run_id
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                raise FileExistsError(f"benchmark workspace already exists: {destination}")
-            shutil.copytree(source, destination)
-            return destination, prepared.model_copy(update={"workspace_path": str(destination)})
-        source_location = str(source)
+        # Prepared benchmark rows are already pinned to a local failing workspace.
+        # Copy Git and files locally; never fall back to a network clone for them.
+        destination = worktrees_dir.resolve() / run_id
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            # Campaign run ids are deterministic.  An interrupted/error task may
+            # already have a workspace and graph checkpoint; keep both so resume
+            # does not discard completed model/tool work.
+            if destination.is_dir():
+                return destination, prepared.model_copy(
+                    update={"workspace_path": str(destination)}
+                )
+            raise FileExistsError(f"benchmark workspace path is not a directory: {destination}")
+        shutil.copytree(source, destination)
+        return destination, prepared.model_copy(update={"workspace_path": str(destination)})
     else:
         source_location = f"https://github.com/{view.repo_owner}/{view.repo_name}.git"
     cache = repo_cache_dir.resolve() / f"{view.repo_owner}-{view.repo_name}.git"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, is_dataclass
 from time import monotonic
 from typing import Any, TypeVar, cast
@@ -136,24 +137,29 @@ class BoundedToolAgent:
                 ToolLoopMessage(
                     role="assistant",
                     content=response.content,
+                    reasoning_content=response.reasoning_content,
                     tool_calls=response.tool_calls,
                 )
             )
             if not response.tool_calls:
                 should_finalize = True
                 break
-            for call in response.tool_calls:
+            budget_exhausted = False
+            for idx, call in enumerate(response.tool_calls):
                 tool_count += 1
                 if tool_count > self.max_tool_calls:
-                    messages.append(
-                        ToolLoopMessage(
-                            role="tool",
-                            tool_call_id=call.call_id,
-                            content=json.dumps(
-                                {"error": "leaf tool-call budget exhausted"}, sort_keys=True
-                            ),
+                    # Add error responses for all remaining tool_calls to satisfy API protocol
+                    budget_exhausted = True
+                    for remaining_call in response.tool_calls[idx:]:
+                        messages.append(
+                            ToolLoopMessage(
+                                role="tool",
+                                tool_call_id=remaining_call.call_id,
+                                content=json.dumps(
+                                    {"error": "leaf tool-call budget exhausted"}, sort_keys=True
+                                ),
+                            )
                         )
-                    )
                     self.recorder.emit(
                         run_id=run_id,
                         event_type=EventType.ATTEMPT_FAILED,
@@ -168,6 +174,8 @@ class BoundedToolAgent:
                         },
                     )
                     should_finalize = True
+                    break
+                if budget_exhausted:
                     break
                 if budget is not None:
                     budget.consume_tool_call()
@@ -196,7 +204,7 @@ class BoundedToolAgent:
                 except (PolicyViolation, ValidationError) as exc:
                     rejected = True
                     error = f"{type(exc).__name__}: {exc}"
-                except (KeyError, ValueError, TypeError, RuntimeError, OSError) as exc:
+                except (KeyError, ValueError, TypeError, RuntimeError, OSError, re.error) as exc:
                     rejected = call.name in {"run_skill_script", "read_skill_resource"}
                     error = f"{type(exc).__name__}: {exc}"
                 serialized = _serializable(result)

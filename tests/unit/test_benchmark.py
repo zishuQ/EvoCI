@@ -7,6 +7,7 @@ import pytest
 from evoci.agents.base import AgentSuite
 from evoci.benchmark.adapters import FixtureAdapter, normalize_ci_failure
 from evoci.benchmark.execution import FailedCommandReplayVerifier, collect_metrics
+from evoci.benchmark.execution import prepare_workspace
 from evoci.benchmark.manifest import generate_balanced_manifest
 from evoci.benchmark.models import (
     AgentTaskView,
@@ -160,6 +161,42 @@ async def test_benchmark_runner_resume_retries_errors_only(tmp_path: Path) -> No
     calls.clear()
     (tmp_path / "runs.jsonl").write_text(
         completed.model_dump_json() + "\n" + error.model_dump_json() + "\n"
+    )
+    await BenchmarkRunner(run_task).run(
+        [
+            BenchmarkManifestEntry(task_id="done", category="x"),
+            BenchmarkManifestEntry(task_id="retry", category="x"),
+        ],
+        variant="evo",
+        output_dir=tmp_path,
+        resume=True,
+    )
+    assert calls == ["retry"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_runner_resume_retries_infra_error(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del variant
+        calls.append(entry.task_id)
+        return _benchmark_metrics("passed")
+
+    infra = BenchmarkResult(
+        task_id="retry",
+        variant="evo",
+        status="infra_error",
+        metrics=_benchmark_metrics("infra_error"),
+    )
+    done = BenchmarkResult(
+        task_id="done",
+        variant="evo",
+        status="resolved",
+        metrics=_benchmark_metrics("passed"),
+    )
+    (tmp_path / "runs.jsonl").write_text(
+        done.model_dump_json() + "\n" + infra.model_dump_json() + "\n"
     )
     await BenchmarkRunner(run_task).run(
         [
@@ -475,6 +512,24 @@ async def test_not_available_is_coverage_not_agent_failure(tmp_path: Path) -> No
     assert aggregate["not_available"] == 1
     assert aggregate["evaluation_coverage"] == pytest.approx(2 / 3)
     assert aggregate["benchmark_success_rate"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_infra_error_is_not_counted_as_model_failure(tmp_path: Path) -> None:
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del entry, variant
+        return _benchmark_metrics("infra_error")
+
+    results = await BenchmarkRunner(run_task).run(  # type: ignore[arg-type]
+        [BenchmarkManifestEntry(task_id="one", category="test")],
+        variant="multi",
+        output_dir=tmp_path,
+    )
+    aggregate = json.loads((tmp_path / "aggregate.json").read_text())
+    assert results[0].status == "infra_error"
+    assert aggregate["infra_errors"] == 1
+    assert aggregate["evaluable"] == 0
+    assert aggregate["benchmark_success_rate"] is None
 
 
 @pytest.mark.asyncio

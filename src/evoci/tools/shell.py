@@ -9,7 +9,7 @@ import signal
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -47,6 +47,18 @@ def _kill_process_group(process: Any) -> None:
 
 
 _process_cancel: ContextVar[threading.Event | None] = ContextVar("process_cancel", default=None)
+ContainerExecutor = Callable[[list[str], str, bool], Awaitable[CommandResult]]
+_container_executor: ContextVar[ContainerExecutor | None] = ContextVar(
+    "container_executor", default=None
+)
+
+
+def set_container_executor(executor: ContainerExecutor) -> Any:
+    return _container_executor.set(executor)
+
+
+def reset_container_executor(token: Any) -> None:
+    _container_executor.reset(token)
 
 
 async def run_cancellable[T](function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -156,6 +168,9 @@ class CommandRunner:
         network: bool = False,
         extra_env: dict[str, str] | None = None,
     ) -> CommandResult:
+        executor = _container_executor.get()
+        if executor is not None:
+            return await executor(argv, cwd, network)
         return await run_cancellable(
             self.run_sync,
             argv,

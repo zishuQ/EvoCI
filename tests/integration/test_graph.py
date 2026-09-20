@@ -35,6 +35,7 @@ from evoci.domain.models import (
     WorkerResult,
 )
 from evoci.graph.builder import GraphRuntime, build_graph
+from evoci.memory.fingerprint import failure_fingerprint
 from evoci.memory.models import MemoryCandidate
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import SQLiteMemoryStore
@@ -324,10 +325,15 @@ async def test_model_gateway_failure_ends_run_without_graph_traceback(tmp_path: 
         FakeDiagnoser(),
     )
 
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    runtime = replace(runtime, memory_store=memory_store)
     result = await build_graph(runtime).ainvoke(initial_state(tmp_path, run_id="model-failure"))
 
     assert result["status"] == "failed"
+    assert result["failure_class"] == "model"
     assert "model call failed after 3 attempts" in str(result["failure_reason"])
+    assert memory_store.get_episode("model-failure") is None
+    memory_store.close()
 
 
 @pytest.mark.asyncio
@@ -1090,7 +1096,279 @@ async def test_new_skill_collision_is_learning_conflict_not_orphan_version(
 
     assert result["status"] == "success"
     assert result["candidate_skill_id"] is None
-    assert result["learning_errors"][0]["stage"] == "experience_mining"
+    assert result["learning_errors"][0]["stage"] == "skill_candidate_creation"
     assert registry.get(original.manifest.skill_id, 2) is None
     assert len(registry.list()) == 1
     registry.close()
+
+
+def _campaign_state(round_number: int, task_id: str) -> dict[str, object]:
+    run_id = f"campaign-demo-r{round_number}-{task_id}"
+    return {
+        "run_id": run_id,
+        "task_id": task_id,
+        "campaign_provenance": {
+            "campaign_id": "demo",
+            "round": round_number,
+            "task_id": task_id,
+            "run_id": run_id,
+            "read_generation": round_number - 1,
+        },
+    }
+
+
+def test_operation_key_is_scoped_to_run_id_across_campaign_rounds() -> None:
+    round1_task_a = _campaign_state(1, "django-123")
+    round1_task_b = _campaign_state(1, "flask-456")
+    round2_task_a = _campaign_state(2, "django-123")
+
+    first = graph_builder_module._operation_key(round1_task_a, "learning-memory")
+    replayed = graph_builder_module._operation_key(round1_task_a, "learning-memory")
+    assert first == replayed == "learning-memory:campaign-demo-r1-django-123"
+
+    round2 = graph_builder_module._operation_key(round2_task_a, "learning-memory")
+    assert round2 == "learning-memory:campaign-demo-r2-django-123"
+    assert first != round2
+
+    other_task = graph_builder_module._operation_key(round1_task_b, "learning-memory")
+    assert other_task == "learning-memory:campaign-demo-r1-flask-456"
+    assert first != other_task
+
+    skill_v1 = graph_builder_module._operation_key(
+        round1_task_a, "skill-use", "fix-django", "v1"
+    )
+    skill_v2 = graph_builder_module._operation_key(
+        round1_task_a, "skill-use", "fix-django", "v2"
+    )
+    assert skill_v1 == "skill-use:campaign-demo-r1-django-123:fix-django:v1"
+    assert skill_v2 == "skill-use:campaign-demo-r1-django-123:fix-django:v2"
+    assert skill_v1 != skill_v2
+
+    normal = {"run_id": "run-abc123", "task_id": "task-1"}
+    normal_key = graph_builder_module._operation_key(normal, "memory-commit")
+    normal_replay = graph_builder_module._operation_key(normal, "memory-commit")
+    other_run = graph_builder_module._operation_key(
+        {"run_id": "run-def456", "task_id": "task-1"}, "memory-commit"
+    )
+    assert normal_key == normal_replay == "memory-commit:run-abc123"
+    assert normal_key != other_run
+
+
+@pytest.mark.asyncio
+async def test_unknown_runtime_bug_is_not_swallowed_as_model_failure(tmp_path: Path) -> None:
+    graph = build_graph(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("a")]]),
+            FakeInvestigator(fail_once="a"),
+            FakeDiagnoser(),
+        )
+    )
+    with pytest.raises(RuntimeError, match="simulated worker crash"):
+        await graph.ainvoke(initial_state(tmp_path, run_id="bug-run"))
+
+
+@pytest.mark.asyncio
+async def test_verified_patch_failure_writes_rich_episode(tmp_path: Path) -> None:
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runtime = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("repo")]]),
+            FakeInvestigator(),
+            FakeDiagnoser(),
+            FakeFixer(edit=FileEdit(path="app.py", content="VALUE = 2\n")),
+        ),
+        config=EvoCIConfig.from_env(cwd=tmp_path).model_copy(update={"max_repair_attempts": 1}),
+        memory_store=memory_store,
+        recorder=TrajectoryRecorder(),
+    )
+    state = initial_state(tmp_path, run_id="rich-fail")
+    state["repo"] = RepoSpec(owner="org", name="example")
+    state["ci_failure"] = CIFailure(
+        summary="tests/test_add.py::test_add failed AssertionError",
+        log_excerpt="tests/test_add.py::test_add FAILED\nAssertionError: 1 != 2\n",
+        failed_commands=[["python", "-c", "raise SystemExit(1)"]],
+        task_family="test",
+    )
+    result = await build_graph(runtime).ainvoke(state)
+    assert result["status"] == "failed"
+    assert result["failure_class"] == "repair"
+    episode = memory_store.get_episode("rich-fail")
+    assert episode is not None
+    assert episode.failure_fingerprint
+    assert episode.attempted_files
+    assert episode.verification_failures
+    assert "VALUE = 2" not in str(episode.model_dump())
+    content = memory_store.search_episodes("AssertionError", repo="org/example", limit=1)[0].content
+    assert "OUTCOME=failed" in content
+    assert "HYPOTHESIS (unverified)" in content
+    assert "ATTEMPTED_FIXES" in content
+    memory_store.close()
+
+
+@pytest.mark.asyncio
+async def test_verification_failure_preserves_stage_after_rollback(tmp_path: Path) -> None:
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runtime = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("repo")]]),
+            FakeInvestigator(),
+            FakeDiagnoser(),
+            FakeFixer(edit=FileEdit(path="app.py", content="VALUE = 2\n")),
+        ),
+        config=EvoCIConfig.from_env(cwd=tmp_path).model_copy(update={"max_repair_attempts": 1}),
+        memory_store=memory_store,
+        recorder=TrajectoryRecorder(),
+    )
+    state = initial_state(tmp_path, run_id="stage-verify")
+    state["ci_failure"] = CIFailure(
+        summary="assertion failed",
+        log_excerpt="AssertionError",
+        failed_commands=[["python", "-c", "raise SystemExit(1)"]],
+        task_family="test",
+    )
+    result = await build_graph(runtime).ainvoke(state)
+    assert result["status"] == "failed"
+    assert result["failure_stage"] == "verify"
+    episode = memory_store.get_episode("stage-verify")
+    assert episode is not None
+    assert episode.failure_stage == "verify"
+    memory_store.close()
+
+
+@pytest.mark.asyncio
+async def test_rollback_failure_records_infrastructure_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: object, **kwargs: object) -> tuple[list[str], list[str]]:
+        del args, kwargs
+        raise OSError("disk full")
+
+    monkeypatch.setattr(graph_builder_module, "_restore_edit_baseline", boom)
+    monkeypatch.setattr(graph_builder_module, "restore_attempt_writes", boom)
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runtime = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("repo")]]),
+            FakeInvestigator(),
+            FakeDiagnoser(),
+            FakeFixer(edit=FileEdit(path="app.py", content="VALUE = 2\n")),
+        ),
+        config=EvoCIConfig.from_env(cwd=tmp_path).model_copy(update={"max_repair_attempts": 1}),
+        memory_store=memory_store,
+        recorder=TrajectoryRecorder(),
+    )
+    state = initial_state(tmp_path, run_id="stage-rollback")
+    state["ci_failure"] = CIFailure(
+        summary="assertion failed",
+        log_excerpt="AssertionError",
+        failed_commands=[["python", "-c", "raise SystemExit(1)"]],
+        task_family="test",
+    )
+    result = await build_graph(runtime).ainvoke(state)
+    assert result["status"] == "failed"
+    assert result["failure_class"] == "infrastructure"
+    assert result["failure_stage"] == "rollback_attempt"
+    episode = memory_store.get_episode("stage-rollback")
+    assert episode is not None
+    assert episode.failure_stage == "rollback_attempt"
+    memory_store.close()
+
+
+@pytest.mark.asyncio
+async def test_success_episode_has_no_failure_stage(tmp_path: Path) -> None:
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    runtime = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("a")]]),
+            FakeInvestigator(),
+            FakeDiagnoser(),
+        ),
+        memory_store=memory_store,
+    )
+    result = await build_graph(runtime).ainvoke(initial_state(tmp_path, run_id="success-stage"))
+    assert result["status"] == "success"
+    assert result.get("failure_stage") is None
+    episode = memory_store.get_episode("success-stage")
+    assert episode is not None
+    assert episode.failure_stage is None
+    memory_store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_ci_failure_is_retrieved_by_fingerprint_not_task_id(
+    tmp_path: Path,
+) -> None:
+    memory_store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    repo = RepoSpec(owner="org", name="example")
+    first_failure = CIFailure(
+        summary="tests/test_add.py::test_add failed AssertionError",
+        log_excerpt="tests/test_add.py::test_add FAILED\nAssertionError: 1 != 2\n",
+        failed_commands=[["python", "-c", "raise SystemExit(1)"]],
+        task_family="test",
+    )
+    first = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("repo")]]),
+            FakeInvestigator(),
+            FakeDiagnoser(),
+            FakeFixer(edit=FileEdit(path="app.py", content="VALUE = 2\n")),
+        ),
+        config=EvoCIConfig.from_env(cwd=tmp_path).model_copy(update={"max_repair_attempts": 1}),
+        memory_store=memory_store,
+        recorder=TrajectoryRecorder(),
+    )
+    state_a = initial_state(tmp_path, run_id="ci-run-1")
+    state_a["task_id"] = "first-task"
+    state_a["repo"] = repo
+    state_a["ci_failure"] = first_failure
+    result_a = await build_graph(first).ainvoke(state_a)
+    assert result_a["status"] == "failed"
+    episode = memory_store.get_episode("ci-run-1")
+    assert episode is not None
+
+    noisy = CIFailure(
+        summary="tests/test_add.py::test_add failed AssertionError",
+        log_excerpt=(
+            "2026-09-20T08:11:00Z tests/test_add.py::test_add FAILED\n"
+            "AssertionError: 1 != 2\n"
+            "File /tmp/pytest-of-ci/pytest-99/workspace/src/unused.py, line 88, in add\n"
+            "uuid=11111111-2222-3333-4444-555555555555\n"
+        ),
+        failed_commands=[["python", "-c", "raise SystemExit(1)"]],
+        task_family="test",
+    )
+
+    assert failure_fingerprint(repo, first_failure) == failure_fingerprint(repo, noisy)
+    second = replace(
+        make_runtime(
+            tmp_path,
+            FakeCoordinator([[task("repo")]]),
+            MemoryUsingInvestigator(),
+            FakeDiagnoser(),
+            FakeFixer(edit=FileEdit(path="app.py", content="VALUE = 2\n")),
+        ),
+        config=EvoCIConfig.from_env(cwd=tmp_path).model_copy(update={"max_repair_attempts": 1}),
+        memory_store=memory_store,
+        memory_retriever=MemoryRetriever(memory_store),
+        recorder=TrajectoryRecorder(),
+    )
+    state_b = initial_state(tmp_path, run_id="ci-run-2")
+    state_b["task_id"] = "completely-different-task"
+    state_b["repo"] = repo
+    state_b["ci_failure"] = noisy
+    result_b = await build_graph(second).ainvoke(state_b)
+    contents = [hit.content for hit in result_b["retrieved_memories"]]
+    assert any("OUTCOME=failed" in content for content in contents)
+    assert any("counterevidence" not in content for content in contents)
+    assert episode.failure_fingerprint == failure_fingerprint(repo, noisy)
+    memory_store.close()
