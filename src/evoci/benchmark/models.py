@@ -173,8 +173,18 @@ class RunMetrics(BaseModel):
     llm_calls: int = Field(default=0, ge=0)
     repair_model_calls: int = Field(default=0, ge=0)
     post_run_model_calls: int = Field(default=0, ge=0)
+    provider_requests: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    repair_input_tokens: int = Field(default=0, ge=0)
+    repair_output_tokens: int = Field(default=0, ge=0)
+    repair_tokens: int = Field(default=0, ge=0)
+    learning_input_tokens: int = Field(default=0, ge=0)
+    learning_output_tokens: int = Field(default=0, ge=0)
+    learning_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
     tool_calls: int = Field(default=0, ge=0)
     repair_tool_calls: int = Field(default=0, ge=0)
     post_run_tool_calls: int = Field(default=0, ge=0)
@@ -200,6 +210,35 @@ class RunMetrics(BaseModel):
     skill_registry_size: int = Field(default=0, ge=0)
     active_skill_count: int = Field(default=0, ge=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def fill_token_totals(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        input_tokens = int(payload.get("input_tokens") or 0)
+        output_tokens = int(payload.get("output_tokens") or 0)
+        if "repair_input_tokens" not in payload and "learning_input_tokens" not in payload:
+            payload["repair_input_tokens"] = input_tokens
+            payload["repair_output_tokens"] = output_tokens
+        repair_input = int(payload.get("repair_input_tokens") or 0)
+        repair_output = int(payload.get("repair_output_tokens") or 0)
+        learning_input = int(payload.get("learning_input_tokens") or 0)
+        learning_output = int(payload.get("learning_output_tokens") or 0)
+        computed_total = input_tokens + output_tokens
+        computed_repair = repair_input + repair_output
+        computed_learning = learning_input + learning_output
+        if int(payload.get("total_tokens") or 0) == 0 and computed_total:
+            payload["total_tokens"] = computed_total
+        if int(payload.get("repair_tokens") or 0) == 0 and computed_repair:
+            payload["repair_tokens"] = computed_repair
+        if int(payload.get("learning_tokens") or 0) == 0 and computed_learning:
+            payload["learning_tokens"] = computed_learning
+        payload.setdefault("total_tokens", computed_total)
+        payload.setdefault("repair_tokens", computed_repair)
+        payload.setdefault("learning_tokens", computed_learning)
+        return payload
+
     @model_validator(mode="after")
     def benchmark_status_is_consistent(self) -> RunMetrics:
         if self.benchmark_verification_status != self.benchmark_verification.status:
@@ -213,6 +252,14 @@ class RunMetrics(BaseModel):
         )
         if self.lines_changed != final_line_count:
             raise ValueError("lines_changed must come from final workspace changes")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("total_tokens must equal input_tokens + output_tokens")
+        if self.repair_tokens != self.repair_input_tokens + self.repair_output_tokens:
+            raise ValueError("repair_tokens must equal repair input and output tokens")
+        if self.learning_tokens != self.learning_input_tokens + self.learning_output_tokens:
+            raise ValueError("learning_tokens must equal learning input and output tokens")
+        if self.total_tokens != self.repair_tokens + self.learning_tokens:
+            raise ValueError("total_tokens must equal repair_tokens + learning_tokens")
         return self
 
 

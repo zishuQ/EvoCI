@@ -1,32 +1,33 @@
 from pathlib import Path
 
+import pytest
+
 from evoci.domain.models import CIFailure, RepoSpec
+from evoci.learning_state import LEGACY_LEARNING_STATE_MESSAGE, LegacyLearningStateError
 from evoci.memory.fingerprint import failure_fingerprint
-from evoci.memory.models import Episode, SemanticMemory
+from evoci.memory.models import Episode, LongTermFactCandidate, LongTermMemory
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import SQLiteMemoryStore
 
 
-def test_memory_retrieval_respects_repo_namespace(tmp_path: Path) -> None:
+def test_long_term_memory_is_repository_scoped(tmp_path: Path) -> None:
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
-    store.add_semantic(
-        SemanticMemory(
+    store.add_long_term(
+        LongTermMemory(
             id="repo-a",
-            namespace="repo:org/a",
+            repository="org/a",
             content="pytest imports require src on PYTHONPATH",
-            importance=0.9,
             confidence=0.95,
             source_run_ids=["run-a"],
         )
     )
-    store.add_semantic(
-        SemanticMemory(
-            id="global",
-            namespace="global:ci",
-            content="pytest failures should be reproduced with the targeted test",
-            importance=0.8,
+    store.add_long_term(
+        LongTermMemory(
+            id="repo-b",
+            repository="org/b",
+            content="pytest imports require src on PYTHONPATH",
             confidence=0.9,
-            source_run_ids=["run-global"],
+            source_run_ids=["run-b"],
         )
     )
     failure = CIFailure(
@@ -38,8 +39,8 @@ def test_memory_retrieval_respects_repo_namespace(tmp_path: Path) -> None:
     repo_a = MemoryRetriever(store).retrieve(RepoSpec(owner="org", name="a"), failure)
     repo_b = MemoryRetriever(store).retrieve(RepoSpec(owner="org", name="b"), failure)
 
-    assert {hit.memory_id for hit in repo_a.hits} == {"repo-a", "global"}
-    assert {hit.memory_id for hit in repo_b.hits} == {"global"}
+    assert {hit.memory_id for hit in repo_a.hits} == {"repo-a"}
+    assert {hit.memory_id for hit in repo_b.hits} == {"repo-b"}
     store.close()
 
 
@@ -259,9 +260,7 @@ def test_empty_fts_query_still_allows_fingerprint_retrieval(tmp_path: Path) -> N
         )
     )
     hits = store.search_episodes("??", repo="org/a", limit=3)
-    exact = store.search_episodes_by_fingerprint(
-        repo="org/a", fingerprint=fingerprint, limit=2
-    )
+    exact = store.search_episodes_by_fingerprint(repo="org/a", fingerprint=fingerprint, limit=2)
     assert exact and exact[0].memory_id == "exact"
     del hits
     store.close()
@@ -312,21 +311,106 @@ def test_related_failure_uses_repo_fts_not_exact_fingerprint(tmp_path: Path) -> 
     store.close()
 
 
-def test_semantic_memory_operation_key_is_exactly_once(tmp_path: Path) -> None:
+def test_long_term_memory_operation_key_is_exactly_once(tmp_path: Path) -> None:
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
-    memory = SemanticMemory(
+    memory = LongTermMemory(
         id="stable-memory",
-        namespace="global:ci",
+        repository="org/a",
         content="replay side effects exactly once",
-        importance=0.8,
         confidence=0.9,
         source_run_ids=["run-1"],
     )
 
-    assert store.add_semantic(memory, operation_key="semantic:run-1")
-    assert not store.add_semantic(memory, operation_key="semantic:run-1")
-    assert store.operation_result("semantic:run-1") == {"memory_id": "stable-memory"}
-    assert (
-        len(store.search_semantic("replay side effects", namespaces=["global:ci"], limit=10)) == 1
-    )
+    assert store.add_long_term(memory, operation_key="ltm:run-1")
+    assert not store.add_long_term(memory, operation_key="ltm:run-1")
+    assert store.operation_result("ltm:run-1") == {
+        "memory_id": "stable-memory",
+        "created": True,
+    }
+    assert len(store.search_long_term("replay side effects", repository="org/a", limit=10)) == 1
     store.close()
+
+
+def test_normalized_identical_facts_merge_source_run_ids(tmp_path: Path) -> None:
+    from evoci.memory.consolidation import commit_candidate, fact_memory_id
+
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    first = commit_candidate(
+        store,
+        LongTermFactCandidate(
+            type="fact",
+            content="The repository uses pytest.",
+            confidence=0.8,
+        ),
+        run_id="run-1",
+        repository="org/rpn",
+    )
+    second = commit_candidate(
+        store,
+        LongTermFactCandidate(
+            type="fact",
+            content="the repository uses pytest",
+            confidence=0.9,
+        ),
+        run_id="run-2",
+        repository="org/rpn",
+    )
+    expected_id = fact_memory_id("org/rpn", "The repository uses pytest.")
+    assert first == expected_id
+    assert second is None
+    facts = store.list_long_term(repository="org/rpn", limit=8)
+    assert len(facts) == 1
+    assert facts[0].id == expected_id
+    assert facts[0].source_run_ids == ["run-1", "run-2"]
+    assert facts[0].confidence == 0.9
+    assert facts[0].content == "The repository uses pytest."
+    store.close()
+
+
+def test_fact_memory_id_does_not_include_run_id() -> None:
+    from evoci.memory.consolidation import fact_memory_id, normalize_fact_content
+
+    left = fact_memory_id("org/rpn", "Uses pytest. Tests live in python_testcases/")
+    right = fact_memory_id("org/rpn", "uses pytest. tests live in python_testcases/")
+    other_repo = fact_memory_id("org/other", "Uses pytest. Tests live in python_testcases/")
+    assert left == right
+    assert left != other_repo
+    assert normalize_fact_content("Uses pytest.") == "uses pytest"
+
+
+def test_fact_extractor_cannot_choose_namespace() -> None:
+    assert "namespace" not in LongTermFactCandidate.model_fields
+    assert "repository" not in LongTermFactCandidate.model_fields
+    candidate = LongTermFactCandidate(type="fact", content="uses pytest 3.2", confidence=0.8)
+    assert candidate.content == "uses pytest 3.2"
+
+
+def test_long_term_memory_fts_supports_unicode(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    store.add_long_term(
+        LongTermMemory(
+            id="zh-fact",
+            repository="org/a",
+            content="该仓库使用 pytest 3.2",
+            confidence=0.9,
+            source_run_ids=["run-zh"],
+        )
+    )
+    hits = store.search_long_term("pytest", repository="org/a", limit=3)
+    assert hits
+    assert hits[0].memory_id == "zh-fact"
+    store.close()
+
+
+def test_legacy_memory_schema_requires_fresh_state(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE semantic_memories (id TEXT PRIMARY KEY, namespace TEXT, content TEXT)"
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(LegacyLearningStateError, match=LEGACY_LEARNING_STATE_MESSAGE):
+        SQLiteMemoryStore(path)

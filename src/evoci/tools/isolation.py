@@ -22,6 +22,17 @@ def _run_git(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess
     )
 
 
+def _commit_isolated_baseline(destination: Path) -> None:
+    _run_git("-C", str(destination), "config", "user.name", "EvoCI isolated workspace")
+    _run_git("-C", str(destination), "config", "user.email", "evoci-isolated@example.invalid")
+    added = _run_git("-C", str(destination), "add", "--all")
+    committed = _run_git(
+        "-C", str(destination), "commit", "--allow-empty", "-qm", "isolated baseline"
+    )
+    if added.returncode != 0 or committed.returncode != 0:
+        raise WorkspaceCopyError(committed.stderr.strip() or "git baseline commit failed")
+
+
 def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path:
     """Copy current files while ensuring `.git` never points back to `source`."""
 
@@ -37,6 +48,10 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
         ),
     )
     if not (source / ".git").exists():
+        initialized = _run_git("init", "-q", str(destination))
+        if initialized.returncode != 0:
+            raise WorkspaceCopyError(initialized.stderr.strip() or "git init failed")
+        _commit_isolated_baseline(destination)
         return destination
 
     head = _run_git("-C", str(source), "rev-parse", "HEAD")
@@ -44,6 +59,7 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
         initialized = _run_git("init", "-q", str(destination))
         if initialized.returncode != 0:
             raise WorkspaceCopyError(initialized.stderr.strip() or "git init failed")
+        _commit_isolated_baseline(destination)
         return destination
 
     # Copy the repository metadata locally.  Calling `git clone` here can ask the
@@ -57,12 +73,7 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
         initialized = _run_git("init", "-q", str(destination))
         if initialized.returncode != 0:
             raise WorkspaceCopyError(initialized.stderr.strip() or "git init failed")
-        _run_git("-C", str(destination), "config", "user.name", "EvoCI isolated workspace")
-        _run_git("-C", str(destination), "config", "user.email", "evoci-isolated@example.invalid")
-        added = _run_git("-C", str(destination), "add", "--all")
-        committed = _run_git("-C", str(destination), "commit", "-qm", "isolated baseline")
-        if added.returncode != 0 or committed.returncode != 0:
-            raise WorkspaceCopyError(committed.stderr.strip() or "git baseline commit failed")
+        _commit_isolated_baseline(destination)
 
     if preserve_head:
         updated = _run_git("-C", str(destination), "update-ref", "HEAD", head.stdout.strip())
@@ -73,3 +84,33 @@ def copy_workspace_with_independent_git(source: Path, destination: Path) -> Path
             raise WorkspaceCopyError(reset.stderr.strip() or "git reset failed")
     _run_git("-C", str(destination), "remote", "remove", "origin")
     return destination
+
+
+def workspace_snapshot_id(workspace: Path) -> str:
+    """Content fingerprint of HEAD plus uncommitted and untracked files."""
+
+    import hashlib
+
+    root = workspace.resolve()
+    head = _run_git("-C", str(root), "rev-parse", "HEAD")
+    revision = head.stdout.strip() if head.returncode == 0 else "no-head"
+    diff = _run_git("-C", str(root), "diff", "HEAD")
+    untracked = _run_git(
+        "-C",
+        str(root),
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    digest = hashlib.sha256()
+    digest.update(revision.encode())
+    digest.update(b"\n")
+    digest.update((diff.stdout or "").encode())
+    names = (untracked.stdout or "").split("\0")
+    for name in sorted(part for part in names if part):
+        digest.update(name.encode())
+        target = root / name
+        if target.is_file() and not target.is_symlink():
+            digest.update(target.read_bytes())
+    return f"{revision}:{digest.hexdigest()[:16]}"

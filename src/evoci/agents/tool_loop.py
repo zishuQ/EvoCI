@@ -12,11 +12,18 @@ from pydantic import BaseModel, ValidationError
 
 from evoci.domain.models import SkillRef
 from evoci.model.gateway import ToolLoopGateway, ToolLoopMessage
-from evoci.runtime.budget import RunBudgetManager
+from evoci.runtime.budget import (
+    FINALIZATION_MODEL_CALLS,
+    CombinedBudget,
+    RepairBudgetExhausted,
+    RunBudgetManager,
+    RunRepairBudget,
+)
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
+from evoci.runtime.usage import make_usage_observer
 from evoci.tools.policy import PolicyViolation
-from evoci.tools.registry import RunSkillScriptArgs, ToolRegistry
+from evoci.tools.registry import LoadSkillArgs, RunSkillScriptArgs, ToolRegistry
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -35,12 +42,19 @@ def _serializable(value: Any) -> Any:
     return str(value)
 
 
-def _skill_ref_from_arguments(arguments: dict[str, Any]) -> tuple[str, int] | None:
+def _skill_ref_from_arguments(arguments: dict[str, Any]) -> str | None:
     try:
         validated = RunSkillScriptArgs.model_validate(arguments)
     except ValidationError:
         return None
-    return validated.skill_id, validated.version
+    return validated.skill_id
+
+
+def _load_skill_id(arguments: dict[str, Any]) -> str | None:
+    try:
+        return LoadSkillArgs.model_validate(arguments).skill_id
+    except ValidationError:
+        return None
 
 
 def _result_success(result: Any) -> tuple[bool, int | None, str | None]:
@@ -86,6 +100,7 @@ class BoundedToolAgent:
         task_prompt: str,
         tools: ToolRegistry,
         output_schema: type[OutputT],
+        extra_budget: RunRepairBudget | None = None,
     ) -> OutputT:
         if not invocation_id.strip():
             raise ValueError("invocation_id must be a stable non-empty identifier")
@@ -94,10 +109,30 @@ class BoundedToolAgent:
             ToolLoopMessage(role="user", content=task_prompt),
         ]
         tool_count = 0
-        used_skills: set[tuple[str, int]] = set()
+        used_skills: set[str] = set()
+        selected_skills: set[str] = set()
         should_finalize = False
-        budget = self.budget_manager.for_run(run_id) if self.budget_manager else None
-        for iteration in range(1, self.max_iterations + 1):
+        budgets: list[RunRepairBudget] = []
+        if self.budget_manager is not None:
+            budgets.append(self.budget_manager.for_run(run_id))
+        if extra_budget is not None:
+            budgets.append(extra_budget)
+        budget = CombinedBudget(*budgets) if budgets else None
+        action_limit = self.max_iterations
+        max_tools = self.max_tool_calls
+        if extra_budget is not None:
+            action_limit = min(
+                action_limit, max(0, extra_budget.max_model_calls - FINALIZATION_MODEL_CALLS)
+            )
+            max_tools = min(max_tools, extra_budget.max_tool_calls)
+        if self.budget_manager is not None:
+            remaining = self.budget_manager.for_run(run_id).remaining_model_calls()
+            if remaining < 1 + FINALIZATION_MODEL_CALLS:
+                raise RepairBudgetExhausted("run-level model-call budget exhausted")
+            action_limit = min(action_limit, remaining - FINALIZATION_MODEL_CALLS)
+        if action_limit < 1 or max_tools < 1:
+            raise RepairBudgetExhausted("task-level model-call budget exhausted")
+        for iteration in range(1, action_limit + 1):
             if budget is not None:
                 budget.consume_model_call()
             try:
@@ -105,6 +140,14 @@ class BoundedToolAgent:
                     messages=messages,
                     tools=tools.definitions(),
                     agent_id=agent_id,
+                    usage_observer=make_usage_observer(
+                        recorder=self.recorder,
+                        run_id=run_id,
+                        agent_id=agent_id,
+                        invocation_id=invocation_id,
+                        budget_scope="repair",
+                        call_key=f"tool-turn:{iteration}",
+                    ),
                 )
             except Exception as exc:
                 self.recorder.emit(
@@ -147,7 +190,7 @@ class BoundedToolAgent:
             budget_exhausted = False
             for idx, call in enumerate(response.tool_calls):
                 tool_count += 1
-                if tool_count > self.max_tool_calls:
+                if tool_count > max_tools:
                     # Add error responses for all remaining tool_calls to satisfy API protocol
                     budget_exhausted = True
                     for remaining_call in response.tool_calls[idx:]:
@@ -205,7 +248,11 @@ class BoundedToolAgent:
                     rejected = True
                     error = f"{type(exc).__name__}: {exc}"
                 except (KeyError, ValueError, TypeError, RuntimeError, OSError, re.error) as exc:
-                    rejected = call.name in {"run_skill_script", "read_skill_resource"}
+                    rejected = call.name in {
+                        "run_skill_script",
+                        "read_skill_resource",
+                        "load_skill",
+                    }
                     error = f"{type(exc).__name__}: {exc}"
                 serialized = _serializable(result)
                 payload: dict[str, Any] = {
@@ -229,6 +276,30 @@ class BoundedToolAgent:
                     event_key=call.call_id,
                     payload=payload,
                 )
+                if call.name == "load_skill":
+                    skill_id = _load_skill_id(call.arguments)
+                    if rejected or not success:
+                        self.recorder.emit(
+                            run_id=run_id,
+                            event_type=EventType.SKILL_INVOCATION_REJECTED,
+                            agent_id=agent_id,
+                            invocation_id=invocation_id,
+                            event_key=call.call_id,
+                            payload={
+                                "skill_id": skill_id,
+                                "reason": error,
+                            },
+                        )
+                    elif skill_id and skill_id not in selected_skills:
+                        selected_skills.add(skill_id)
+                        self.recorder.emit(
+                            run_id=run_id,
+                            event_type=EventType.SKILL_SELECTED,
+                            agent_id=agent_id,
+                            invocation_id=invocation_id,
+                            event_key=f"select:{skill_id}",
+                            payload={"skills": [{"skill_id": skill_id}]},
+                        )
                 if call.name == "run_skill_script":
                     ref = _skill_ref_from_arguments(call.arguments)
                     resource = call.arguments.get("script_name")
@@ -240,8 +311,7 @@ class BoundedToolAgent:
                             invocation_id=invocation_id,
                             event_key=call.call_id,
                             payload={
-                                "skill_id": None if ref is None else ref[0],
-                                "version": None if ref is None else ref[1],
+                                "skill_id": ref,
                                 "resource": resource,
                                 "reason": error,
                             },
@@ -255,8 +325,8 @@ class BoundedToolAgent:
                             invocation_id=invocation_id,
                             event_key=call.call_id,
                             payload={
-                                "skill_id": ref[0],
-                                "version": ref[1],
+                                "skill_id": ref,
+                                "usage_kind": "script",
                                 "resource": resource,
                                 "success": success,
                             },
@@ -288,6 +358,14 @@ class BoundedToolAgent:
                 messages=messages,
                 response_model=output_schema,
                 agent_id=agent_id,
+                usage_observer=make_usage_observer(
+                    recorder=self.recorder,
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    invocation_id=invocation_id,
+                    budget_scope="repair",
+                    call_key="structured-final",
+                ),
             )
         except Exception as exc:
             self.recorder.emit(
@@ -312,12 +390,32 @@ class BoundedToolAgent:
         )
         if "used_skill_refs" in type(result).model_fields:
             claimed = {
-                (ref.skill_id, ref.version)
+                ref.skill_id
                 for ref in cast(list[SkillRef], getattr(result, "used_skill_refs", []))
             }
+            activated = set(tools.activated_skill_ids) | selected_skills
+            valid_claimed = claimed & activated
+            # Script use preferentially represents this Skill. If a script already
+            # produced SKILL_USED, do not also emit a procedure use for the same
+            # skill_id. The production loop therefore does not currently emit both
+            # procedure and script traces for one Skill.
+            for skill_id in sorted(valid_claimed - used_skills):
+                self.recorder.emit(
+                    run_id=run_id,
+                    event_type=EventType.SKILL_USED,
+                    agent_id=agent_id,
+                    invocation_id=invocation_id,
+                    event_key=f"method-use:{skill_id}",
+                    payload={
+                        "skill_id": skill_id,
+                        "usage_kind": "procedure",
+                        "resource": None,
+                        "success": None,
+                    },
+                )
             refs = [
-                SkillRef(skill_id=skill_id, version=version)
-                for skill_id, version in sorted(claimed | used_skills)
+                SkillRef(skill_id=skill_id)
+                for skill_id in sorted(valid_claimed | used_skills)
             ]
             result = cast(OutputT, result.model_copy(update={"used_skill_refs": refs}))
         return cast(OutputT, result)

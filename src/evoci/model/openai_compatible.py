@@ -15,14 +15,17 @@ from langchain_openai import ChatOpenAI
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
 
-from evoci.config import EvoCIConfig
+from evoci.config import EvoCIConfig, ReasoningEffort, RoleRuntimeConfig
 from evoci.model.gateway import (
     ModelGatewayError,
+    ModelUsage,
+    RequestKind,
     ResponseT,
     ToolCallRequest,
     ToolDefinition,
     ToolLoopMessage,
     ToolModelResponse,
+    UsageObserver,
 )
 
 ResultT = TypeVar("ResultT")
@@ -43,6 +46,133 @@ _STRUCTURED_CONTENT_ERRORS = (
     TypeError,
     ValueError,
 )
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _extract_usage(
+    message: AIMessage,
+    *,
+    request_kind: RequestKind,
+    model_name: str | None = None,
+) -> ModelUsage:
+    input_tokens = 0
+    output_tokens = 0
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    resolved_model = model_name
+    request_id = message.id if isinstance(message.id, str) and message.id else None
+
+    raw_usage = message.usage_metadata
+    usage_meta: dict[str, Any] = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    if "input_tokens" in usage_meta:
+        input_tokens = _as_int(usage_meta.get("input_tokens"))
+    if "output_tokens" in usage_meta:
+        output_tokens = _as_int(usage_meta.get("output_tokens"))
+    input_details = usage_meta.get("input_token_details")
+    if isinstance(input_details, dict):
+        cached_input_tokens = _as_optional_int(
+            input_details.get("cache_read", input_details.get("cached_tokens"))
+        )
+    output_details = usage_meta.get("output_token_details")
+    if isinstance(output_details, dict):
+        reasoning_tokens = _as_optional_int(
+            output_details.get("reasoning", output_details.get("reasoning_tokens"))
+        )
+
+    response_meta = message.response_metadata if isinstance(message.response_metadata, dict) else {}
+    token_usage = response_meta.get("token_usage") or response_meta.get("usage")
+    if isinstance(token_usage, dict):
+        if input_tokens == 0:
+            input_tokens = _as_int(
+                token_usage.get("prompt_tokens", token_usage.get("input_tokens"))
+            )
+        if output_tokens == 0:
+            output_tokens = _as_int(
+                token_usage.get("completion_tokens", token_usage.get("output_tokens"))
+            )
+        prompt_details = token_usage.get("prompt_tokens_details")
+        if cached_input_tokens is None and isinstance(prompt_details, dict):
+            cached_input_tokens = _as_optional_int(
+                prompt_details.get("cached_tokens", prompt_details.get("cache_read"))
+            )
+        completion_details = token_usage.get("completion_tokens_details")
+        if reasoning_tokens is None and isinstance(completion_details, dict):
+            reasoning_tokens = _as_optional_int(
+                completion_details.get("reasoning_tokens", completion_details.get("reasoning"))
+            )
+        if cached_input_tokens is None:
+            cached_input_tokens = _as_optional_int(token_usage.get("cached_tokens"))
+        if reasoning_tokens is None:
+            reasoning_tokens = _as_optional_int(token_usage.get("reasoning_tokens"))
+    if resolved_model is None:
+        reported = response_meta.get("model_name") or response_meta.get("model")
+        if isinstance(reported, str):
+            resolved_model = reported
+    if request_id is None:
+        reported_id = response_meta.get("id") or response_meta.get("response_id")
+        if isinstance(reported_id, str):
+            request_id = reported_id
+
+    return ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_tokens=reasoning_tokens,
+        model_name=resolved_model,
+        provider_request_id=request_id,
+        request_kind=request_kind,
+    )
+
+
+def _raw_message_from_exception(exc: BaseException) -> AIMessage | None:
+    for attr in ("llm_output", "generation", "response"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, AIMessage):
+            return value
+        if isinstance(value, dict):
+            message = value.get("message") or value.get("raw")
+            if isinstance(message, AIMessage):
+                return message
+    return None
+
+
+def _observe_usage(
+    observer: UsageObserver | None,
+    message: object,
+    *,
+    request_kind: RequestKind,
+    model_name: str | None,
+) -> None:
+    if observer is None or not isinstance(message, AIMessage):
+        return
+    usage = _extract_usage(message, request_kind=request_kind, model_name=model_name)
+    try:
+        observer(usage)
+    except Exception:
+        return
 
 
 def _reasoning_from_completion(response: Any) -> str | None:
@@ -147,9 +277,22 @@ class OpenAICompatibleGateway:
         config: EvoCIConfig,
         *,
         model_name: str | None = None,
+        enable_thinking: bool | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        role: RoleRuntimeConfig | None = None,
         max_attempts: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
-        resolved_model = model_name or config.model_name
+        if role is not None:
+            resolved_model = model_name or role.model_name or config.model_name
+            thinking = role.enable_thinking if enable_thinking is None else enable_thinking
+            effort = role.reasoning_effort if reasoning_effort is None else reasoning_effort
+            self.role: str | None = role.role
+        else:
+            resolved_model = model_name or config.model_name
+            thinking = bool(enable_thinking)
+            effort = reasoning_effort
+            self.role = None
         if not resolved_model:
             raise ValueError("EVO_MODEL_NAME is required for live model calls")
         if not config.model_api_key:
@@ -158,10 +301,13 @@ class OpenAICompatibleGateway:
         configured_attempts = max_attempts or int(os.environ.get("EVO_MODEL_RETRY_ATTEMPTS", "6"))
         self._max_attempts = max(1, configured_attempts)
         self.model_name = resolved_model
-        self._enable_thinking = config.enable_thinking
+        self.enable_thinking = thinking
+        self.reasoning_effort = effort
+        self.max_output_tokens = max_output_tokens
         client_kwargs: dict[str, Any] = {}
-        if self._enable_thinking:
-            client_kwargs["reasoning_effort"] = "high"
+        if thinking:
+            if effort is not None:
+                client_kwargs["reasoning_effort"] = effort
             client_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         self._client = _ReasoningChatOpenAI(
             model=resolved_model,
@@ -171,6 +317,27 @@ class OpenAICompatibleGateway:
             max_retries=0,
             **client_kwargs,
         )
+
+    def requested_runtime(self) -> dict[str, Any]:
+        """Request parameters sent to the provider. This is not proof of execution."""
+
+        return {
+            "role": self.role,
+            "model_name": self.model_name,
+            "thinking_requested": self.enable_thinking,
+            "reasoning_effort": self.reasoning_effort,
+            "max_output_tokens": self.max_output_tokens,
+        }
+
+    def _bind_output_limit(self, runnable: Any, max_output_tokens: int | None) -> Any:
+        limit = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else getattr(self, "max_output_tokens", None)
+        )
+        if limit is None:
+            return runnable
+        return runnable.bind(max_tokens=limit)
 
     async def smoke_test(self) -> dict[str, tuple[bool, str | None]]:
         """Exercise the same ChatOpenAI client features used by the runtime."""
@@ -264,6 +431,8 @@ class OpenAICompatibleGateway:
         messages: list[Any],
         response_model: type[ResponseT],
         correction: str | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ResponseT:
         schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         prompt = (
@@ -277,6 +446,12 @@ class OpenAICompatibleGateway:
             )
         json_client = self._client.bind(response_format={"type": "json_object"})
         response = await self._retry(lambda: json_client.ainvoke([*messages, ("human", prompt)]))
+        _observe_usage(
+            usage_observer,
+            response,
+            request_kind="plain_json_correction",
+            model_name=getattr(self, "model_name", None),
+        )
         content = response.content if isinstance(response, AIMessage) else str(response)
         text = content if isinstance(content, str) else str(content)
         payload = _extract_json_object(text)
@@ -291,13 +466,38 @@ class OpenAICompatibleGateway:
         messages: list[Any],
         response_model: type[ResponseT],
         agent_id: str,
+        request_kind: RequestKind,
+        usage_observer: UsageObserver | None = None,
     ) -> ResponseT:
         last_error: Exception | None = None
         try:
             result = await self._retry(invoke)
-            if isinstance(result, response_model):
+            if isinstance(result, dict) and "raw" in result:
+                raw = result.get("raw")
+                parsed = result.get("parsed")
+                parsing_error = result.get("parsing_error")
+                _observe_usage(
+                    usage_observer,
+                    raw,
+                    request_kind=request_kind,
+                    model_name=getattr(self, "model_name", None),
+                )
+                try:
+                    if isinstance(parsed, response_model):
+                        return parsed
+                    if parsed is not None:
+                        return response_model.model_validate(cast(Any, parsed))
+                except _STRUCTURED_CONTENT_ERRORS as exc:
+                    last_error = exc
+                else:
+                    if isinstance(parsing_error, Exception):
+                        last_error = parsing_error
+                    else:
+                        last_error = ValueError("structured output returned no parsed result")
+            elif isinstance(result, response_model):
                 return result
-            return response_model.model_validate(cast(Any, result))
+            else:
+                return response_model.model_validate(cast(Any, result))
         except _UNCATCHABLE:
             raise
         except asyncio.CancelledError:
@@ -306,10 +506,25 @@ class OpenAICompatibleGateway:
             raise
         except _STRUCTURED_CONTENT_ERRORS as exc:
             last_error = exc
+            raw_message = _raw_message_from_exception(exc)
+            if raw_message is not None:
+                _observe_usage(
+                    usage_observer,
+                    raw_message,
+                    request_kind=request_kind,
+                    model_name=getattr(self, "model_name", None),
+                )
+        if last_error is None:
+            raise ModelGatewayError(f"{agent_id} structured output failed without an error")
         correction = str(last_error)
         for _ in range(_MAX_STRUCTURED_CORRECTIONS):
             try:
-                return await self._plain_json(messages, response_model, correction=correction)
+                return await self._plain_json(
+                    messages,
+                    response_model,
+                    correction=correction,
+                    usage_observer=usage_observer,
+                )
             except _UNCATCHABLE:
                 raise
             except asyncio.CancelledError:
@@ -332,8 +547,13 @@ class OpenAICompatibleGateway:
         user_prompt: str,
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ResponseT:
-        runnable = self._client.with_structured_output(response_model)
+        runnable = self._bind_output_limit(
+            self._client.with_structured_output(response_model, include_raw=True),
+            max_output_tokens,
+        )
         messages = [
             ("system", system_prompt),
             ("human", f"Agent: {agent_id}\n\n{user_prompt}"),
@@ -343,6 +563,8 @@ class OpenAICompatibleGateway:
             messages=messages,
             response_model=response_model,
             agent_id=agent_id,
+            request_kind="structured",
+            usage_observer=usage_observer,
         )
 
     @staticmethod
@@ -387,6 +609,8 @@ class OpenAICompatibleGateway:
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ToolModelResponse:
         definitions = [
             {
@@ -399,8 +623,9 @@ class OpenAICompatibleGateway:
             }
             for tool in tools
         ]
-        runnable = self._client.bind_tools(
-            definitions, tool_choice="auto", parallel_tool_calls=False
+        runnable = self._bind_output_limit(
+            self._client.bind_tools(definitions, tool_choice="auto", parallel_tool_calls=False),
+            max_output_tokens,
         )
         try:
             raw = await self._retry(lambda: runnable.ainvoke(self._messages(messages)))
@@ -412,6 +637,12 @@ class OpenAICompatibleGateway:
             raise
         if not isinstance(raw, AIMessage):
             raise ModelGatewayError("tool-bound model returned a non-assistant message")
+        _observe_usage(
+            usage_observer,
+            raw,
+            request_kind="tool_action",
+            model_name=getattr(self, "model_name", None),
+        )
         try:
             usage: dict[str, Any] = dict(raw.usage_metadata or {})
             calls = [
@@ -450,8 +681,13 @@ class OpenAICompatibleGateway:
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ResponseT:
-        runnable = self._client.with_structured_output(response_model)
+        runnable = self._bind_output_limit(
+            self._client.with_structured_output(response_model, include_raw=True),
+            max_output_tokens,
+        )
         final_messages = [
             *self._messages(messages),
             HumanMessage(
@@ -467,4 +703,6 @@ class OpenAICompatibleGateway:
             messages=final_messages,
             response_model=response_model,
             agent_id=agent_id,
+            request_kind="structured_finalize",
+            usage_observer=usage_observer,
         )

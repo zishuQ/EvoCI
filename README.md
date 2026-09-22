@@ -6,34 +6,32 @@ Current release: **0.7.0**, focused on execution isolation, durable retry semant
 self-evolution attribution, and fair benchmark budgets.
 
 It dynamically coordinates specialized coding agents, remembers past incidents across runs, and
-promotes successful execution patterns into versioned reusable capability packages.
+turns successful execution patterns into a single current reusable capability package.
 
 ## Core systems
 
-- **Dynamic Multi-Agent Orchestration** — LangGraph owns planning, bounded fan-out/fan-in,
-  diagnosis, approval, repair, verification, review, and terminal state.
-- **Tool-using leaf agents** — investigators, fixer, and reviewer use one shared bounded tool-loop
-  runtime over the existing permission-aware filesystem, Git, command, and skill tools. Their final
-  answers remain validated Pydantic models.
+- **Supervisor–Worker orchestration** — LangGraph owns planning, bounded worker fan-out/fan-in,
+  patch integration, approval, verification, rollback, and terminal state.
+- **Tool-using leaf agents** — Supervisor (read-only) and Worker (investigate or repair) share one
+  bounded tool-loop runtime over the existing permission-aware filesystem, Git, command, and skill
+  tools. Final Worker answers are short reports; the harness collects staged edits.
 - **Cross-run long-term memory** — SQLite and FTS5 retain success and failure episodes plus
-  namespaced semantic facts, with retrieved, selected, and used attribution kept distinct.
-- **Self-evolving capability registry** — reusable procedures become immutable, validated package
-  versions, gather trial evidence, and are promoted or rejected by configurable policy.
+  repository-scoped facts, with retrieved, selected, and used attribution kept distinct.
+- **Self-evolving capability registry** — reusable procedures become one current validated package
+  with append-only usage memory; failed updates leave the current package unchanged.
 
 ## Multi-Agent Orchestration
 
-LangGraph remains the only multi-agent control plane. The coordinator creates independent
-investigation tasks and dispatches them with `Send`; reducer-backed state joins evidence before
-diagnosis. Coordinator and diagnoser are structured one-shot calls. Each investigator, the fixer,
-and the reviewer owns only a local bounded model → tool → result loop with configurable iteration
-and tool-call limits.
+LangGraph remains the only multi-agent control plane. The Supervisor plans investigate or repair
+tasks and dispatches at most two workers with `Send`. Reducer-backed worker results join before
+integration. After a batch is integrated, the harness runs formal verification. A code failure
+rolls the batch back and returns evidence to the Supervisor.
 
-Role permissions differ. Investigators can read, search, inspect Git, and run allowlisted commands,
-but executable tools run in a disposable copy and cannot write the real workspace. The reviewer has
-the same execution isolation while reading the real final patch. The fixer can edit and test a
-private staging copy with independent filesystem and Git metadata. Its structured full-file edits
-then return to LangGraph, which performs deterministic risk checks, pauses for approval where
-required, and is the only component that applies those edits to the real workspace.
+Role permissions differ. The Supervisor can read, search, and inspect Git, but cannot write or run
+tests. Investigate workers are read-only. Repair workers edit a private staging copy with exact
+`write_scope` paths. The harness collects staged edits, performs deterministic risk checks, pauses
+for approval where required, and is the only component that applies those edits to the real
+workspace. Learning (Memory Consolidator and SkillMiner) reuses the Worker gateway after the run.
 
 All current-task agents share atomic run-level model-call and tool-call budgets. A rejected or failed
 repair is rolled back to its attempt baseline before the next fixer receives verification feedback,
@@ -54,28 +52,25 @@ context before `MemoryUsed` or `SkillUsed` is accepted.
 
 Both successful and failed terminal paths persist an episode. Failure episodes retain the failure
 reason, attempted hypotheses, verification failures, evidence IDs, actual tools, and repair-attempt
-count. Successful runs may additionally consolidate a durable semantic fact; full trajectories stay
+count. Successful runs may additionally consolidate a durable repository fact; full trajectories stay
 in the event store rather than being copied into long-term memory.
 
 ## Self-Evolving Capability Registry
 
-Trial and active packages are both retrievable, with active versions ranked first. Workers receive
-`SKILL.md` plus declared resource metadata. `run_skill_script` is a formal registry tool and can
-execute only a selected trial/active package's declared script; its result emits `SkillUsed`.
+Enabled packages are retrievable. Workers receive `SKILL.md`, recent usage memory, and declared
+resource metadata. `run_skill_script` is a formal registry tool and can execute only a selected
+enabled package's declared script; its result emits `SkillUsed`.
 
-After a run, per-execution traces update success/failure counts, average tool calls, average attempts,
-patch association, last-used time, and utility. An explicit skill-script failure remains failure
-evidence even when the agent later succeeds without it. Trial promotion defaults to two uses, two
-successes, a 75% success rate, and rejection after two failures; all thresholds are configurable
-with `EVO_*` variables. A colliding `new_skill` slug is rejected. An `update_skill` decision must
-identify an exact skill ID and parent version; only this explicit lineage can create a later version.
-The parent remains active until the child earns promotion, then becomes superseded.
+After a run, actually used skills receive success/failure counts and an append-only `memory.md`
+entry. Retrieved-but-unused skills do not get memory. An explicit skill-script failure remains
+failure evidence even when the agent later succeeds without it. A colliding `new_skill` slug is
+rejected. An `update_skill` decision names an exact skill ID, validates a new package, keeps one
+previous backup, and leaves `memory.md` in place.
 
-Experience mining reads the full trajectory, including helper scripts created through real tools.
-The curator first performs deterministic lifecycle maintenance and an indexed duplicate shortlist.
-An auxiliary model (falling back to the main model) reviews complete package manifests, files,
-tests, utility, and provenance. A merge is always a new validated trial; its sources remain active
-until that merge later earns promotion.
+Skill mining reads the full trajectory, including helper scripts created through real tools. It can
+create a skill after a success with no prior skill, or update a used skill after success. Repair
+failures do not create skills; they may append failure memory for used skills. Infrastructure and
+model failures do not learn.
 
 ## Quick start
 
@@ -94,9 +89,9 @@ For a deterministic demonstration that does not require a model API, run:
 uv run evoci demo
 ```
 
-The demo deliberately starts with a broken calculator, launches three investigators with dynamic
-`Send`, reduces their evidence, repairs one source file, runs the real test suite, asks an independent
-reviewer, checkpoints the run, and writes a condensed episode.
+The demo deliberately starts with a broken calculator, asks the Supervisor to dispatch a Worker,
+repairs one source file, runs the real verification command, checkpoints the run, and writes a
+condensed episode.
 
 ## CLI
 
@@ -163,7 +158,7 @@ Live task files contain only the repository identity, CI failure, and an already
   restricted environment variables, output truncation, and timeouts.
 - Workflow, manifest-plus-lockfile, deletion, and broad changes pause through a durable interrupt
   before any file is written.
-- SQLite checkpoints retain successful parallel writes. Desired-state patch application makes
+- SQLite checkpoints resume a serial apply. Desired-state patch application makes
   create/update/delete replay safe after a crash, while rejected attempts are rolled back before
   retry.
 - Skill scripts require a selected trial/active package, declared file membership, static safety

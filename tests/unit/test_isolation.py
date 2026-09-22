@@ -50,3 +50,18 @@ def test_fixer_copy_has_independent_worktree_git_metadata(tmp_path: Path) -> Non
 
     FileTools(real, writable=True).write_file("app.py", "VALUE = 3\n")
     assert (real / "app.py").read_text() == "VALUE = 3\n"
+
+
+def test_copy_without_git_initializes_and_commits_baseline(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 1\n")
+    staging = tmp_path / "staging"
+    copy_workspace_with_independent_git(source, staging)
+    assert (staging / ".git").is_dir()
+    assert _git(staging, "rev-parse", "HEAD").returncode == 0
+    assert (staging / "app.py").read_text() == "VALUE = 1\n"
+    (staging / "app.py").write_text("VALUE = 2\n")
+    assert _git(staging, "reset", "--hard", "HEAD").returncode == 0
+    assert (staging / "app.py").read_text() == "VALUE = 1\n"
+    assert (source / "app.py").read_text() == "VALUE = 1\n"

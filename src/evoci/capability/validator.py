@@ -12,10 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from evoci.capability.models import RegisteredSkill, ValidationResult
-from evoci.capability.registry import CapabilityRegistry
-from evoci.tools.policy import PolicyViolation
-from evoci.tools.shell import CommandRunner, run_cancellable, run_grouped_subprocess
+from evoci.capability.models import SkillManifest, ValidationResult
+from evoci.tools.shell import run_cancellable, run_grouped_subprocess
 
 SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -92,20 +90,18 @@ def _python_policy(source: str, path: str) -> list[str]:
 
 
 class CandidateValidator:
-    def __init__(self, registry: CapabilityRegistry, *, timeout: float = 10.0) -> None:
-        self.registry = registry
+    def __init__(self, registry: object | None = None, *, timeout: float = 10.0) -> None:
+        del registry
         self.timeout = timeout
 
-    def validate(self, skill_id: str, version: int) -> ValidationResult:
-        record = self.registry.get(skill_id, version)
-        if record is None:
-            return ValidationResult(passed=False, errors=["skill not found"])
-        errors = self._validate_record(record)
+    def validate_package(self, staging_package: Path, manifest: SkillManifest) -> ValidationResult:
+        package = staging_package.resolve()
+        errors = self._validate_package(package, manifest)
         tests_run = 0
         test_files = 0
         behavior_verified = False
         if not errors:
-            test_error, tests_run, test_files, behavior_verified = self._run_behavior(record)
+            test_error, tests_run, test_files, behavior_verified = self._run_behavior(package)
             if test_error:
                 errors.append(test_error)
         return ValidationResult(
@@ -116,25 +112,17 @@ class CandidateValidator:
             behavior_verified=behavior_verified and not errors,
         )
 
-    def validate_to_trial(self, skill_id: str, version: int) -> ValidationResult:
-        result = self.validate(skill_id, version)
-        self.registry.transition(skill_id, version, "trial" if result.passed else "rejected")
-        return result
+    async def avalidate_package(
+        self, staging_package: Path, manifest: SkillManifest
+    ) -> ValidationResult:
+        return await run_cancellable(self.validate_package, staging_package, manifest)
 
-    async def avalidate_to_trial(self, skill_id: str, version: int) -> ValidationResult:
-        # Transition on the caller's thread only after validation has fully completed.
-        # Cancellation joins subprocess cleanup and leaves the candidate unpromoted.
-        result = await run_cancellable(self.validate, skill_id, version)
-        self.registry.transition(skill_id, version, "trial" if result.passed else "rejected")
-        return result
-
-    def _validate_record(self, record: RegisteredSkill) -> list[str]:
-        package = Path(record.package_path).resolve()
+    def _validate_package(self, package: Path, manifest: SkillManifest) -> list[str]:
         errors: list[str] = []
         required = {"SKILL.md", "manifest.json"}
         if not all((package / path).is_file() for path in required):
             errors.append("package is missing SKILL.md or manifest.json")
-        for file in record.manifest.files:
+        for file in manifest.files:
             target = (package / file.path).resolve()
             if package not in target.parents or not target.is_file():
                 errors.append(f"unsafe or missing file: {file.path}")
@@ -154,14 +142,10 @@ class CandidateValidator:
                 errors.append(f"unsupported_runner: {file.path}")
         return errors
 
-    def _run_behavior(
-        self, record: RegisteredSkill
-    ) -> tuple[str | None, int, int, bool]:
-        package = Path(record.package_path)
+    def _run_behavior(self, package: Path) -> tuple[str | None, int, int, bool]:
         tests_dir = package / "tests"
         test_files = list(tests_dir.rglob("*.py")) if tests_dir.is_dir() else []
-        commands = list(record.manifest.verification_commands)
-        if not test_files and not commands:
+        if not test_files:
             return None, 0, 0, False
         with tempfile.TemporaryDirectory(prefix="evoci-skill-test-") as temporary:
             copied = Path(temporary) / "package"
@@ -169,15 +153,9 @@ class CandidateValidator:
             for item in copied.rglob("*"):
                 if item.is_file():
                     item.chmod(item.stat().st_mode | 0o200)
-            tests_run = 0
-            if test_files:
-                error, tests_run = self._run_pytest(copied, len(test_files))
-                if error:
-                    return error, tests_run, len(test_files), False
-            if commands:
-                error = self._run_verification_commands(copied, commands)
-                if error:
-                    return error, tests_run, len(test_files), False
+            error, tests_run = self._run_pytest(copied, len(test_files))
+            if error:
+                return error, tests_run, len(test_files), False
         return None, tests_run, len(test_files), True
 
     def _run_pytest(self, copied: Path, file_count: int) -> tuple[str | None, int]:
@@ -227,17 +205,3 @@ class CandidateValidator:
         if executed <= 0:
             return "zero tests executed", 0
         return None, executed
-
-    def _run_verification_commands(self, copied: Path, commands: list[list[str]]) -> str | None:
-        runner = CommandRunner(copied, timeout=self.timeout)
-        for command in commands:
-            try:
-                completed = runner.run_sync(command, extra_env={"CI": "1"})
-            except (OSError, PolicyViolation, TypeError, ValueError) as exc:
-                return f"verification command could not run: {type(exc).__name__}: {exc}"
-            if completed.timed_out:
-                return f"verification command timed out: {' '.join(command)}"
-            if completed.exit_code != 0:
-                detail = completed.stderr or f"exit code {completed.exit_code}"
-                return f"verification command failed: {' '.join(command)}: {detail[-2_000:]}"
-        return None

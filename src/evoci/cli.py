@@ -21,14 +21,8 @@ from rich.table import Table
 from typer._click.core import Command as ClickCommand
 from typer._click.core import Context as ClickContext
 
-from evoci.agents.base import AgentContext, AgentSuite
-from evoci.agents.model_agents import (
-    ModelCoordinator,
-    ModelDiagnoser,
-    ModelFixer,
-    ModelInvestigator,
-    ModelReviewer,
-)
+from evoci.agents.base import AgentSuite, WorkerContext
+from evoci.agents.model_agents import ModelSupervisor, ModelWorker
 from evoci.benchmark.adapters import CIRepairBenchAdapter
 from evoci.benchmark.campaign import CampaignError, CampaignManager
 from evoci.benchmark.docker import DockerError, DockerImageManager, DockerReplayVerifier
@@ -47,27 +41,27 @@ from evoci.benchmark.models import (
 from evoci.benchmark.runner import BenchmarkRunner
 from evoci.benchmark.validate import validate_reference
 from evoci.benchmark.variants import VariantFeatures, variant_features
-from evoci.capability.curator import CuratorPipeline, ModelCurator
 from evoci.capability.materializer import (
     CapabilityMaterializer,
     resolve_capability_runtime_root,
 )
-from evoci.capability.miner import ExperienceMiner
+from evoci.capability.miner import SkillMiner
 from evoci.capability.registry import CapabilityRegistry
 from evoci.capability.retrieval import CapabilityRetriever
-from evoci.capability.validator import CandidateValidator
 from evoci.config import EvoCIConfig
 from evoci.demo import run_repair_demo
 from evoci.domain.models import (
     CIFailure,
-    Diagnosis,
-    Hypothesis,
+    FailureClass,
     RepoSpec,
     ReviewResult,
     VerificationCommandResult,
     VerificationResult,
+    WorkerTask,
 )
-from evoci.graph.builder import GraphRuntime, build_graph, persist_run_outcome
+from evoci.graph.builder import GraphRuntime, build_graph
+from evoci.graph.integration import fixer_output_from_edits
+from evoci.graph.outcome import persist_run_outcome
 from evoci.graph.routing import contains_review_bypass, contains_workspace_review_bypass
 from evoci.local_task import inspect_repository, parse_verification_command, prepare_local_task
 from evoci.memory.consolidation import ModelMemoryConsolidator
@@ -91,14 +85,42 @@ from evoci.tools.patch import (
     restore_attempt_writes,
     snapshot_edit_baseline,
 )
-from evoci.tools.policy import PolicyViolation
+from evoci.tools.policy import WORKER_REPAIR_CAPABILITIES, PolicyViolation
 from evoci.tools.shell import reset_container_executor, set_container_executor
 from evoci.verification.service import VerificationService
+
+OfficialLearningVerdict = Literal["success", "repair", "infrastructure", "skip"]
+
+
+def _config_from_env(*, cwd: Path | None = None) -> EvoCIConfig:
+    try:
+        return EvoCIConfig.from_env(cwd=cwd)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def official_learning_verdict(
+    *,
+    learning_deferred: bool,
+    benchmark_verification_status: str,
+    benchmark_resolved: bool = False,
+) -> OfficialLearningVerdict:
+    """Benchmark official evaluator is the learning authority when learning was deferred."""
+
+    del benchmark_resolved
+    if not learning_deferred:
+        return "skip"
+    if benchmark_verification_status == "passed":
+        return "success"
+    if benchmark_verification_status == "failed":
+        return "repair"
+    return "infrastructure"
+
 
 app = typer.Typer(help="Durable, self-improving multi-agent CI recovery")
 runs_app = typer.Typer(help="Inspect durable runs")
 memory_app = typer.Typer(help="Search long-term memory")
-skills_app = typer.Typer(help="Inspect and curate capability packages")
+skills_app = typer.Typer(help="Inspect capability packages")
 
 
 class _BenchmarkGroup(typer.core.TyperGroup):
@@ -133,7 +155,8 @@ class LiveResources:
     run_store: SQLiteRunStore
     memory_store: SQLiteMemoryStore
     registry: CapabilityRegistry
-    gateway: ToolLoopGateway
+    supervisor_gateway: ToolLoopGateway
+    worker_gateway: ToolLoopGateway
     recorder: TrajectoryRecorder
 
     async def close(self) -> None:
@@ -152,15 +175,13 @@ async def _live_resources(
 ) -> LiveResources:
     enabled = features or variant_features("evo")
     config.ensure_directories()
-    strong_gateway = OpenAICompatibleGateway(
-        config, model_name=config.strong_model_name or config.model_name
-    )
-    fast_gateway = OpenAICompatibleGateway(
-        config, model_name=config.fast_model_name or config.model_name
-    )
-    aux_gateway = OpenAICompatibleGateway(
+    supervisor_gateway = OpenAICompatibleGateway(
         config,
-        model_name=config.aux_model_name or config.fast_model_name or config.model_name,
+        role=config.supervisor_runtime(),
+    )
+    worker_gateway = OpenAICompatibleGateway(
+        config,
+        role=config.worker_runtime(),
     )
     event_store = SQLiteEventStore(config.state_dir / "events.sqlite")
     recorder = TrajectoryRecorder(event_store)
@@ -172,23 +193,13 @@ async def _live_resources(
     run_store = SQLiteRunStore(config.state_dir / "runs.sqlite")
     memory_store = SQLiteMemoryStore(config.state_dir / "memory.sqlite")
     registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
-    validator = CandidateValidator(registry)
-    curator_pipeline = None
-    if enabled.curator:
-        curator_pipeline = CuratorPipeline(
-            registry,
-            validator,
-            model_curator=ModelCurator(registry, aux_gateway),
-            max_exposures_without_use=config.trial_max_exposures_without_use,
-        )
     agent_registry = registry if enabled.capabilities else None
     checkpoint = await create_async_sqlite_checkpointer(config.state_dir / "checkpoints.sqlite")
     runtime = GraphRuntime(
         config=config,
         agents=AgentSuite(
-            coordinator=ModelCoordinator(fast_gateway, recorder, budget_manager),
-            investigator=ModelInvestigator(
-                fast_gateway,
+            supervisor=ModelSupervisor(
+                supervisor_gateway,
                 recorder,
                 capability_registry=agent_registry,
                 max_iterations=config.max_leaf_iterations,
@@ -197,19 +208,8 @@ async def _live_resources(
                 max_chars=config.output_limit_chars,
                 budget_manager=budget_manager,
             ),
-            diagnoser=ModelDiagnoser(strong_gateway, recorder, budget_manager),
-            fixer=ModelFixer(
-                strong_gateway,
-                recorder,
-                capability_registry=agent_registry,
-                max_iterations=config.max_leaf_iterations,
-                max_tool_calls=config.max_leaf_tool_calls,
-                timeout=config.command_timeout_seconds,
-                max_chars=config.output_limit_chars,
-                budget_manager=budget_manager,
-            ),
-            reviewer=ModelReviewer(
-                strong_gateway,
+            worker=ModelWorker(
+                worker_gateway,
                 recorder,
                 capability_registry=agent_registry,
                 max_iterations=config.max_leaf_iterations,
@@ -228,14 +228,14 @@ async def _live_resources(
             else None
         ),
         memory_consolidator=(
-            ModelMemoryConsolidator(aux_gateway) if enabled.long_term_memory else None
+            ModelMemoryConsolidator(worker_gateway) if enabled.long_term_memory else None
         ),
         capability_registry=registry if enabled.capabilities else None,
         capability_retriever=(
             CapabilityRetriever(
                 registry,
                 top_k=config.capability_retrieval_top_k,
-                trial_slots=config.trial_retrieval_slots,
+                catalog_limit_chars=config.skill_catalog_limit_chars,
             )
             if enabled.capabilities
             else None
@@ -249,10 +249,8 @@ async def _live_resources(
             if enabled.capabilities
             else None
         ),
-        experience_miner=ExperienceMiner(aux_gateway) if enabled.capabilities else None,
-        candidate_validator=validator if enabled.capabilities else None,
+        skill_miner=SkillMiner(worker_gateway) if enabled.capabilities else None,
         recorder=recorder,
-        curator_pipeline=curator_pipeline,
         budget_manager=budget_manager,
         defer_success_learning=defer_success_learning,
     )
@@ -263,7 +261,8 @@ async def _live_resources(
         run_store,
         memory_store,
         registry,
-        strong_gateway,
+        supervisor_gateway,
+        worker_gateway,
         recorder,
     )
 
@@ -321,7 +320,21 @@ def _print_run_summary(result: dict[str, Any], *, task_id: str) -> None:
     if learning_errors:
         stages = ", ".join(str(item.get("stage", "unknown")) for item in learning_errors)
         console.print(f"Post-run warnings   {stages}")
+    _print_learning_summary(result)
     console.print(f"Full report         evoci runs report {task_id}")
+
+
+def _print_learning_summary(result: dict[str, Any]) -> None:
+    summary = result.get("learning_summary")
+    if not isinstance(summary, dict):
+        return
+    facts = summary.get("long_term_facts") or 0
+    fact_line = f"{facts} added" if facts else "none"
+    console.print("Learning:")
+    console.print(f"  Episode: {summary.get('episode', 'none')}")
+    console.print(f"  Long-term facts: {fact_line}")
+    console.print(f"  Skill: {summary.get('skill', 'none')}")
+    console.print(f"  Skill memory: {summary.get('skill_memory', 'none')}")
 
 
 def _print_run_report(run_id: str, events: list[Any]) -> None:
@@ -332,7 +345,7 @@ def _print_run_report(run_id: str, events: list[Any]) -> None:
         (
             event
             for event in events
-            if event.type == EventType.AGENT_COMPLETED and event.agent_id == "coordinator"
+            if event.type == EventType.AGENT_COMPLETED and event.agent_id == "supervisor"
         ),
         None,
     )
@@ -381,7 +394,7 @@ def _print_run_report(run_id: str, events: list[Any]) -> None:
             continue
         evidence_count += 1
         evidence_table.add_row(
-            str(event.agent_id or "unknown").removeprefix("investigator:"),
+            str(event.agent_id or "unknown").removeprefix("worker:"),
             str(item.get("kind", "unknown")),
             str(item.get("file_path") or "-"),
             str(item.get("claim", "not provided")),
@@ -441,6 +454,33 @@ async def _drive_graph(
             await progress
 
 
+def _task_completion_line(task_id: str, metrics: RunMetrics) -> str:
+    return (
+        f"Task {task_id}: {metrics.benchmark_verification_status}, tokens: {metrics.total_tokens:,}"
+    )
+
+
+def _round_summary_line(results: list[BenchmarkResult], round_number: int | None) -> str:
+    passed = sum(
+        result.metrics is not None and result.metrics.benchmark_resolved for result in results
+    )
+    failed = sum(
+        result.metrics is not None and result.metrics.benchmark_verification_status == "failed"
+        for result in results
+    )
+    other = len(results) - passed - failed
+    total_tokens = sum(
+        result.metrics.total_tokens if result.metrics is not None else 0 for result in results
+    )
+    round_label = f"Round {round_number}" if round_number is not None else "Benchmark"
+    summary = (
+        f"{round_label} summary: passed={passed}, failed={failed}, total_tokens={total_tokens:,}"
+    )
+    if other:
+        summary += f", other={other}"
+    return summary
+
+
 def _progress_line(
     event_type: EventType,
     agent_id: str | None,
@@ -456,22 +496,21 @@ def _progress_line(
             return None
         announced.add(role)
         messages = {
-            "coordinator": "正在制定调查计划...",
-            "investigator": "正在检查代码、测试和失败现场...",
-            "diagnoser": "正在综合证据并判断根因...",
-            "fixer": "正在准备最小修复...",
-            "reviewer": "正在审查修复和验证结果...",
+            "supervisor": "正在规划调查或修复任务...",
+            "worker": "正在执行授权范围内的调查或修复...",
             "memory-consolidator": "正在整理本次运行的可复用经验...",
-            "experience-miner": "正在判断是否产生新的可复用技能...",
+            "skill-miner": "正在判断是否产生新的可复用技能...",
         }
         return messages.get(role, "正在执行模型步骤...")
     if event_type == EventType.TOOL_RESULT and not payload.get("success", True):
         return _failed_command_progress(payload, announced)
     if event_type == EventType.AGENT_COMPLETED:
-        if agent == "coordinator":
+        if agent == "supervisor":
             tasks = payload.get("tasks", [])
+            if payload.get("action") == "stop":
+                return f"主管结束: {payload.get('stop_reason') or payload.get('reasoning_summary')}"
             return _investigation_plan_progress(tasks)
-        if agent.startswith("investigator:"):
+        if agent.startswith("worker:"):
             count = payload.get("evidence_count", 0)
             return _investigation_evidence_progress(agent.split(":", 1)[1], count, evidence or [])
     if event_type == EventType.DIAGNOSIS_CREATED:
@@ -625,16 +664,6 @@ async def _drive_single(
         event_key="single",
         payload={"variant": "single"},
     )
-    diagnosis = Diagnosis(
-        primary=Hypothesis(
-            root_cause="Determine the root cause directly with repository and test tools.",
-            evidence_ids=[],
-            confidence=0,
-            affected_files=[],
-            proposed_action="Inspect, repair, and verify the failing task.",
-        ),
-        needs_more_evidence=False,
-    )
     files = FileTools(
         workspace,
         writable=True,
@@ -642,8 +671,6 @@ async def _drive_single(
     )
     assert resources.runtime.budget_manager is not None
     budget = resources.runtime.budget_manager.for_run(run_id)
-    previous_verification: VerificationResult | None = None
-    previous_blockers: tuple[str, ...] = ()
     previous_summary: str | None = None
     verification_history: list[VerificationResult] = []
     output = None
@@ -660,19 +687,29 @@ async def _drive_single(
 
     for attempt in range(1, resources.runtime.config.max_repair_attempts + 1):
         try:
-            output = await resources.runtime.agents.fixer.propose(
-                context=AgentContext(
+            run = await resources.runtime.agents.worker.execute(
+                context=WorkerContext(
                     run_id=run_id,
                     repo=repo,
                     failure=failure,
                     workspace_path=str(workspace),
                     invocation_id=f"repair:{attempt}",
-                    previous_review_blockers=previous_blockers,
+                    task=WorkerTask(
+                        task_id=f"repair-{attempt}",
+                        kind="repair",
+                        objective=failure.summary,
+                        acceptance_criteria=["formal verification passes"],
+                        write_scope=["calculator.py", "app.py", "calc.py"],
+                    ),
                     previous_attempt_summary=previous_summary,
                 ),
-                diagnosis=diagnosis,
-                evidence=[],
-                previous_verification=previous_verification,
+                capabilities=WORKER_REPAIR_CAPABILITIES,
+            )
+            output = fixer_output_from_edits(
+                summary=run.result.summary,
+                edits=run.edits,
+                commands_run=run.commands_run,
+                verification_plan=run.verification_plan,
             )
         except RepairBudgetExhausted as exc:
             failure_reason = str(exc)
@@ -680,7 +717,6 @@ async def _drive_single(
 
         blockers = contains_review_bypass(output)
         if blockers:
-            previous_blockers = tuple(blockers)
             previous_summary = "; ".join(blockers)
             failure_reason = previous_summary
             continue
@@ -769,7 +805,6 @@ async def _drive_single(
         final_blockers = contains_workspace_review_bypass(workspace)
         if final_blockers:
             restore_attempt_writes(workspace, baseline, written)
-            previous_blockers = tuple(final_blockers)
             previous_summary = "; ".join(final_blockers)
             failure_reason = previous_summary
             continue
@@ -830,7 +865,6 @@ async def _drive_single(
             restore_attempt_writes(workspace, baseline, written)
             raise
         verification_history.append(verification)
-        previous_verification = verification
         if verification.passed:
             review = ReviewResult(accepted=False, performed=False, confidence=0.0)
             status = "success"
@@ -878,7 +912,7 @@ def doctor(
     live: Annotated[bool, typer.Option("--live", help="Run live model capability probes")] = False,
 ) -> None:
     """Check local runtime prerequisites, optionally including live model calls."""
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     fts_connection = sqlite3.connect(":memory:")
     try:
         fts_connection.execute("CREATE VIRTUAL TABLE check_fts USING fts5(content)")
@@ -902,82 +936,97 @@ def doctor(
 
 
 def _print_model_routing(config: EvoCIConfig) -> None:
-    table = Table(title="Model routing")
-    table.add_column("Tier")
+    table = Table(title="Role gateways")
+    table.add_column("Role")
     table.add_column("Model")
-    table.add_column("Agents")
-    routes = (
-        ("FAST", config.fast_model_name or config.model_name, config.fast_model_name is None),
-        ("STRONG", config.strong_model_name or config.model_name, config.strong_model_name is None),
-        (
-            "AUX",
-            config.aux_model_name or config.fast_model_name or config.model_name,
-            config.aux_model_name is None,
-        ),
+    table.add_column("Thinking requested")
+    table.add_column("Effort")
+    table.add_column("Uses")
+    supervisor = config.supervisor_runtime()
+    worker = config.worker_runtime()
+    table.add_row(
+        "Supervisor",
+        supervisor.model_name or "not configured",
+        "yes" if supervisor.enable_thinking else "no",
+        supervisor.reasoning_effort or "provider default",
+        "planning / replanning",
     )
-    agents = {
-        "FAST": "Coordinator, Investigator",
-        "STRONG": "Diagnoser, Fixer, Reviewer",
-        "AUX": "Memory Consolidator, Experience Miner, Curator",
-    }
-    for tier, model, fallback in routes:
-        table.add_row(
-            tier,
-            f"{model or 'not configured'}{' (fallback)' if fallback else ''}",
-            agents[tier],
-        )
+    table.add_row(
+        "Worker",
+        worker.model_name or "not configured",
+        "yes" if worker.enable_thinking else "no",
+        worker.reasoning_effort or "provider default",
+        "investigate / repair / learning",
+    )
     console.print(table)
+    console.print(
+        "Thinking requested means the client sent thinking/effort parameters. "
+        "It does not prove the provider executed those settings."
+    )
+
+
+async def _probe_role(config: EvoCIConfig, role_name: str) -> dict[str, tuple[bool, str | None]]:
+    runtime = config.supervisor_runtime() if role_name == "supervisor" else config.worker_runtime()
+    gateway = OpenAICompatibleGateway(config, role=runtime)
+    return await gateway.smoke_test()
 
 
 async def _run_model_check(config: EvoCIConfig) -> None:
     console.print("\nModel connectivity")
     console.print(f"Endpoint           {config.model_base_url}")
     console.print(f"Model              {config.model_name or 'not configured'}")
-    results: dict[str, tuple[bool, str | None]]
-    try:
-        gateway = OpenAICompatibleGateway(config, model_name=config.model_name)
-        results = await gateway.smoke_test()
-    except Exception as exc:
-        failure_reason = str(exc)[:160]
-        results = {
-            name: (False, failure_reason)
-            for name in ("basic_chat", "structured_output", "tool_calling")
-        }
-    labels = (
-        ("basic_chat", "Basic chat"),
-        ("structured_output", "Structured output"),
-        ("tool_calling", "Tool calling"),
-    )
-    passed = True
-    for key, label in labels:
-        ok, reason = results[key]
-        passed = passed and ok
-        console.print(f"{label:<19}{'PASS' if ok else 'FAIL'}")
-        if not ok and reason:
-            console.print(f"  {reason}")
-    console.print(f"\nEvoCI compatible    {'YES' if passed else 'NO'}")
-    if not results["structured_output"][0]:
-        console.print("Structured Output failure: structured Agent output is unavailable.")
-    if not results["tool_calling"][0]:
-        console.print(
-            "Tool Calling failure: Investigator/Fixer/Reviewer leaf tool loops are unavailable."
+    overall = True
+    for role_name, needs_tools in (("supervisor", True), ("worker", True)):
+        runtime = (
+            config.supervisor_runtime() if role_name == "supervisor" else config.worker_runtime()
         )
+        console.print(f"\n{role_name.title()}")
+        console.print(f"  Thinking requested  {'yes' if runtime.enable_thinking else 'no'}")
+        console.print(f"  Reasoning effort    {runtime.reasoning_effort or 'provider default'}")
+        try:
+            results = await _probe_role(config, role_name)
+        except Exception as exc:
+            failure_reason = str(exc)[:160]
+            results = {
+                name: (False, failure_reason)
+                for name in ("basic_chat", "structured_output", "tool_calling")
+            }
+        labels = (
+            ("structured_output", "Structured output"),
+            ("tool_calling", "Tool calling"),
+        )
+        for key, label in labels:
+            if key not in results:
+                continue
+            ok, reason = results[key]
+            overall = overall and ok
+            console.print(f"  {label:<19}{'PASS' if ok else 'FAIL'}")
+            if not ok and reason:
+                console.print(f"    {reason}")
+        if not results.get("structured_output", (True, None))[0]:
+            console.print("  Structured output is required for this role.")
+        if needs_tools and not results.get("tool_calling", (True, None))[0]:
+            console.print("  Tool calling is required for this role's bounded tool loop.")
+    console.print(f"\nEvoCI compatible    {'YES' if overall else 'NO'}")
+    console.print(
+        "PASS means the live probe observed a valid response. "
+        "It does not certify that the provider honored thinking parameters."
+    )
 
 
 @app.command("model-check")
 def model_check() -> None:
     """Run live Basic Chat, Structured Output, and Tool Calling probes."""
-    asyncio.run(_run_model_check(EvoCIConfig.from_env()))
+    asyncio.run(_run_model_check(_config_from_env()))
 
 
 @app.command()
 def demo() -> None:
-    """Run an offline failure→fan-out→repair→verify→review demonstration."""
+    """Run an offline supervisor→worker→verify demonstration."""
     result = asyncio.run(run_repair_demo(Path.cwd()))
     console.print(f"status: [bold]{result['status']}[/bold]")
     console.print(f"evidence: {len(result.get('evidence', []))}")
-    console.print(f"investigation rounds: {result.get('investigation_round', 0)}")
-    console.print(f"repair attempts: {result.get('repair_attempt', 0)}")
+    console.print(f"supervisor batches: {result.get('supervisor_batch', 0)}")
     console.print(f"episode: {result.get('episode_id')}")
 
 
@@ -998,7 +1047,7 @@ def fix_repository(
     try:
         argv = parse_verification_command(command)
         repository = inspect_repository(repo)
-        config = EvoCIConfig.from_env(cwd=repository.root)
+        config = _config_from_env(cwd=repository.root)
         resolve_capability_runtime_root(
             config.runtime_dir,
             repository.root,
@@ -1052,7 +1101,7 @@ def run_task(
     task_file: Annotated[Path | None, typer.Option(help="JSON task specification")] = None,
 ) -> None:
     """Start a live model-backed run."""
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     path = task_file or config.state_dir.parent / "tasks" / f"{task_id}.json"
     if not path.is_file():
         raise typer.BadParameter(f"task file not found: {path}")
@@ -1082,7 +1131,7 @@ def run_task(
 @app.command()
 def resume(run_id: str) -> None:
     """Resume a checkpointed run after a crash or approval interrupt."""
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
 
     async def execute() -> dict[str, Any]:
         resources = await _live_resources(config)
@@ -1101,7 +1150,7 @@ def resume(run_id: str) -> None:
 
 @runs_app.command("list")
 def list_runs() -> None:
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     store = SQLiteRunStore(config.state_dir / "runs.sqlite")
     try:
         table = Table("Run", "Task", "Status", "Updated")
@@ -1116,7 +1165,7 @@ def list_runs() -> None:
 
 @runs_app.command("inspect")
 def inspect_run(run_id: str) -> None:
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     run_store = SQLiteRunStore(config.state_dir / "runs.sqlite")
     event_store = SQLiteEventStore(config.state_dir / "events.sqlite")
     try:
@@ -1135,7 +1184,7 @@ def inspect_run(run_id: str) -> None:
 @runs_app.command("report")
 def report_run(run_id: str) -> None:
     """Show the investigation plan, failed commands, and all recorded evidence."""
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     run_store = SQLiteRunStore(config.state_dir / "runs.sqlite")
     event_store = SQLiteEventStore(config.state_dir / "events.sqlite")
     try:
@@ -1150,12 +1199,12 @@ def report_run(run_id: str) -> None:
 @memory_app.command("search")
 def search_memory(
     query: str,
-    namespace: Annotated[str, typer.Option(help="Exact memory namespace")] = "global:ci",
+    repository: Annotated[str, typer.Option(help="Repository full name, e.g. owner/name")],
 ) -> None:
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     store = SQLiteMemoryStore(config.state_dir / "memory.sqlite")
     try:
-        hits = store.search_semantic(query, namespaces=[namespace], limit=10)
+        hits = store.search_long_term(query, repository=repository, limit=10)
         console.print_json(data={"hits": [hit.model_dump() for hit in hits]})
     finally:
         store.close()
@@ -1163,16 +1212,15 @@ def search_memory(
 
 @skills_app.command("list")
 def list_skills() -> None:
-    config = EvoCIConfig.from_env()
+    config = _config_from_env()
     registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
     try:
-        table = Table("Skill", "Version", "Status", "Description")
-        for record in registry.list():
+        table = Table("Skill", "Enabled", "Description")
+        for record in registry.list(enabled_only=False):
             manifest = record.manifest
             table.add_row(
                 manifest.skill_id,
-                str(manifest.version),
-                manifest.status,
+                "yes" if manifest.enabled else "no",
                 manifest.description,
             )
         console.print(table)
@@ -1181,11 +1229,11 @@ def list_skills() -> None:
 
 
 @skills_app.command("show")
-def show_skill(skill_id: str, version: int | None = None) -> None:
-    config = EvoCIConfig.from_env()
+def show_skill(skill_id: str) -> None:
+    config = _config_from_env()
     registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
     try:
-        record = registry.get(skill_id, version)
+        record = registry.get(skill_id)
         if record is None:
             raise typer.BadParameter(f"unknown skill: {skill_id}")
         console.print_json(data=record.manifest.model_dump(mode="json"))
@@ -1194,27 +1242,42 @@ def show_skill(skill_id: str, version: int | None = None) -> None:
         registry.close()
 
 
-@skills_app.command("curate")
-def curate_skills() -> None:
-    config = EvoCIConfig.from_env()
+@skills_app.command("enable")
+def enable_skill(skill_id: str) -> None:
+    config = _config_from_env()
     registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
     try:
-        model_curator = None
-        if config.model_name and config.model_api_key:
-            gateway = OpenAICompatibleGateway(
-                config,
-                model_name=config.aux_model_name or config.fast_model_name or config.model_name,
-            )
-            model_curator = ModelCurator(registry, gateway)
-        result = asyncio.run(
-            CuratorPipeline(
-                registry,
-                CandidateValidator(registry),
-                model_curator=model_curator,
-                max_exposures_without_use=config.trial_max_exposures_without_use,
-            ).run()
-        )
-        console.print_json(data=result.model_dump(mode="json"))
+        registry.enable(skill_id)
+        console.print(f"Enabled {skill_id}")
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        registry.close()
+
+
+@skills_app.command("disable")
+def disable_skill(skill_id: str) -> None:
+    config = _config_from_env()
+    registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
+    try:
+        registry.disable(skill_id)
+        console.print(f"Disabled {skill_id}")
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        registry.close()
+
+
+@skills_app.command("memory")
+def show_skill_memory(skill_id: str) -> None:
+    config = _config_from_env()
+    registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
+    try:
+        if registry.get(skill_id) is None:
+            raise typer.BadParameter(f"unknown skill: {skill_id}")
+        memory_path = registry.skill_root(skill_id) / "memory.md"
+        text = memory_path.read_text(encoding="utf-8") if memory_path.is_file() else ""
+        console.print(text or "(empty)")
     finally:
         registry.close()
 
@@ -1242,7 +1305,12 @@ def benchmark_run(
         int, typer.Option(min=1, help="Maximum tasks to execute concurrently within a round")
     ] = 1,
     enable_thinking: Annotated[
-        bool, typer.Option(help="Enable extended thinking for the model")
+        bool,
+        typer.Option(
+            "--enable-thinking",
+            help="Removed; set EVO_SUPERVISOR_ENABLE_THINKING and EVO_WORKER_ENABLE_THINKING",
+            hidden=True,
+        ),
     ] = False,
 ) -> None:
     """Execute real benchmark workspaces through the selected runtime ablation."""
@@ -1257,9 +1325,12 @@ def benchmark_run(
         )
 
     async def execute_benchmark() -> list[BenchmarkResult]:
-        base_config = EvoCIConfig.from_env()
         if enable_thinking:
-            base_config = base_config.model_copy(update={"enable_thinking": True})
+            raise typer.BadParameter(
+                "--enable-thinking is removed. Set EVO_SUPERVISOR_ENABLE_THINKING and "
+                "EVO_WORKER_ENABLE_THINKING (and the matching EVO_*_REASONING_EFFORT values)."
+            )
+        base_config = _config_from_env()
         features = variant_features(variant)
         campaign = (
             CampaignManager(
@@ -1406,7 +1477,9 @@ def benchmark_run(
                 truth = adapter.ground_truth(entry.task_id)
                 registry_size = len(resources.registry.list()) if features.capabilities else 0
                 active_count = (
-                    len(resources.registry.list({"active"})) if features.capabilities else 0
+                    len(resources.registry.list(enabled_only=True))
+                    if features.capabilities
+                    else 0
                 )
                 metrics = await collect_metrics(
                     result=result,
@@ -1421,30 +1494,39 @@ def benchmark_run(
                     skill_registry_size=registry_size,
                     active_skill_count=active_count,
                 )
-                if (
-                    result.get("learning_deferred")
-                    and result.get("status") == "success"
-                    and metrics.benchmark_verification_status != "infra_error"
-                ):
-                    independent_ok = metrics.benchmark_resolved
+                verdict = official_learning_verdict(
+                    learning_deferred=bool(result.get("learning_deferred")),
+                    benchmark_verification_status=metrics.benchmark_verification_status,
+                    benchmark_resolved=metrics.benchmark_resolved,
+                )
+                if verdict != "skip":
+                    independent_ok = verdict == "success"
+                    if verdict == "infrastructure":
+                        failure_class: FailureClass | None = "infrastructure"
+                        failure_reason = metrics.benchmark_verification.details
+                    elif independent_ok:
+                        failure_class = None
+                        failure_reason = None
+                    else:
+                        failure_class = "repair"
+                        failure_reason = (
+                            "independent benchmark verification "
+                            f"{metrics.benchmark_verification_status}: "
+                            f"{metrics.benchmark_verification.details}"
+                        )
                     learned = await persist_run_outcome(
                         resources.runtime,
                         cast(Any, result),
                         success=independent_ok,
-                        failure_reason=(
-                            None
-                            if independent_ok
-                            else (
-                                "independent benchmark verification "
-                                f"{metrics.benchmark_verification_status}: "
-                                f"{metrics.benchmark_verification.details}"
-                            )
-                        ),
+                        failure_class=failure_class,
+                        failure_reason=failure_reason,
                     )
                     result.update(learned)
                     registry_size = len(resources.registry.list()) if features.capabilities else 0
                     active_count = (
-                        len(resources.registry.list({"active"})) if features.capabilities else 0
+                        len(resources.registry.list(enabled_only=True))
+                        if features.capabilities
+                        else 0
                     )
                     metrics = attach_learning_metrics(
                         metrics,
@@ -1454,9 +1536,7 @@ def benchmark_run(
                         skill_registry_size=registry_size,
                         active_skill_count=active_count,
                     )
-                console.print(
-                    f"[green]Task {entry.task_id}:[/green] {metrics.benchmark_verification_status}"
-                )
+                console.print(_task_completion_line(entry.task_id, metrics))
                 return metrics
             except Exception as exc:
                 console.print(f"[red]Task {entry.task_id}:[/red] error: {exc}")
@@ -1487,7 +1567,7 @@ def benchmark_run(
 
     try:
         if campaign_dir is not None:
-            base_config = EvoCIConfig.from_env()
+            base_config = _config_from_env()
             manager = CampaignManager(
                 campaign_dir, variant=variant, base_config=base_config, strict=campaign_strict
             )
@@ -1498,6 +1578,7 @@ def benchmark_run(
     except (CampaignError, DockerError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     destination = campaign_dir / "rounds" / f"round-{round_number}" if campaign_dir else output_dir
+    console.print(f"[bold]{_round_summary_line(results, round_number)}[/bold]")
     console.print(f"wrote {len(results)} results to {destination}")
 
 

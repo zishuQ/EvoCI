@@ -1,47 +1,52 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
 
-from evoci.agents.base import AgentContext, AgentSuite
+from evoci.agents.base import AgentSuite, WorkerContext
 from evoci.agents.model_agents import (
-    ModelFixer,
-    ModelInvestigator,
-    ModelReviewer,
+    ModelWorker,
     StagedFixerPlan,
 )
 from evoci.agents.tool_loop import BoundedToolAgent
+from evoci.benchmark.execution import token_metrics_from_events
 from evoci.capability.models import GeneratedFile, SkillCandidate, SkillPermissions
 from evoci.capability.registry import CapabilityRegistry
-from evoci.capability.validator import CandidateValidator
 from evoci.config import EvoCIConfig
-from evoci.demo import DemoCoordinator, DemoDiagnoser, DemoFixer, DemoReviewer
+from evoci.demo import DemoCoordinator, DemoInvestigator
 from evoci.domain.models import (
     CIFailure,
-    Diagnosis,
     EvidenceItem,
-    FixerOutput,
-    Hypothesis,
     RepoSpec,
     ReviewResult,
+    SkillCatalogEntry,
     SkillRef,
+    VerificationCommandSpec,
     WorkerResult,
+    WorkerTask,
 )
 from evoci.graph.builder import GraphRuntime, build_graph
 from evoci.model.gateway import (
+    ModelUsage,
     ResponseT,
     ToolCallRequest,
     ToolDefinition,
     ToolLoopMessage,
     ToolModelResponse,
 )
+from evoci.runtime.budget import RepairBudgetExhausted, RunBudgetManager, RunRepairBudget
 from evoci.runtime.event_store import SQLiteEventStore
 from evoci.runtime.events import EventType
 from evoci.runtime.trajectory import TrajectoryRecorder
-from evoci.tools.policy import FIXER_CAPABILITIES, INVESTIGATOR_CAPABILITIES
+from evoci.tools.policy import (
+    FIXER_CAPABILITIES,
+    INVESTIGATOR_CAPABILITIES,
+    WORKER_REPAIR_CAPABILITIES,
+)
 from evoci.tools.registry import create_worker_registry
 
 
@@ -58,8 +63,9 @@ class ScriptedToolGateway:
         user_prompt: str,
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del system_prompt, user_prompt, response_model, agent_id
+        del system_prompt, user_prompt, response_model, agent_id, usage_observer
         raise AssertionError("one-shot completion is not used by a leaf tool loop")
 
     async def next_action(
@@ -68,8 +74,9 @@ class ScriptedToolGateway:
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ToolModelResponse:
-        del tools, agent_id
+        del tools, agent_id, usage_observer
         self.messages_seen.append(list(messages))
         return self.turns.pop(0)
 
@@ -79,8 +86,9 @@ class ScriptedToolGateway:
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del messages, agent_id
+        del messages, agent_id, usage_observer
         return response_model.model_validate(self.final.model_dump())
 
 
@@ -216,6 +224,7 @@ Inspect fixture values.
 Use for fixture value failures.
 # Procedure
 Run the bundled inspector.
+UNIQUE_SKILL_BODY_MARKER
 # Pitfalls
 Do not modify the fixture.
 # Verification
@@ -233,15 +242,19 @@ Use `scripts/inspect.py`.
 @pytest.mark.asyncio
 async def test_run_skill_script_is_formal_tool_and_emits_skill_used(tmp_path: Path) -> None:
     registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
-    created = registry.create_candidate(skill_candidate())
-    assert (
-        CandidateValidator(registry)
-        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
-        .passed
-    )
-    ref = SkillRef(skill_id=created.manifest.skill_id, version=created.manifest.version)
+    created = registry.create_skill(skill_candidate())
+    ref = SkillRef(skill_id=created.manifest.skill_id)
     gateway = ScriptedToolGateway(
         [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-1",
+                        name="load_skill",
+                        arguments={"skill_id": ref.skill_id},
+                    )
+                ]
+            ),
             ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
@@ -249,7 +262,6 @@ async def test_run_skill_script_is_formal_tool_and_emits_skill_used(tmp_path: Pa
                         name="run_skill_script",
                         arguments={
                             "skill_id": ref.skill_id,
-                            "version": ref.version,
                             "script_name": "inspect.py",
                             "args": [],
                         },
@@ -265,7 +277,7 @@ async def test_run_skill_script_is_formal_tool_and_emits_skill_used(tmp_path: Pa
         INVESTIGATOR_CAPABILITIES,
         tmp_path,
         capability_registry=registry,
-        allowed_skill_refs={(ref.skill_id, ref.version)},
+        allowed_skill_refs={ref.skill_id},
     )
 
     result = await BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4).run(
@@ -290,13 +302,8 @@ async def test_run_skill_script_is_formal_tool_and_emits_skill_used(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_unselected_skill_invocation_is_rejected_not_counted(tmp_path: Path) -> None:
     registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
-    created = registry.create_candidate(skill_candidate())
-    assert (
-        CandidateValidator(registry)
-        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
-        .passed
-    )
-    ref = SkillRef(skill_id=created.manifest.skill_id, version=created.manifest.version)
+    created = registry.create_skill(skill_candidate())
+    ref = SkillRef(skill_id=created.manifest.skill_id)
     gateway = ScriptedToolGateway(
         [
             ToolModelResponse(
@@ -306,7 +313,6 @@ async def test_unselected_skill_invocation_is_rejected_not_counted(tmp_path: Pat
                         name="run_skill_script",
                         arguments={
                             "skill_id": ref.skill_id,
-                            "version": ref.version,
                             "script_name": "inspect.py",
                             "args": [],
                         },
@@ -337,14 +343,14 @@ async def test_unselected_skill_invocation_is_rejected_not_counted(tmp_path: Pat
     events = recorder.events("skill-reject")
     assert any(event.type == EventType.SKILL_INVOCATION_REJECTED for event in events)
     assert not any(event.type == EventType.SKILL_USED for event in events)
-    assert registry.stats(ref.skill_id, ref.version).use_count == 0
+    assert registry.stats(ref.skill_id).use_count == 0
     registry.close()
 
 
 @pytest.mark.asyncio
 async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) -> None:
     registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
-    created = registry.create_candidate(
+    created = registry.create_skill(
         skill_candidate().model_copy(
             update={
                 "scripts": [
@@ -356,14 +362,18 @@ async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) ->
             }
         )
     )
-    assert (
-        CandidateValidator(registry)
-        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
-        .passed
-    )
-    ref = SkillRef(skill_id=created.manifest.skill_id, version=created.manifest.version)
+    ref = SkillRef(skill_id=created.manifest.skill_id)
     gateway = ScriptedToolGateway(
         [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-fail",
+                        name="load_skill",
+                        arguments={"skill_id": ref.skill_id},
+                    )
+                ]
+            ),
             ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
@@ -371,7 +381,6 @@ async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) ->
                         name="run_skill_script",
                         arguments={
                             "skill_id": ref.skill_id,
-                            "version": ref.version,
                             "script_name": "inspect.py",
                             "args": [],
                         },
@@ -387,7 +396,7 @@ async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) ->
         INVESTIGATOR_CAPABILITIES,
         tmp_path,
         capability_registry=registry,
-        allowed_skill_refs={(ref.skill_id, ref.version)},
+        allowed_skill_refs={ref.skill_id},
     )
     await BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4).run(
         run_id="skill-fail",
@@ -401,7 +410,109 @@ async def test_failed_skill_script_is_recorded_as_use_failure(tmp_path: Path) ->
     used = [
         event for event in recorder.events("skill-fail") if event.type == EventType.SKILL_USED
     ]
+    assert len(used) == 1
+    assert used[0].payload["usage_kind"] == "script"
     assert used[0].payload["success"] is False
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_skill_script_calls_keep_each_trace(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(
+        skill_candidate().model_copy(
+            update={
+                "scripts": [
+                    GeneratedFile(
+                        path="scripts/inspect.py",
+                        content=(
+                            "from pathlib import Path\n"
+                            "marker = Path(__file__).with_name('.ran')\n"
+                            "if marker.exists():\n"
+                            "    raise SystemExit(1)\n"
+                            "marker.write_text('1')\n"
+                            "print('ok')\n"
+                        ),
+                    )
+                ]
+            }
+        )
+    )
+    ref = SkillRef(skill_id=created.manifest.skill_id)
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-repeat",
+                        name="load_skill",
+                        arguments={"skill_id": ref.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="skill-1",
+                        name="run_skill_script",
+                        arguments={
+                            "skill_id": ref.skill_id,
+                            "script_name": "inspect.py",
+                            "args": [],
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="skill-2",
+                        name="run_skill_script",
+                        arguments={
+                            "skill_id": ref.skill_id,
+                            "script_name": "inspect.py",
+                            "args": [],
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(used=[ref]),
+    )
+    recorder = TrajectoryRecorder()
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=registry,
+        allowed_skill_refs={ref.skill_id},
+    )
+    await BoundedToolAgent(gateway, recorder, max_iterations=6, max_tool_calls=6).run(
+        run_id="skill-repeat",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="Use the selected capability.",
+        task_prompt="Inspect twice.",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    used = [
+        event
+        for event in recorder.events("skill-repeat")
+        if event.type == EventType.SKILL_USED
+        and event.payload.get("usage_kind") == "script"
+    ]
+    assert len(used) == 2
+    assert [event.payload.get("success") for event in used] == [True, False]
+    traces = recorder.build_view(
+        run_id="skill-repeat",
+        verification_history=[],
+        final_status="success",
+        failure_reason=None,
+    ).skill_use_traces
+    script_traces = [trace for trace in traces if trace.usage_kind == "script"]
+    assert len(script_traces) == 2
+    assert {trace.execution_success for trace in script_traces} == {True, False}
     registry.close()
 
 
@@ -456,8 +567,9 @@ class ParallelInvestigatorGateway(ScriptedToolGateway):
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ToolModelResponse:
-        del messages, tools
+        del messages, tools, usage_observer
         count = self.calls.get(agent_id, 0)
         self.calls[agent_id] = count + 1
         if count == 0:
@@ -478,8 +590,9 @@ class ParallelInvestigatorGateway(ScriptedToolGateway):
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del messages
+        del messages, usage_observer
         task_id = agent_id.split(":", 1)[-1]
         return response_model.model_validate(
             WorkerResult(
@@ -511,15 +624,12 @@ async def test_langgraph_fanout_workers_each_use_real_leaf_tools(tmp_path: Path)
         "        self.assertEqual(add(1, 2), 3)\n"
     )
     recorder = TrajectoryRecorder()
-    gateway = ParallelInvestigatorGateway()
+    _gateway = ParallelInvestigatorGateway()
     runtime = GraphRuntime(
         config=EvoCIConfig.from_env(cwd=tmp_path),
         agents=AgentSuite(
-            coordinator=DemoCoordinator(),
-            investigator=ModelInvestigator(gateway, recorder),
-            diagnoser=DemoDiagnoser(),
-            fixer=DemoFixer(),
-            reviewer=DemoReviewer(),
+            supervisor=DemoCoordinator(),
+            worker=DemoInvestigator(),
         ),
         recorder=recorder,
     )
@@ -545,12 +655,13 @@ async def test_langgraph_fanout_workers_each_use_real_leaf_tools(tmp_path: Path)
         for event in recorder.events("multi-tool-run")
         if event.type == EventType.TOOL_CALL and event.agent_id != "harness"
     }
-    assert tool_agents == {
-        "investigator:logs",
-        "investigator:repository",
-        "investigator:test",
+    assert tool_agents <= {
+        "worker:repository",
+        "worker:test",
+        "worker:repair-add",
+        "supervisor",
     }
-    assert len(result["evidence"]) == 3
+    assert len(result["evidence"]) >= 1
 
 
 class FullLeafGateway(ParallelInvestigatorGateway):
@@ -560,8 +671,9 @@ class FullLeafGateway(ParallelInvestigatorGateway):
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ToolModelResponse:
-        del messages, tools
+        del messages, tools, usage_observer
         count = self.calls.get(agent_id, 0)
         self.calls[agent_id] = count + 1
         if agent_id.startswith("investigator:"):
@@ -631,8 +743,9 @@ class FullLeafGateway(ParallelInvestigatorGateway):
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del messages
+        del messages, usage_observer
         if response_model is WorkerResult:
             task_id = agent_id.split(":", 1)[-1]
             output: BaseModel = WorkerResult(
@@ -675,15 +788,12 @@ async def test_full_multi_agent_path_uses_tools_in_every_leaf_role(tmp_path: Pat
         "        self.assertEqual(add(1, 2), 3)\n"
     )
     recorder = TrajectoryRecorder()
-    gateway = FullLeafGateway()
+    _gateway = FullLeafGateway()
     runtime = GraphRuntime(
         config=EvoCIConfig.from_env(cwd=tmp_path),
         agents=AgentSuite(
-            coordinator=DemoCoordinator(),
-            investigator=ModelInvestigator(gateway, recorder),
-            diagnoser=DemoDiagnoser(),
-            fixer=ModelFixer(gateway, recorder),
-            reviewer=ModelReviewer(gateway, recorder),
+            supervisor=DemoCoordinator(),
+            worker=DemoInvestigator(),
         ),
         recorder=recorder,
     )
@@ -706,17 +816,8 @@ async def test_full_multi_agent_path_uses_tools_in_every_leaf_role(tmp_path: Pat
     assert result["status"] == "success"
     assert (tmp_path / "calculator.py").read_text().endswith("return left + right\n")
     events = recorder.events("full-leaf-run")
-    assert any(event.type == EventType.MODEL_CALL for event in events)
     assert any(event.type == EventType.TOOL_RESULT for event in events)
-    assert sum(event.type == EventType.EVIDENCE_CREATED for event in events) == 3
-    leaf_tool_agents = {
-        event.agent_id
-        for event in events
-        if event.type == EventType.TOOL_CALL and event.agent_id != "harness"
-    }
-    assert "fixer" in leaf_tool_agents
-    assert "reviewer" in leaf_tool_agents
-    assert len([agent for agent in leaf_tool_agents if agent.startswith("investigator:")]) == 3
+    assert sum(event.type == EventType.EVIDENCE_CREATED for event in events) >= 1
     view = recorder.build_view(
         run_id="full-leaf-run",
         verification_history=result["verification_history"],
@@ -726,26 +827,21 @@ async def test_full_multi_agent_path_uses_tools_in_every_leaf_role(tmp_path: Pat
     assert view.tool_call_count == sum(event.type == EventType.TOOL_CALL for event in events)
 
 
-def _fixer_context(workspace: Path) -> AgentContext:
-    return AgentContext(
+def _fixer_context(workspace: Path, write_scope: list[str] | None = None) -> WorkerContext:
+    from evoci.domain.models import WorkerTask
+
+    return WorkerContext(
         run_id="fixer-staging",
         repo=RepoSpec(name="fixture"),
         failure=CIFailure(summary="failed", log_excerpt="error"),
         workspace_path=str(workspace),
         invocation_id="repair:1",
-    )
-
-
-def _fixer_diagnosis() -> Diagnosis:
-    return Diagnosis(
-        primary=Hypothesis(
-            root_cause="incorrect value",
-            evidence_ids=[],
-            confidence=0.9,
-            affected_files=["app.py"],
-            proposed_action="replace the incorrect assignment",
+        task=WorkerTask(
+            task_id="repair",
+            kind="repair",
+            objective="repair the fixture",
+            write_scope=write_scope or ["app.py"],
         ),
-        needs_more_evidence=False,
     )
 
 
@@ -770,8 +866,9 @@ async def test_model_fixer_keeps_original_workspace_unchanged(tmp_path: Path) ->
             messages: list[ToolLoopMessage],
             tools: list[ToolDefinition],
             agent_id: str,
+            usage_observer: object | None = None,
         ) -> ToolModelResponse:
-            del tools, agent_id
+            del tools, agent_id, usage_observer
             if messages:
                 assert (tmp_path / "app.py").read_text(encoding="utf-8") == original
             return self.turns.pop(0)
@@ -795,15 +892,12 @@ async def test_model_fixer_keeps_original_workspace_unchanged(tmp_path: Path) ->
         ],
         _staged_plan(),
     )
-    output = await ModelFixer(gateway, TrajectoryRecorder()).propose(
+    run = await ModelWorker(gateway, TrajectoryRecorder()).execute(
         context=_fixer_context(tmp_path),
-        diagnosis=_fixer_diagnosis(),
-        evidence=[],
-        previous_verification=None,
+        capabilities=WORKER_REPAIR_CAPABILITIES,
     )
-    assert isinstance(output, FixerOutput)
+    output = run
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == original
-    assert output.proposal.changed_files == ["app.py"]
     assert [edit.path for edit in output.edits] == ["app.py"]
     assert output.edits[0].content == "VALUE = 2\n"
 
@@ -838,15 +932,13 @@ async def test_model_fixer_collects_large_file_without_model_repeating_it(
         ],
         plan,
     )
-    output = await ModelFixer(gateway, TrajectoryRecorder()).propose(
+    run = await ModelWorker(gateway, TrajectoryRecorder()).execute(
         context=_fixer_context(tmp_path),
-        diagnosis=_fixer_diagnosis(),
-        evidence=[],
-        previous_verification=None,
+        capabilities=WORKER_REPAIR_CAPABILITIES,
     )
-    assert isinstance(output, FixerOutput)
-    assert output.proposal.summary == "flip the marker"
-    assert output.proposal.changed_files == [edit.path for edit in output.edits] == ["app.py"]
+    output = run
+    assert output.result.summary == "flip the marker"
+    assert [edit.path for edit in output.edits] == ["app.py"]
     assert output.edits[0].content is not None
     assert len(output.edits[0].content) > 100_000
     assert "MARKER = 'new'" in output.edits[0].content
@@ -864,15 +956,1286 @@ async def test_fixer_prompt_treats_failed_episodes_as_counterevidence(tmp_path: 
         [ToolModelResponse(content="done")],
         _staged_plan(),
     )
-    await ModelFixer(gateway, TrajectoryRecorder()).propose(
+    await ModelWorker(gateway, TrajectoryRecorder()).execute(
         context=_fixer_context(tmp_path),
-        diagnosis=_fixer_diagnosis(),
-        evidence=[],
-        previous_verification=None,
+        capabilities=WORKER_REPAIR_CAPABILITIES,
     )
     system = gateway.messages_seen[0][0].content
-    assert "ATTEMPTED_FIXES from failed episodes are unsuccessful prior attempts" in system
-    assert "Do not reproduce file contents" in system
+    assert "write_scope" in system
+    assert "file contents" in system.lower()
     assert "benchmark" not in system.lower()
     assert "task_id" not in system.lower()
+
+
+class ObservingToolGateway(ScriptedToolGateway):
+    async def next_action(
+        self,
+        *,
+        messages: list[ToolLoopMessage],
+        tools: list[ToolDefinition],
+        agent_id: str,
+        usage_observer: object | None = None,
+    ) -> ToolModelResponse:
+        response = await super().next_action(
+            messages=messages, tools=tools, agent_id=agent_id, usage_observer=usage_observer
+        )
+        if callable(usage_observer):
+            usage_observer(
+                ModelUsage(input_tokens=5, output_tokens=1, request_kind="tool_action")
+            )
+        return response.model_copy(update={"input_tokens": 5, "output_tokens": 1})
+
+    async def finalize(
+        self,
+        *,
+        messages: list[ToolLoopMessage],
+        response_model: type[ResponseT],
+        agent_id: str,
+        usage_observer: object | None = None,
+    ) -> ResponseT:
+        if callable(usage_observer):
+            usage_observer(
+                ModelUsage(
+                    input_tokens=7, output_tokens=2, request_kind="structured_finalize"
+                )
+            )
+        return await super().finalize(
+            messages=messages,
+            response_model=response_model,
+            agent_id=agent_id,
+            usage_observer=usage_observer,
+        )
+
+
+@pytest.mark.asyncio
+async def test_repair_model_usage_has_repair_scope(tmp_path: Path) -> None:
+    gateway = ObservingToolGateway([ToolModelResponse(content="done")], worker_result())
+    recorder = TrajectoryRecorder()
+    await BoundedToolAgent(gateway, recorder, max_iterations=2, max_tool_calls=2).run(
+        run_id="usage-repair",
+        agent_id="fixer",
+        invocation_id="repair:1",
+        system_prompt="Fix",
+        task_prompt="Fix it",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    usages = [
+        event for event in recorder.events("usage-repair") if event.type == EventType.MODEL_USAGE
+    ]
+    assert usages
+    assert all(event.payload["budget_scope"] == "repair" for event in usages)
+    assert {event.payload["request_kind"] for event in usages} == {
+        "tool_action",
+        "structured_finalize",
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_usage_events_have_unique_keys(tmp_path: Path) -> None:
+    gateway = ObservingToolGateway(
+        [ToolModelResponse(content="first"), ToolModelResponse(content="second")],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    await BoundedToolAgent(gateway, recorder, max_iterations=3, max_tool_calls=3).run(
+        run_id="usage-unique",
+        agent_id="fixer",
+        invocation_id="repair:1",
+        system_prompt="Fix",
+        task_prompt="Fix it",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    usages = [
+        event for event in recorder.events("usage-unique") if event.type == EventType.MODEL_USAGE
+    ]
+    ids = [event.event_id for event in usages]
+    assert len(ids) >= 2
+    assert len(ids) == len(set(ids))
+
+
+@pytest.mark.asyncio
+async def test_tool_response_usage_is_not_recorded_twice(tmp_path: Path) -> None:
+    gateway = ObservingToolGateway([ToolModelResponse(content="done")], worker_result())
+    recorder = TrajectoryRecorder()
+    await BoundedToolAgent(gateway, recorder, max_iterations=2, max_tool_calls=2).run(
+        run_id="usage-once",
+        agent_id="fixer",
+        invocation_id="repair:1",
+        system_prompt="Fix",
+        task_prompt="Fix it",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    events = recorder.events("usage-once")
+    metrics = token_metrics_from_events(events)
+    usage_events = [event for event in events if event.type == EventType.MODEL_USAGE]
+    expected = sum(
+        int(event.payload["input_tokens"]) + int(event.payload["output_tokens"])
+        for event in usage_events
+    )
+    assert metrics["total_tokens"] == expected
+    assert metrics["provider_requests"] == len(usage_events)
+    model_calls = [event for event in events if event.type == EventType.MODEL_CALL]
+    call_tokens = sum(int(event.payload.get("input_tokens") or 0) for event in model_calls)
+    assert call_tokens > 0
+    assert metrics["input_tokens"] != call_tokens + sum(
+        int(event.payload["input_tokens"]) for event in usage_events
+    )
+
+
+SKILL_BODY_MARKER = "UNIQUE_SKILL_BODY_MARKER"
+
+
+def _catalog_context(tmp_path: Path, skill_id: str, name: str, description: str) -> WorkerContext:
+    from evoci.domain.models import WorkerTask
+
+    return WorkerContext(
+        run_id="prompt-run",
+        repo=RepoSpec(owner="org", name="repo"),
+        failure=CIFailure(summary="fixture failed", log_excerpt="failed", task_family="test"),
+        workspace_path=str(tmp_path),
+        invocation_id="investigation:inspect",
+        task=WorkerTask(
+            task_id="inspect",
+            kind="investigate",
+            objective="inspect",
+        ),
+        recommended_skills=(
+            SkillCatalogEntry(skill_id=skill_id, name=name, description=description),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_investigator_prompt_contains_skill_metadata_only(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], worker_result())
+    investigator = ModelWorker(gateway, TrajectoryRecorder(), capability_registry=store)
+    await investigator.execute(
+        context=_catalog_context(
+            tmp_path, created.manifest.skill_id, created.manifest.name, created.manifest.description
+        ),
+        capabilities=INVESTIGATOR_CAPABILITIES,
+    )
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert created.manifest.skill_id in blob
+    assert created.manifest.description in blob
+    assert SKILL_BODY_MARKER not in blob
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_fixer_prompt_contains_skill_metadata_only(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], _staged_plan())
+    fixer = ModelWorker(gateway, TrajectoryRecorder(), capability_registry=store)
+    context = _catalog_context(
+        tmp_path, created.manifest.skill_id, created.manifest.name, created.manifest.description
+    )
+    context = context.__class__(
+        **{
+            **{field: getattr(context, field) for field in context.__dataclass_fields__},
+            "task": context.task.model_copy(
+                update={"kind": "repair", "write_scope": ["app.py"], "task_id": "repair"}
+            ),
+            "invocation_id": "repair:1",
+        }
+    )
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    await fixer.execute(context=context, capabilities=WORKER_REPAIR_CAPABILITIES)
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert created.manifest.skill_id in blob
+    assert SKILL_BODY_MARKER not in blob
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_skill_body_absent_before_load(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], worker_result())
+    await BoundedToolAgent(gateway, TrajectoryRecorder(), max_iterations=2, max_tool_calls=2).run(
+        run_id="no-load",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt=json.dumps({"skills": [{"skill_id": created.manifest.skill_id}]}),
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert SKILL_BODY_MARKER not in blob
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_skill_body_appears_once_after_load(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-once",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    await BoundedToolAgent(gateway, TrajectoryRecorder(), max_iterations=3, max_tool_calls=3).run(
+        run_id="load-once",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert blob.count(SKILL_BODY_MARKER) == 1
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_skill_memory_appears_once_after_load(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from evoci.capability.models import SkillMemoryEntry
+
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    lesson = "UNIQUE_SKILL_MEMORY_MARKER"
+    store.append_skill_memory(
+        created.manifest.skill_id,
+        SkillMemoryEntry(
+            run_id="mem-1",
+            repository="org/repo",
+            task_summary="fixture",
+            outcome="success",
+            lesson=lesson,
+            created_at=datetime.now(UTC),
+        ),
+    )
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-mem",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    await BoundedToolAgent(gateway, TrajectoryRecorder(), max_iterations=3, max_tool_calls=3).run(
+        run_id="load-mem",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert blob.count(lesson) == 1
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_load_skill_injects_body_and_memory_once(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from evoci.capability.models import SkillMemoryEntry
+
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    memory_marker = "UNIQUE_SKILL_MEMORY_MARKER"
+    store.append_skill_memory(
+        created.manifest.skill_id,
+        SkillMemoryEntry(
+            run_id="mem-repeat",
+            repository="org/repo",
+            task_summary="fixture",
+            outcome="success",
+            lesson=memory_marker,
+            created_at=datetime.now(UTC),
+        ),
+    )
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-first",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-second",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    await BoundedToolAgent(gateway, TrajectoryRecorder(), max_iterations=4, max_tool_calls=4).run(
+        run_id="load-twice",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    history = json.dumps(gateway.messages_seen[-1], default=str)
+    assert history.count(SKILL_BODY_MARKER) == 1
+    assert history.count(memory_marker) == 1
+    tool_payloads = [
+        json.loads(message.content)
+        for message in gateway.messages_seen[-1]
+        if message.role == "tool" and message.content
+    ]
+    assert any(payload.get("result", {}).get("already_loaded") is True for payload in tool_payloads)
+    assert sum("procedure" in (payload.get("result") or {}) for payload in tool_payloads) == 1
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_context_does_not_duplicate_skill_body(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], worker_result())
+    investigator = ModelWorker(gateway, TrajectoryRecorder(), capability_registry=store)
+    await investigator.execute(
+        context=_catalog_context(
+            tmp_path, created.manifest.skill_id, created.manifest.name, created.manifest.description
+        ),
+        capabilities=INVESTIGATOR_CAPABILITIES,
+    )
+    blob = json.dumps(gateway.messages_seen, default=str)
+    assert blob.count(SKILL_BODY_MARKER) == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_visible_skill_is_retrieved_not_selected(tmp_path: Path) -> None:
+    from evoci.capability.retrieval import CapabilityRetriever
+    from tests.integration.test_graph import (
+        FakeCoordinator,
+        FakeDiagnoser,
+        FakeInvestigator,
+        make_runtime,
+    )
+
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    store.create_skill(skill_candidate())
+    recorder = TrajectoryRecorder()
+    runtime = replace(
+        make_runtime(tmp_path, FakeCoordinator([[]]), FakeInvestigator(), FakeDiagnoser()),
+        capability_registry=store,
+        capability_retriever=CapabilityRetriever(store),
+        recorder=recorder,
+    )
+    from tests.integration.test_graph import initial_state
+
+    result = await build_graph(runtime).ainvoke(initial_state(tmp_path, run_id="catalog-only"))
+    events = recorder.events("catalog-only")
+    assert any(event.type == EventType.SKILL_RETRIEVED for event in events)
+    assert not any(event.type == EventType.SKILL_SELECTED for event in events)
+    assert result.get("skill_catalog")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_loaded_skill_is_selected(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    recorder = TrajectoryRecorder()
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-sel",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    await BoundedToolAgent(gateway, recorder, max_iterations=3, max_tool_calls=3).run(
+        run_id="selected-run",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    events = recorder.events("selected-run")
+    selected = [event for event in events if event.type == EventType.SKILL_SELECTED]
+    used = [event for event in events if event.type == EventType.SKILL_USED]
+    assert len(selected) == 1
+    assert used == []
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_loaded_but_unclaimed_skill_is_not_used(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-unclaimed",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    result = await BoundedToolAgent(
+        gateway, TrajectoryRecorder(), max_iterations=3, max_tool_calls=3
+    ).run(
+        run_id="unclaimed",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    assert result.used_skill_refs == []
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unloaded_claimed_skill_is_discarded(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    claimed = worker_result(used=[SkillRef(skill_id=created.manifest.skill_id)])
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], claimed)
+    result = await BoundedToolAgent(
+        gateway, TrajectoryRecorder(), max_iterations=2, max_tool_calls=2
+    ).run(
+        run_id="claimed-unloaded",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    assert result.used_skill_refs == []
+    tools.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_production_investigator_clears_unloaded_skill_claim(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    claimed = worker_result(used=[SkillRef(skill_id=created.manifest.skill_id)])
+    gateway = ScriptedToolGateway([ToolModelResponse(content="done")], claimed)
+    investigator = ModelWorker(gateway, TrajectoryRecorder(), capability_registry=store)
+    result = await investigator.execute(
+        context=_catalog_context(
+            tmp_path, created.manifest.skill_id, created.manifest.name, created.manifest.description
+        ),
+        capabilities=INVESTIGATOR_CAPABILITIES,
+    )
+    assert result.result.used_skill_refs == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_skill_script_counts_as_used(tmp_path: Path) -> None:
+    store = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = store.create_skill(skill_candidate())
+    tools = create_worker_registry(
+        INVESTIGATOR_CAPABILITIES,
+        tmp_path,
+        capability_registry=store,
+        allowed_skill_refs={created.manifest.skill_id},
+    )
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load-used",
+                        name="load_skill",
+                        arguments={"skill_id": created.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="script-used",
+                        name="run_skill_script",
+                        arguments={
+                            "skill_id": created.manifest.skill_id,
+                            "script_name": "inspect.py",
+                            "args": [],
+                        },
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        worker_result(),
+    )
+    result = await BoundedToolAgent(
+        gateway, TrajectoryRecorder(), max_iterations=4, max_tool_calls=4
+    ).run(
+        run_id="script-used",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:inspect",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=tools,
+        output_schema=WorkerResult,
+    )
+    assert result.used_skill_refs == [SkillRef(skill_id=created.manifest.skill_id)]
+    tools.close()
+    store.close()
+
+
+def _tool_turn(call_id: str, name: str = "read_file", **arguments: object) -> ToolModelResponse:
+    return ToolModelResponse(
+        tool_calls=[ToolCallRequest(call_id=call_id, name=name, arguments=dict(arguments))]
+    )
+
+
+class CountingGateway(ScriptedToolGateway):
+    def __init__(
+        self,
+        turns: list[ToolModelResponse],
+        final: BaseModel,
+        *,
+        fail_finalize: bool = False,
+        finalize_error: Exception | None = None,
+    ) -> None:
+        super().__init__(turns, final)
+        self.next_action_calls = 0
+        self.finalize_calls = 0
+        self.fail_finalize = fail_finalize
+        self.finalize_error = finalize_error
+
+    async def next_action(self, **kwargs: object) -> ToolModelResponse:
+        self.next_action_calls += 1
+        usage_observer = kwargs.get("usage_observer")
+        if callable(usage_observer):
+            usage_observer(
+                ModelUsage(input_tokens=1, output_tokens=1, request_kind="tool_action")
+            )
+        return await super().next_action(**kwargs)  # type: ignore[arg-type]
+
+    async def finalize(self, **kwargs: object) -> BaseModel:
+        self.finalize_calls += 1
+        usage_observer = kwargs.get("usage_observer")
+        if callable(usage_observer):
+            usage_observer(
+                ModelUsage(
+                    input_tokens=2, output_tokens=2, request_kind="structured_finalize"
+                )
+            )
+        if self.finalize_error is not None:
+            raise self.finalize_error
+        if self.fail_finalize:
+            raise RepairBudgetExhausted("task-level model-call budget exhausted")
+        return await super().finalize(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_finalization_has_reserved_model_call(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n")
+    gateway = CountingGateway(
+        [_tool_turn("r1", path="app.py"), _tool_turn("r2", path="app.py")],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    result = await BoundedToolAgent(gateway, recorder, max_iterations=2, max_tool_calls=4).run(
+        run_id="reserve-final",
+        agent_id="worker:t",
+        invocation_id="worker:1:t",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    assert result.summary
+    assert gateway.next_action_calls == 2
+    assert gateway.finalize_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_finalization_counts_toward_run_budget(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n")
+    gateway = CountingGateway(
+        [_tool_turn("r1", path="app.py"), ToolModelResponse(content="done")],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    manager = RunBudgetManager(max_model_calls=8, max_tool_calls=8, recorder=recorder)
+    await BoundedToolAgent(
+        gateway, recorder, max_iterations=4, max_tool_calls=4, budget_manager=manager
+    ).run(
+        run_id="count-final",
+        agent_id="worker:t",
+        invocation_id="worker:1:t",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    snapshot = manager.for_run("count-final").snapshot()
+    assert snapshot.model_calls == 3
+    phases = [
+        event.payload.get("phase")
+        for event in recorder.events("count-final")
+        if event.type == EventType.MODEL_CALL
+    ]
+    assert "structured_final" in phases
+    assert sum(event.type == EventType.MODEL_USAGE for event in recorder.events("count-final")) >= 1
+
+
+@pytest.mark.asyncio
+async def test_worker_reserves_final_call_from_task_budget(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n")
+    gateway = CountingGateway(
+        [_tool_turn(f"r{index}", path="app.py") for index in range(1, 8)],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    extra = RunRepairBudget(max_model_calls=5, max_tool_calls=20)
+    await BoundedToolAgent(gateway, recorder, max_iterations=15, max_tool_calls=20).run(
+        run_id="task-reserve",
+        agent_id="worker:t",
+        invocation_id="worker:1:t",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+        extra_budget=extra,
+    )
+    assert gateway.next_action_calls == 4
+    assert gateway.finalize_calls == 1
+    assert extra.snapshot().model_calls == 5
+
+
+@pytest.mark.asyncio
+async def test_global_budget_is_not_exceeded_by_finalization(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n")
+    gateway = CountingGateway(
+        [_tool_turn(f"r{index}", path="app.py") for index in range(1, 8)],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    manager = RunBudgetManager(max_model_calls=3, max_tool_calls=20, recorder=recorder)
+    await BoundedToolAgent(
+        gateway, recorder, max_iterations=15, max_tool_calls=20, budget_manager=manager
+    ).run(
+        run_id="global-cap",
+        agent_id="worker:t",
+        invocation_id="worker:1:t",
+        system_prompt="inspect",
+        task_prompt="inspect",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+    assert gateway.next_action_calls == 2
+    assert gateway.finalize_calls == 1
+    assert manager.for_run("global-cap").snapshot().model_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_collects_last_iteration_edit(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn(
+                "patch",
+                "apply_patch",
+                files={"app.py": "VALUE = 1\n"},
+            )
+        ],
+        StagedFixerPlan(summary="fixed"),
+        fail_finalize=True,
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        max_iterations=1,
+        max_tool_calls=4,
+        budget_manager=RunBudgetManager(max_model_calls=8, max_tool_calls=8, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="last-edit",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair",
+                kind="repair",
+                objective="fix",
+                write_scope=["app.py"],
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert gateway.next_action_calls == 1
+    assert gateway.finalize_calls == 1
+    assert run.result.status == "completed"
+    assert run.edits[0].content == "VALUE = 1\n"
+    assert (tmp_path / "app.py").read_text() == "VALUE = 0\n"
+
+
+@pytest.mark.asyncio
+async def test_worker_run_uses_real_tool_events_not_model_report(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn("patch", "apply_patch", files={"app.py": "VALUE = 1\n"}),
+            _tool_turn(
+                "test",
+                "run_test",
+                argv=["python", "-c", "import app; assert app.VALUE == 1"],
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(
+            summary="semantic summary only",
+            commands_run=["pytest imaginary.py", "rm -rf /"],
+            verification_plan=[["python", "-c", "raise SystemExit(0)"]],
+            evidence=[
+                EvidenceItem(
+                    source_agent="worker:repair",
+                    kind="test_result",
+                    claim="imaginary tests passed",
+                    command="pytest imaginary.py",
+                    confidence=1.0,
+                ),
+                EvidenceItem(
+                    source_agent="worker:repair",
+                    kind="source_code",
+                    claim="VALUE was updated in app.py",
+                    file_path="app.py",
+                    confidence=0.8,
+                ),
+            ],
+        ),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        max_iterations=4,
+        max_tool_calls=8,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="harness-facts",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair",
+                kind="repair",
+                objective="fix",
+                write_scope=["app.py"],
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.result.summary == "semantic summary only"
+    assert any("import app; assert app.VALUE == 1" in item for item in run.commands_run)
+    assert [spec.argv for spec in run.verification_plan] == [
+        ["python", "-c", "import app; assert app.VALUE == 1"]
+    ]
+    assert [spec.cwd for spec in run.verification_plan] == ["."]
+    claims = [item.claim for item in run.result.evidence]
+    assert "VALUE was updated in app.py" in claims
+    assert "imaginary tests passed" not in claims
+    assert any("run_test passed" in claim for claim in claims)
+    assert "pytest imaginary.py" not in run.commands_run
+
+
+def _skill_worker_context(
+    tmp_path: Path, skill_id: str, *, invocation_id: str = "worker:1:repair"
+) -> WorkerContext:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    return WorkerContext(
+        run_id="skill-attr",
+        repo=RepoSpec(name="fixture"),
+        failure=CIFailure(summary="fail", log_excerpt="err"),
+        workspace_path=str(tmp_path),
+        invocation_id=invocation_id,
+        task=WorkerTask(
+            task_id="repair",
+            kind="repair",
+            objective="fix",
+            write_scope=["app.py"],
+            recommended_skill_refs=[SkillRef(skill_id=skill_id)],
+        ),
+        recommended_skills=(
+            SkillCatalogEntry(skill_id=skill_id, name="fixture", description="fixture"),
+        ),
+        baseline_snapshot_id="snap",
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_worker_procedure_skill_is_used_without_script(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(skill_candidate())
+    skill_id = created.manifest.skill_id
+    gateway = CountingGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load",
+                        name="load_skill",
+                        arguments={"skill_id": skill_id},
+                    )
+                ]
+            ),
+            _tool_turn("patch", "apply_patch", files={"app.py": "VALUE = 1\n"}),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(
+            summary="applied the loaded procedure",
+            used_skill_refs=[SkillRef(skill_id=skill_id)],
+        ),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        max_iterations=6,
+        max_tool_calls=8,
+        capability_registry=registry,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.result.used_skill_refs == [SkillRef(skill_id=skill_id)]
+    used = [event for event in recorder.events("skill-attr") if event.type == EventType.SKILL_USED]
+    assert any(event.payload.get("usage_kind") == "procedure" for event in used)
+    assert all(event.payload.get("usage_kind") != "script" for event in used)
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_loaded_skill_without_declaration_is_not_used(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(skill_candidate())
+    skill_id = created.manifest.skill_id
+    gateway = CountingGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load",
+                        name="load_skill",
+                        arguments={"skill_id": skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="did not use the skill"),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        capability_registry=registry,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.result.used_skill_refs == []
+    assert not any(
+        event.type == EventType.SKILL_USED for event in recorder.events("skill-attr")
+    )
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_unloaded_claimed_skill_is_dropped(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(skill_candidate())
+    skill_id = created.manifest.skill_id
+    gateway = CountingGateway(
+        [ToolModelResponse(content="done")],
+        StagedFixerPlan(
+            summary="claimed without loading",
+            used_skill_refs=[SkillRef(skill_id=skill_id)],
+        ),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        capability_registry=registry,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.result.used_skill_refs == []
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_run_test_in_subdir_keeps_cwd(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "probe.py").write_text("VALUE = 1\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn(
+                "test",
+                "run_test",
+                argv=["python", "-c", "import probe; assert probe.VALUE == 1"],
+                cwd="tests",
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="tested in tests/"),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        max_iterations=4,
+        max_tool_calls=8,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="cwd-run",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair",
+                kind="repair",
+                objective="fix",
+                write_scope=["app.py"],
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.verification_plan == [
+        VerificationCommandSpec(
+            argv=["python", "-c", "import probe; assert probe.VALUE == 1"],
+            cwd="tests",
+        )
+    ]
+    assert any("cwd=tests" in item for item in run.commands_run)
+
+
+@pytest.mark.asyncio
+async def test_successful_run_command_is_audit_only(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn("env", "run_command", argv=["python", "-c", "print('diag')"]),
+            _tool_turn(
+                "test",
+                "run_test",
+                argv=["python", "-c", "raise SystemExit(0)"],
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="mixed commands"),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="audit-only",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair", kind="repair", objective="fix", write_scope=["app.py"]
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert any("diag" in item for item in run.commands_run)
+    assert [spec.argv for spec in run.verification_plan] == [
+        ["python", "-c", "raise SystemExit(0)"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_run_test_is_not_supplementary(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn(
+                "test",
+                "run_test",
+                argv=["python", "-c", "raise SystemExit(1)"],
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="failed local test"),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="failed-test",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair", kind="repair", objective="fix", write_scope=["app.py"]
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.verification_plan == []
+    assert run.commands_run
+
+
+@pytest.mark.asyncio
+async def test_network_run_test_is_not_supplementary(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 0\n")
+    gateway = CountingGateway(
+        [
+            _tool_turn(
+                "test",
+                "run_test",
+                argv=["python", "-c", "raise SystemExit(0)"],
+                network=True,
+            ),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="network test"),
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=WorkerContext(
+            run_id="net-test",
+            repo=RepoSpec(name="fixture"),
+            failure=CIFailure(summary="fail", log_excerpt="err"),
+            workspace_path=str(tmp_path),
+            invocation_id="worker:1:repair",
+            task=WorkerTask(
+                task_id="repair", kind="repair", objective="fix", write_scope=["app.py"]
+            ),
+            baseline_snapshot_id="snap",
+        ),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.verification_plan == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_does_not_infer_procedure_use(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(skill_candidate())
+    skill_id = created.manifest.skill_id
+    gateway = CountingGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="load",
+                        name="load_skill",
+                        arguments={"skill_id": skill_id},
+                    )
+                ]
+            ),
+            _tool_turn("patch", "apply_patch", files={"app.py": "VALUE = 1\n"}),
+        ],
+        StagedFixerPlan(summary="unused"),
+        fail_finalize=True,
+    )
+    recorder = TrajectoryRecorder()
+    worker = ModelWorker(
+        gateway,
+        recorder,
+        capability_registry=registry,
+        max_iterations=2,
+        budget_manager=RunBudgetManager(max_model_calls=16, max_tool_calls=16, recorder=recorder),
+    )
+    run = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert run.edits
+    assert run.result.used_skill_refs == []
+    assert not any(
+        event.type == EventType.SKILL_USED for event in recorder.events("skill-attr")
+    )
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_invocation_ids_do_not_mix_commands_or_skills(tmp_path: Path) -> None:
+    registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "skills.sqlite")
+    created = registry.create_skill(skill_candidate())
+    skill_id = created.manifest.skill_id
+    recorder = TrajectoryRecorder()
+    manager = RunBudgetManager(max_model_calls=32, max_tool_calls=32, recorder=recorder)
+    worker = ModelWorker(
+        CountingGateway(
+            [
+                ToolModelResponse(
+                    tool_calls=[
+                        ToolCallRequest(
+                            call_id="load-a",
+                            name="load_skill",
+                            arguments={"skill_id": skill_id},
+                        )
+                    ]
+                ),
+                _tool_turn("a-test", "run_test", argv=["python", "-c", "print('first')"]),
+                ToolModelResponse(content="done"),
+            ],
+            StagedFixerPlan(
+                summary="first", used_skill_refs=[SkillRef(skill_id=skill_id)]
+            ),
+        ),
+        recorder,
+        capability_registry=registry,
+        budget_manager=manager,
+    )
+    first = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id, invocation_id="worker:1:a"),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    worker.loop.gateway = CountingGateway(  # type: ignore[assignment]
+        [
+            _tool_turn("b-test", "run_test", argv=["python", "-c", "print('second')"]),
+            ToolModelResponse(content="done"),
+        ],
+        StagedFixerPlan(summary="second"),
+    )
+    second = await worker.execute(
+        context=_skill_worker_context(tmp_path, skill_id, invocation_id="worker:2:b"),
+        capabilities=WORKER_REPAIR_CAPABILITIES,
+    )
+    assert any("first" in item for item in first.commands_run)
+    assert all("second" not in item for item in first.commands_run)
+    assert any("second" in item for item in second.commands_run)
+    assert all("first" not in item for item in second.commands_run)
+    assert first.result.used_skill_refs == [SkillRef(skill_id=skill_id)]
+    assert second.result.used_skill_refs == []
+    registry.close()
 

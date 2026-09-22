@@ -8,24 +8,19 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 import evoci.cli as cli
-from evoci.agents.model_agents import StagedFixerPlan
+from evoci.agents.model_agents import WorkerReport
 from evoci.benchmark.models import BenchmarkVariant
 from evoci.benchmark.variants import variant_features
-from evoci.capability.curator import CuratorReview
-from evoci.capability.miner import LearningDecision
+from evoci.capability.miner import SkillLearningDecision
 from evoci.config import EvoCIConfig
 from evoci.domain.models import (
     CIFailure,
-    Diagnosis,
     EvidenceItem,
-    Hypothesis,
-    InvestigationPlan,
-    InvestigationTask,
     RepoSpec,
-    ReviewResult,
-    WorkerResult,
+    SupervisorDecision,
+    WorkerTask,
 )
-from evoci.memory.models import MemoryCandidate
+from evoci.memory.models import LongTermFactCandidate
 from evoci.model.gateway import (
     ResponseT,
     ToolCallRequest,
@@ -47,47 +42,20 @@ class OfflineBenchmarkGateway:
         user_prompt: str,
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del system_prompt, user_prompt, agent_id
+        del system_prompt, user_prompt, agent_id, usage_observer
         output: BaseModel
-        if response_model is InvestigationPlan:
-            output = InvestigationPlan(
-                tasks=[
-                    InvestigationTask(
-                        task_id="repository",
-                        role="repository",
-                        objective="inspect calculator implementation",
-                    ),
-                    InvestigationTask(
-                        task_id="test",
-                        role="test",
-                        objective="inspect expected behavior",
-                    ),
-                ],
-                reasoning_summary="inspect source and test independently",
-            )
-        elif response_model is Diagnosis:
-            output = Diagnosis(
-                primary=Hypothesis(
-                    root_cause="calculator subtracts instead of adding",
-                    evidence_ids=[],
-                    confidence=0.99,
-                    affected_files=["calculator.py"],
-                    proposed_action="replace subtraction with addition",
-                ),
-                needs_more_evidence=False,
-            )
-        elif response_model is MemoryCandidate:
-            output = MemoryCandidate(
-                type="semantic",
+        if response_model is LongTermFactCandidate:
+            output = LongTermFactCandidate(
+                type="fact",
                 content="calculator addition failures can come from a subtraction operator",
-                namespace="repo:fixture/calculator",
                 confidence=0.9,
             )
-        elif response_model is LearningDecision:
-            output = LearningDecision(action="none", rationale="fixture adds no new capability")
-        elif response_model is CuratorReview:
-            output = CuratorReview(action="none", rationale="no duplicate")
+        elif response_model is SkillLearningDecision:
+            output = SkillLearningDecision(
+                action="none", rationale="fixture adds no new capability"
+            )
         else:
             raise AssertionError(response_model)
         return response_model.model_validate(output.model_dump())
@@ -98,25 +66,27 @@ class OfflineBenchmarkGateway:
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ToolModelResponse:
-        del messages, tools
+        del messages, usage_observer
         count = self.turns.get(agent_id, 0)
         self.turns[agent_id] = count + 1
-        if agent_id.startswith("investigator:") and count == 0:
+        writable = any(item.name == "apply_patch" for item in tools)
+        if agent_id == "supervisor" and count == 0:
             return ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
-                        call_id=f"{agent_id}:read",
+                        call_id="supervisor:read",
                         name="read_file",
                         arguments={"path": "calculator.py"},
                     )
                 ]
             )
-        if agent_id == "fixer" and count == 0:
+        if agent_id.startswith("worker:") and count == 0 and writable:
             return ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
-                        call_id="fixer:patch",
+                        call_id=f"{agent_id}:patch",
                         name="apply_patch",
                         arguments={
                             "files": {
@@ -129,13 +99,13 @@ class OfflineBenchmarkGateway:
                     )
                 ]
             )
-        if agent_id == "reviewer" and count == 0:
+        if agent_id.startswith("worker:") and count == 0:
             return ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
-                        call_id="reviewer:test",
-                        name="run_test",
-                        arguments={"argv": ["python", "-m", "unittest", "-q"]},
+                        call_id=f"{agent_id}:read",
+                        name="read_file",
+                        arguments={"path": "calculator.py"},
                     )
                 ]
             )
@@ -147,32 +117,47 @@ class OfflineBenchmarkGateway:
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del messages
+        del messages, usage_observer
         output: BaseModel
-        if response_model is WorkerResult:
-            output = WorkerResult(
-                task_id=agent_id.split(":", 1)[-1],
-                summary="repository inspected",
+        if response_model is SupervisorDecision:
+            count = self.turns.get("supervisor-final", 0)
+            self.turns["supervisor-final"] = count + 1
+            if count == 0:
+                output = SupervisorDecision(
+                    action="dispatch",
+                    reasoning_summary="repair the calculator",
+                    tasks=[
+                        WorkerTask(
+                            task_id="repair-add",
+                            kind="repair",
+                            objective="fix addition",
+                            write_scope=["calculator.py"],
+                        )
+                    ],
+                )
+            else:
+                output = SupervisorDecision(
+                    action="stop",
+                    reasoning_summary="formal verification already passed",
+                    stop_reason="verified success",
+                )
+        elif response_model is WorkerReport:
+            output = WorkerReport(
+                summary="correct calculator addition",
                 evidence=[
                     EvidenceItem(
                         source_agent=agent_id,
                         kind="source_code",
-                        claim="calculator uses subtraction",
+                        claim="calculator used subtraction",
                         file_path="calculator.py",
                         confidence=0.95,
                     )
                 ],
-            )
-        elif response_model is StagedFixerPlan:
-            output = StagedFixerPlan(
-                summary="correct calculator addition",
                 commands_run=["python -m unittest -q"],
-                risk="low",
                 verification_plan=[["python", "-m", "unittest", "-q"]],
             )
-        elif response_model is ReviewResult:
-            output = ReviewResult(accepted=True, confidence=0.99)
         else:
             raise AssertionError(response_model)
         return response_model.model_validate(output.model_dump())
@@ -235,7 +220,6 @@ async def test_all_benchmark_variants_execute_their_real_runtime(
         assert any(event.type == EventType.TOOL_CALL for event in resources.recorder.events(run_id))
         assert (resources.runtime.memory_store is not None) is features.long_term_memory
         assert (resources.runtime.capability_registry is not None) is features.capabilities
-        assert (resources.runtime.curator_pipeline is not None) is features.curator
         assert resources.runtime.budget_manager is not None
         budget = resources.runtime.budget_manager.for_run(run_id).snapshot()
         assert budget.model_calls <= config.max_run_model_calls
@@ -266,8 +250,9 @@ class RetrySingleGateway(OfflineBenchmarkGateway):
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ToolModelResponse:
-        del messages, tools, agent_id
+        del messages, tools, agent_id, usage_observer
         if not self._wrote_this_attempt:
             self._wrote_this_attempt = True
             operator = "+" if self.fixer_finalizations >= 1 else "-"
@@ -295,14 +280,15 @@ class RetrySingleGateway(OfflineBenchmarkGateway):
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> ResponseT:
-        del messages, agent_id
-        if response_model is not StagedFixerPlan:
+        del messages, agent_id, usage_observer
+        if response_model is not WorkerReport:
             raise AssertionError(response_model)
         self.fixer_finalizations += 1
         self._wrote_this_attempt = False
         succeeds = self.fixer_finalizations > 1
-        output = StagedFixerPlan(
+        output = WorkerReport(
             summary="retry fixture",
             risk="low",
             verification_plan=[
@@ -329,7 +315,7 @@ async def test_single_variant_uses_feedback_and_retries_with_shared_budget(
             "state_dir": tmp_path / "single-retry-state",
             "capability_dir": tmp_path / "single-retry-skills",
             "runtime_dir": tmp_path / "single-retry-runtime",
-            "max_repair_attempts": 3,
+            "max_supervisor_batches": 3,
             "max_run_model_calls": 10,
             "max_run_tool_calls": 10,
         }

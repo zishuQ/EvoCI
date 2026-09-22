@@ -1,40 +1,35 @@
 # Capability registry
 
-A capability is a versioned package, not a prompt fragment. `SKILL.md` and `manifest.json` are
-required; scripts, references, templates, tests, and assets are optional. Package files are hashed
-and made read-only. A revised capability creates a new version instead of overwriting history.
+A capability is a single current package, not a versioned prompt fragment. `SKILL.md` and
+`manifest.json` are required; scripts, references, templates, and tests are optional. Package files
+are hashed and made read-only. A revised capability replaces `package/` after validation and keeps
+one `previous/` backup. `memory.md` stays beside the package and is never hashed into the manifest.
 
-```mermaid
-stateDiagram-v2
-    [*] --> candidate
-    candidate --> trial: validate
-    candidate --> rejected: validation fails
-    trial --> active: policy threshold met
-    trial --> rejected: failure threshold met
-    active --> stale: unused
-    stale --> active: reused
-    stale --> archived: remains unused
-    active --> superseded: validated replacement
+```text
+skills/
+└── debug-pytest-collection/
+    ├── package/
+    │   ├── SKILL.md
+    │   ├── manifest.json
+    │   └── scripts/
+    ├── previous/
+    └── memory.md
 ```
 
-Validation covers safe relative paths, immutable hashes, required package structure, secret scans,
-dangerous text, Python AST policy, syntax, and package tests in a temporary copy with a restricted
-environment and timeout. Script execution additionally requires trial/active status, declared
-manifest membership, explicit execute permission, path containment, and bounded output.
+`CandidateValidator` checks only the Skill package itself: required directory and manifest files,
+file hashes, path containment, secret scans, dangerous text, Python AST safety, and, if `tests/`
+exists, `pytest tests` in a disposable copy. It does not run repository-level test commands during
+install. Whether the current repair is valid is already decided by the repair graph and official
+evaluator. How a future agent should verify a repair after using the Skill is written in
+`SkillSpec.verification` and rendered as the `# Verification` section of `SKILL.md`. Failed
+validation deletes the candidate and leaves the current package unchanged.
 
-`run_skill_script` is a formal leaf tool and is limited to capabilities selected for the current
-run. Its trace records skill/version, agent, stable invocation, resource, and execution result.
-Explicit script failure is always failure evidence; a successful run can credit an actually used
-skill only when that skill has no explicit execution failure. Trial evidence uses configurable
-minimum uses, successes, success rate, and maximum failures, and each skill/run outcome is recorded
-idempotently.
+`run_skill_script` is a formal leaf tool and is limited to enabled capabilities selected for the
+current run. Its trace records skill ID, agent, stable invocation, resource, and execution result.
+Explicit script failure is always failure evidence. Disabled skills are not retrieved or executed.
 
-Statistics distinguish retrieval, selection, and execution. Utility is provided by a strategy with
-configurable success, tool-reduction, and retry-reduction weights. The deterministic curator handles
-age, usage, utility, and lifecycle transitions; semantic duplicate/merge proposals remain a model
-concern and must produce a new validated target before sources become superseded.
-The registry rejects a colliding `new_skill` slug rather than inventing an orphan version. Updates
-name an exact skill ID and parent version, create the next version under that same ID, and leave the
-parent active until the child promotes. Every version after v1 therefore has explicit lineage.
-Curator merge candidates follow the same rule: complete package review, new validated trial,
-observed use, promotion, then source supersession.
+Statistics distinguish retrieval, selection, and execution. The registry rejects a colliding
+`new_skill` slug. `update_skill` names an exact skill ID, validates a new package, moves the current
+package to `previous/`, and installs the candidate as `package/`. Skill usage memory is append-only,
+idempotent on `run_id + skill_id`, and injected into agent context separately from the procedure.
+FAILURE memory is counterevidence, not a recommended procedure.

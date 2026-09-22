@@ -1,14 +1,15 @@
-"""Experience miner prompt contract: registry grounding and anti-conservatism."""
+"""Skill miner prompt contract and decision constraints."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from evoci.capability.miner import ExperienceMiner, LearningDecision
+from evoci.capability.miner import SkillLearningDecision, SkillMiner, SkillUsageLesson
 from evoci.capability.models import SkillCandidate, SkillSpec
+from evoci.domain.models import SkillRef
 from evoci.runtime.trajectory import AgentTrace, TrajectoryView
 
 
@@ -24,8 +25,9 @@ class CaptureGateway:
         user_prompt: str,
         response_model: type[BaseModel],
         agent_id: str,
+        usage_observer: object | None = None,
     ) -> Any:
-        del user_prompt, response_model, agent_id
+        del user_prompt, response_model, agent_id, usage_observer
         self.system_prompts.append(system_prompt)
         outcome = self.decisions.pop(0)
         if isinstance(outcome, Exception):
@@ -53,7 +55,7 @@ def _candidate() -> SkillCandidate:
     )
 
 
-def _trajectory() -> TrajectoryView:
+def _trajectory(*, success: bool = True, used: list[str] | None = None) -> TrajectoryView:
     return TrajectoryView(
         run_id="run-miner",
         agents=[AgentTrace(agent_id="fixer", model_calls=2, tool_calls=6, failed_tool_calls=0)],
@@ -67,18 +69,81 @@ def _trajectory() -> TrajectoryView:
         verification_history=[],
         skills_retrieved=[],
         skills_selected=[],
-        skills_used=[],
+        skills_used=[SkillRef(skill_id=skill_id) for skill_id in used or []],
         memories_retrieved=[],
         memories_selected=[],
         memories_used=[],
-        final_status="success",
+        final_status="success" if success else "failed",
     )
 
 
-def test_failed_trajectory_never_creates_a_skill_candidate() -> None:
-    miner = ExperienceMiner(CaptureGateway([]))
+def test_skill_miner_cannot_return_memory() -> None:
+    with pytest.raises(ValidationError):
+        SkillLearningDecision.model_validate(
+            {"action": "memory", "rationale": "store a fact", "candidate_memory": {}}
+        )
+
+
+def test_successful_trajectory_can_create_skill() -> None:
+    miner = SkillMiner(CaptureGateway([]))
+    assert miner.should_mine(
+        success=True,
+        failure_class=None,
+        skills_used=[],
+        tool_calls=1,
+        failed_attempts=0,
+        reusable_script_created=False,
+        repeated_pattern_detected=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_used_skill_success_can_update_skill() -> None:
+    decision = SkillLearningDecision(
+        action="update_skill",
+        rationale="improved verification",
+        target_skill_id="assertion-repair",
+        candidate_skill=_candidate(),
+        usage_lessons=[SkillUsageLesson(skill_id="assertion-repair", lesson="worked")],
+    )
+    gateway = CaptureGateway([decision])
+    miner = SkillMiner(gateway)
+    result = await miner.decide(
+        _trajectory(used=["assertion-repair"]),
+        existing_skills=[{"skill_id": "assertion-repair", "name": "assertion-repair"}],
+        used_skill_ids=["assertion-repair"],
+    )
+    assert result.action == "update_skill"
+    assert result.target_skill_id == "assertion-repair"
+    assert "the only valid update_skill targets" in gateway.system_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_used_skill_failure_produces_failure_lesson() -> None:
+    decision = SkillLearningDecision(
+        action="new_skill",
+        rationale="should be ignored",
+        candidate_skill=_candidate(),
+        usage_lessons=[
+            SkillUsageLesson(skill_id="assertion-repair", lesson="older pluggy interface")
+        ],
+    )
+    miner = SkillMiner(CaptureGateway([decision]))
+    result = await miner.decide(
+        _trajectory(success=False, used=["assertion-repair"]),
+        used_skill_ids=["assertion-repair"],
+    )
+    assert result.action == "none"
+    assert result.candidate_skill is None
+    assert result.usage_lessons[0].lesson == "older pluggy interface"
+
+
+def test_failed_no_skill_run_cannot_create_skill() -> None:
+    miner = SkillMiner(CaptureGateway([]))
     assert not miner.should_mine(
         success=False,
+        failure_class="repair",
+        skills_used=[],
         tool_calls=100,
         failed_attempts=5,
         reusable_script_created=True,
@@ -88,45 +153,55 @@ def test_failed_trajectory_never_creates_a_skill_candidate() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_registry_blocks_update_skill_in_prompt() -> None:
-    decision = LearningDecision(
+    decision = SkillLearningDecision(
         action="new_skill", rationale="reusable", candidate_skill=_candidate()
     )
     gateway = CaptureGateway([decision])
-    miner = ExperienceMiner(gateway)
+    miner = SkillMiner(gateway)
     result = await miner.decide(_trajectory(), existing_skills=[])
     assert result.action == "new_skill"
     prompt = gateway.system_prompts[0]
     assert "The skill registry is empty" in prompt
     assert "update_skill is not available" in prompt
-    assert "prefer new_skill over none" in prompt
 
 
 @pytest.mark.asyncio
-async def test_populated_registry_lists_valid_update_targets() -> None:
-    decision = LearningDecision(
-        action="update_skill",
-        rationale="improved verification",
-        target_skill_id="assertion-repair",
-        target_version=1,
+async def test_new_skill_is_not_silently_converted_to_used_skill_update() -> None:
+    decision = SkillLearningDecision(
+        action="new_skill",
+        rationale="another procedure",
         candidate_skill=_candidate(),
+        usage_lessons=[SkillUsageLesson(skill_id="assertion-repair", lesson="worked")],
     )
-    gateway = CaptureGateway([decision])
-    miner = ExperienceMiner(gateway)
-    skills = [
-        {
-            "skill_id": "assertion-repair",
-            "version": 1,
-            "name": "assertion-repair",
-            "description": "repair assertion failures",
-            "triggers": ["AssertionError"],
-            "task_families": ["test"],
-        }
-    ]
-    await miner.decide(_trajectory(), existing_skills=skills)
-    prompt = gateway.system_prompts[0]
-    assert "the only valid update_skill targets" in prompt
-    assert "assertion-repair" in prompt
-    assert "target_skill_id and target_version from this list" in prompt
+    miner = SkillMiner(CaptureGateway([decision]))
+    result = await miner.decide(
+        _trajectory(used=["assertion-repair"]),
+        used_skill_ids=["assertion-repair"],
+    )
+    assert result.action == "none"
+    assert result.candidate_skill is None
+    assert result.target_skill_id is None
+    assert result.usage_lessons[0].lesson == "worked"
+
+
+@pytest.mark.asyncio
+async def test_miner_cannot_update_an_unused_skill() -> None:
+    decision = SkillLearningDecision(
+        action="update_skill",
+        rationale="wrong target",
+        target_skill_id="unrelated-skill",
+        candidate_skill=_candidate(),
+        usage_lessons=[SkillUsageLesson(skill_id="assertion-repair", lesson="worked")],
+    )
+    miner = SkillMiner(CaptureGateway([decision]))
+    result = await miner.decide(
+        _trajectory(used=["assertion-repair"]),
+        used_skill_ids=["assertion-repair"],
+    )
+    assert result.action == "none"
+    assert result.candidate_skill is None
+    assert result.target_skill_id is None
+    assert result.usage_lessons[0].skill_id == "assertion-repair"
 
 
 @pytest.mark.asyncio
@@ -134,9 +209,9 @@ async def test_repair_prompt_includes_registry_context() -> None:
     class InvalidDecision(ValueError):
         pass
 
-    fixed = LearningDecision(action="none", rationale="nothing durable")
+    fixed = SkillLearningDecision(action="none", rationale="nothing durable")
     gateway = CaptureGateway([InvalidDecision("update_skill requires target_skill_id"), fixed])
-    miner = ExperienceMiner(gateway)
+    miner = SkillMiner(gateway)
     result = await miner.decide(_trajectory(), existing_skills=[])
     assert result.action == "none"
     assert len(gateway.system_prompts) == 2

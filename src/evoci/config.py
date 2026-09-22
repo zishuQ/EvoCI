@@ -4,9 +4,86 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal, cast
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
+
+_REMOVED_SETTINGS = {
+    "EVO_MODEL_FAST": (
+        "FAST/STRONG/AUX routing has been removed. Use EVO_MODEL_NAME with "
+        "EVO_SUPERVISOR_* and EVO_WORKER_* role settings."
+    ),
+    "EVO_MODEL_STRONG": (
+        "FAST/STRONG/AUX routing has been removed. Use EVO_MODEL_NAME with "
+        "EVO_SUPERVISOR_* and EVO_WORKER_* role settings."
+    ),
+    "EVO_MODEL_AUX": (
+        "FAST/STRONG/AUX routing has been removed. Learning reuses the Worker "
+        "gateway. Use EVO_MODEL_NAME and EVO_WORKER_*."
+    ),
+    "EVO_AUX_MODEL_NAME": (
+        "FAST/STRONG/AUX routing has been removed. Learning reuses the Worker "
+        "gateway. Use EVO_MODEL_NAME and EVO_WORKER_*."
+    ),
+    "EVO_ENABLE_THINKING": (
+        "EVO_ENABLE_THINKING is removed. Set EVO_SUPERVISOR_ENABLE_THINKING and "
+        "EVO_WORKER_ENABLE_THINKING separately."
+    ),
+    "EVO_REASONING_EFFORT": (
+        "EVO_REASONING_EFFORT is removed. Set EVO_SUPERVISOR_REASONING_EFFORT "
+        "and EVO_WORKER_REASONING_EFFORT separately."
+    ),
+    "EVO_MAX_PARALLEL_WORKERS": (
+        "Multi-worker dispatch has been removed. EvoCI runs one Worker at a time."
+    ),
+    "EVO_MAX_TASKS_PER_BATCH": (
+        "Multi-task batches have been removed. Supervisor dispatch must contain "
+        "exactly one task."
+    ),
+    "EVO_MAX_RUN_TOKENS": (
+        "Token hard limits have been removed. Usage is recorded but does not stop "
+        "a run. Unset EVO_MAX_RUN_TOKENS."
+    ),
+    "EVO_MAX_TASK_OUTPUT_TOKENS": (
+        "Per-request output token caps are not sent by default. Unset "
+        "EVO_MAX_TASK_OUTPUT_TOKENS."
+    ),
+}
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_effort(name: str, default: str) -> ReasoningEffort:
+    raw = os.environ.get(name, default).strip().lower()
+    if raw not in {"low", "medium", "high", "xhigh"}:
+        raise ValueError(f"{name} must be one of low, medium, high, xhigh")
+    return cast(ReasoningEffort, raw)
+
+
+def _reject_removed_settings() -> None:
+    conflicts = [
+        f"{name}: {_REMOVED_SETTINGS[name]}"
+        for name in _REMOVED_SETTINGS
+        if os.environ.get(name, "").strip()
+    ]
+    if conflicts:
+        raise ValueError("Removed EvoCI settings must be migrated:\n" + "\n".join(conflicts))
+
+
+class RoleRuntimeConfig(BaseModel):
+    """Immutable per-role model request settings."""
+
+    model_config = ConfigDict(frozen=True)
+
+    role: Literal["supervisor", "worker"]
+    model_name: str | None = None
+    enable_thinking: bool = True
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class EvoCIConfig(BaseModel):
@@ -17,9 +94,6 @@ class EvoCIConfig(BaseModel):
     model_base_url: str = "https://api.openai.com/v1"
     model_api_key: SecretStr | None = None
     model_name: str | None = None
-    fast_model_name: str | None = None
-    strong_model_name: str | None = None
-    aux_model_name: str | None = None
     state_dir: Path = Path(".evoci/state")
     workspace_dir: Path = Path(".evoci/worktrees")
     repo_cache_dir: Path = Path(".evoci/repos")
@@ -31,30 +105,39 @@ class EvoCIConfig(BaseModel):
     command_timeout_seconds: float = Field(default=120.0, gt=0)
     output_limit_chars: int = Field(default=32_000, ge=1_000)
     memory_context_limit_chars: int = Field(default=6_000, ge=1_000)
-    max_initial_workers: int = Field(default=4, ge=1, le=4)
-    max_investigation_tasks: int = Field(default=8, ge=1, le=8)
-    max_investigation_rounds: int = Field(default=3, ge=1, le=3)
-    max_repair_attempts: int = Field(default=3, ge=1, le=5)
-    max_leaf_iterations: int = Field(default=8, ge=1, le=20)
-    max_leaf_tool_calls: int = Field(default=16, ge=1, le=50)
+    max_supervisor_batches: int = Field(default=3, ge=1, le=8)
+    max_leaf_iterations: int = Field(default=15, ge=1, le=20)
+    max_leaf_tool_calls: int = Field(default=30, ge=1, le=50)
     max_run_model_calls: int = Field(default=256, ge=1, le=1_000)
-    max_run_tool_calls: int = Field(default=256, ge=1, le=2_000)
-    trial_min_uses: int = Field(default=1, ge=1, le=100)
-    trial_min_successes: int = Field(default=1, ge=1, le=100)
-    trial_min_success_rate: float = Field(default=0.5, ge=0, le=1)
-    trial_max_failures: int = Field(default=3, ge=1, le=100)
+    max_run_tool_calls: int = Field(default=320, ge=1, le=2_000)
     capability_retrieval_top_k: int = Field(default=2, ge=1, le=20)
-    trial_retrieval_slots: int = Field(default=1, ge=0, le=20)
-    trial_max_exposures_without_use: int = Field(default=5, ge=1, le=1_000)
-    enable_thinking: bool = False
+    skill_catalog_limit_chars: int = Field(default=8_000, ge=500, le=32_000)
+    supervisor_enable_thinking: bool = True
+    supervisor_reasoning_effort: ReasoningEffort | None = "xhigh"
+    worker_enable_thinking: bool = True
+    worker_reasoning_effort: ReasoningEffort | None = "medium"
 
-    @model_validator(mode="after")
-    def validate_task_limits(self) -> EvoCIConfig:
-        if self.max_initial_workers > self.max_investigation_tasks:
-            raise ValueError("max_initial_workers cannot exceed max_investigation_tasks")
-        if self.trial_retrieval_slots > self.capability_retrieval_top_k:
-            raise ValueError("trial_retrieval_slots cannot exceed capability_retrieval_top_k")
-        return self
+    @property
+    def max_repair_attempts(self) -> int:
+        """Historical alias: one supervisor batch is one repair/replan cycle."""
+
+        return self.max_supervisor_batches
+
+    def supervisor_runtime(self) -> RoleRuntimeConfig:
+        return RoleRuntimeConfig(
+            role="supervisor",
+            model_name=self.model_name,
+            enable_thinking=self.supervisor_enable_thinking,
+            reasoning_effort=self.supervisor_reasoning_effort,
+        )
+
+    def worker_runtime(self) -> RoleRuntimeConfig:
+        return RoleRuntimeConfig(
+            role="worker",
+            model_name=self.model_name,
+            enable_thinking=self.worker_enable_thinking,
+            reasoning_effort=self.worker_reasoning_effort,
+        )
 
     @classmethod
     def from_env(cls, *, cwd: Path | None = None) -> EvoCIConfig:
@@ -62,21 +145,25 @@ class EvoCIConfig(BaseModel):
         env_file = root / ".env"
         if env_file.is_file():
             load_dotenv(env_file, override=False)
+        _reject_removed_settings()
 
         def path_value(name: str, default: str) -> Path:
             raw = Path(os.environ.get(name, default))
             return raw if raw.is_absolute() else root / raw
 
         api_key = os.environ.get("EVO_MODEL_API_KEY")
+        supervisor_batches = os.environ.get("EVO_MAX_SUPERVISOR_BATCHES")
+        repair_attempts = os.environ.get("EVO_MAX_REPAIR_ATTEMPTS")
+        if supervisor_batches and repair_attempts and supervisor_batches != repair_attempts:
+            raise ValueError(
+                "EVO_MAX_SUPERVISOR_BATCHES and EVO_MAX_REPAIR_ATTEMPTS disagree; "
+                "set only EVO_MAX_SUPERVISOR_BATCHES"
+            )
+        batches = int(supervisor_batches or repair_attempts or "3")
         return cls(
             model_base_url=os.environ.get("EVO_MODEL_BASE_URL", "https://api.openai.com/v1"),
             model_api_key=SecretStr(api_key) if api_key else None,
             model_name=os.environ.get("EVO_MODEL_NAME") or None,
-            fast_model_name=os.environ.get("EVO_MODEL_FAST") or None,
-            strong_model_name=os.environ.get("EVO_MODEL_STRONG") or None,
-            aux_model_name=(
-                os.environ.get("EVO_MODEL_AUX") or os.environ.get("EVO_AUX_MODEL_NAME") or None
-            ),
             state_dir=path_value("EVO_STATE_DIR", ".evoci/state"),
             workspace_dir=path_value("EVO_WORKSPACE_DIR", ".evoci/worktrees"),
             repo_cache_dir=path_value("EVO_REPO_CACHE_DIR", ".evoci/repos"),
@@ -87,22 +174,19 @@ class EvoCIConfig(BaseModel):
             not in {"0", "false", "no", "off"},
             model_timeout_seconds=float(os.environ.get("EVO_MODEL_TIMEOUT_SECONDS", "120")),
             command_timeout_seconds=float(os.environ.get("EVO_COMMAND_TIMEOUT_SECONDS", "120")),
-            max_repair_attempts=int(os.environ.get("EVO_MAX_REPAIR_ATTEMPTS", "3")),
-            max_leaf_iterations=int(os.environ.get("EVO_MAX_LEAF_ITERATIONS", "8")),
-            max_leaf_tool_calls=int(os.environ.get("EVO_MAX_LEAF_TOOL_CALLS", "16")),
+            max_supervisor_batches=batches,
+            max_leaf_iterations=int(os.environ.get("EVO_MAX_LEAF_ITERATIONS", "15")),
+            max_leaf_tool_calls=int(os.environ.get("EVO_MAX_LEAF_TOOL_CALLS", "30")),
             max_run_model_calls=int(os.environ.get("EVO_MAX_RUN_MODEL_CALLS", "256")),
-            max_run_tool_calls=int(os.environ.get("EVO_MAX_RUN_TOOL_CALLS", "256")),
-            trial_min_uses=int(os.environ.get("EVO_TRIAL_MIN_USES", "1")),
-            trial_min_successes=int(os.environ.get("EVO_TRIAL_MIN_SUCCESSES", "1")),
-            trial_min_success_rate=float(os.environ.get("EVO_TRIAL_MIN_SUCCESS_RATE", "0.5")),
-            trial_max_failures=int(os.environ.get("EVO_TRIAL_MAX_FAILURES", "3")),
+            max_run_tool_calls=int(os.environ.get("EVO_MAX_RUN_TOOL_CALLS", "320")),
             capability_retrieval_top_k=int(os.environ.get("EVO_CAPABILITY_RETRIEVAL_TOP_K", "2")),
-            trial_retrieval_slots=int(os.environ.get("EVO_TRIAL_RETRIEVAL_SLOTS", "1")),
-            trial_max_exposures_without_use=int(
-                os.environ.get("EVO_TRIAL_MAX_EXPOSURES_WITHOUT_USE", "5")
+            skill_catalog_limit_chars=int(
+                os.environ.get("EVO_SKILL_CATALOG_LIMIT_CHARS", "8000")
             ),
-            enable_thinking=os.environ.get("EVO_ENABLE_THINKING", "0").strip().lower()
-            in {"1", "true", "yes", "on"},
+            supervisor_enable_thinking=_env_bool("EVO_SUPERVISOR_ENABLE_THINKING", "1"),
+            supervisor_reasoning_effort=_env_effort("EVO_SUPERVISOR_REASONING_EFFORT", "xhigh"),
+            worker_enable_thinking=_env_bool("EVO_WORKER_ENABLE_THINKING", "1"),
+            worker_reasoning_effort=_env_effort("EVO_WORKER_REASONING_EFFORT", "medium"),
         )
 
     def ensure_directories(self) -> None:

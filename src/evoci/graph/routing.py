@@ -4,27 +4,8 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path, PurePosixPath
-from typing import Literal
 
-from evoci.config import EvoCIConfig
 from evoci.domain.models import FixerOutput
-from evoci.graph.state import EvoCIState
-
-
-def diagnosis_route(
-    state: EvoCIState, config: EvoCIConfig
-) -> Literal["repair", "coordinate", "failed"]:
-    diagnosis = state.get("diagnosis")
-    if diagnosis is None:
-        return "failed"
-    if diagnosis.primary.confidence >= 0.75 and not diagnosis.needs_more_evidence:
-        return "repair"
-    if (
-        state.get("investigation_round", 0) < config.max_investigation_rounds
-        and state.get("investigation_task_count", 0) < config.max_investigation_tasks
-    ):
-        return "coordinate"
-    return "failed"
 
 
 def requires_approval(output: FixerOutput) -> bool:

@@ -1,4 +1,4 @@
-"""Distinguish a wall-clock threshold failure from missing parallel execution."""
+"""Serial Worker execution: the previous parallel barrier is no longer a production path."""
 
 import asyncio
 
@@ -17,30 +17,31 @@ from tests.integration.test_graph import (
 
 
 @pytest.mark.asyncio
-async def test_three_investigators_overlap_and_join(tmp_path):
-    started = set()
-    barrier = asyncio.Event()
+async def test_two_queued_workers_never_overlap(tmp_path):
+    started: list[str] = []
+    inflight = 0
+    peaks: list[int] = []
 
-    class BarrierInvestigator(FakeInvestigator):
-        async def run(self, **kwargs):
-            started.add(kwargs["task"].task_id)
-            if len(started) == 3:
-                barrier.set()
-            # Serial execution cannot release this barrier.
-            await asyncio.wait_for(barrier.wait(), timeout=3)
-            return await super().run(**kwargs)
+    class SerialInvestigator(FakeInvestigator):
+        async def execute(self, **kwargs):
+            nonlocal inflight
+            started.append(kwargs["context"].task.task_id)
+            inflight += 1
+            peaks.append(inflight)
+            await asyncio.sleep(0.02)
+            inflight -= 1
+            return await super().execute(**kwargs)
 
-    diagnoser = FakeDiagnoser()
     runtime = make_runtime(
         tmp_path,
-        FakeCoordinator([[task("a"), task("b"), task("c")]]),
-        BarrierInvestigator(),
-        diagnoser,
+        FakeCoordinator([[task("a"), task("b")]]),
+        SerialInvestigator(),
+        FakeDiagnoser(),
     )
     graph = build_graph(runtime, checkpointer=InMemorySaver())
     result = await graph.ainvoke(
-        initial_state(tmp_path), {"configurable": {"thread_id": "parallel-barrier"}}
+        initial_state(tmp_path), {"configurable": {"thread_id": "serial-barrier"}}
     )
-    assert started == {"a", "b", "c"}
+    assert started[:2] == ["a", "b"]
+    assert max(peaks) == 1
     assert result["status"] == "success"
-    assert diagnoser.evidence_counts == [3]

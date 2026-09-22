@@ -1,15 +1,26 @@
-"""Model-assisted memory extraction with harness-owned commits."""
+"""Model-assisted repository fact extraction with harness-owned commits."""
 
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Sequence
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
-from evoci.domain.models import Diagnosis, FixerOutput, VerificationResult
-from evoci.memory.models import MemoryCandidate, SemanticMemory
+from evoci.memory.models import LongTermFactCandidate, LongTermMemory
 from evoci.memory.store import MemoryStore
-from evoci.model.gateway import ModelGateway
+from evoci.model.gateway import ModelGateway, UsageObserver
+from evoci.runtime.learning_payload import LearningInput
+
+
+def normalize_fact_content(content: str) -> str:
+    text = re.sub(r"\s+", " ", content.strip().lower())
+    return re.sub(r"[.。!！?？;；,，:：]+$", "", text)  # noqa: RUF001
+
+
+def fact_memory_id(repository: str, content: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"evoci:{repository}:{normalize_fact_content(content)}"))
 
 
 class MemoryConsolidator(Protocol):
@@ -19,10 +30,10 @@ class MemoryConsolidator(Protocol):
         run_id: str,
         repo: str,
         task_family: str,
-        diagnosis: Diagnosis,
-        patch: FixerOutput,
-        verification: VerificationResult,
-    ) -> MemoryCandidate: ...
+        learning: LearningInput,
+        existing_facts: Sequence[str] = (),
+        usage_observer: UsageObserver | None = None,
+    ) -> LongTermFactCandidate: ...
 
 
 class ModelMemoryConsolidator:
@@ -35,55 +46,62 @@ class ModelMemoryConsolidator:
         run_id: str,
         repo: str,
         task_family: str,
-        diagnosis: Diagnosis,
-        patch: FixerOutput,
-        verification: VerificationResult,
-    ) -> MemoryCandidate:
+        learning: LearningInput,
+        existing_facts: Sequence[str] = (),
+        usage_observer: UsageObserver | None = None,
+    ) -> LongTermFactCandidate:
         payload = {
             "run_id": run_id,
             "repo": repo,
             "task_family": task_family,
-            "diagnosis": diagnosis.model_dump(),
-            "patch": patch.model_dump(),
-            "verification": verification.model_dump(),
+            "learning": learning.model_dump(mode="json"),
+            "existing_repository_facts": list(existing_facts),
         }
         return await self.gateway.complete(
             system_prompt=(
-                "Extract one durable fact useful in future CI runs, or none. When a non-obvious "
-                "root cause or fix pattern was confirmed, prefer extracting it over returning "
-                "none. Facts that apply to more than one repo must go in family:<type>; use "
-                "global:ci only for truly universal knowledge, and repo:<owner>/<repo> only for "
-                "facts that can never transfer."
+                "Extract one durable fact about this repository, or none. Facts describe "
+                "what the repository is like: test runner, generated directories, legacy "
+                "APIs, or similar stable conditions. Do not write workflows or procedures; "
+                "those belong in Skills. Do not output a namespace or repository field; the "
+                "harness binds the fact to the current repository. If existing_repository_facts "
+                "already covers the useful fact, return type=none."
             ),
             user_prompt=json.dumps(payload),
-            response_model=MemoryCandidate,
+            response_model=LongTermFactCandidate,
             agent_id="memory-consolidator",
+            usage_observer=usage_observer,
         )
 
 
 def commit_candidate(
     store: MemoryStore,
-    candidate: MemoryCandidate,
+    candidate: LongTermFactCandidate,
     *,
     run_id: str,
+    repository: str,
     operation_key: str | None = None,
 ) -> str | None:
     if operation_key:
         existing = store.operation_result(operation_key)
         if existing is not None:
-            memory_id = existing.get("memory_id")
-            return str(memory_id) if memory_id else None
-    if candidate.type != "semantic" or not candidate.content or not candidate.namespace:
+            if existing.get("created") and existing.get("memory_id"):
+                return str(existing["memory_id"])
+            return None
+    if candidate.type != "fact" or not candidate.content:
         if operation_key:
-            store.record_operation(operation_key, {"memory_id": None})
+            store.record_operation(operation_key, {"memory_id": None, "created": False})
         return None
-    memory = SemanticMemory(
-        id=str(uuid5(NAMESPACE_URL, f"evoci:{run_id}:{candidate.namespace}:{candidate.content}")),
-        namespace=candidate.namespace,
-        content=candidate.content,
-        importance=0.7,
+    normalized = normalize_fact_content(candidate.content)
+    if not normalized:
+        if operation_key:
+            store.record_operation(operation_key, {"memory_id": None, "created": False})
+        return None
+    memory = LongTermMemory(
+        id=fact_memory_id(repository, candidate.content),
+        repository=repository,
+        content=candidate.content.strip(),
         confidence=candidate.confidence,
         source_run_ids=[run_id],
     )
-    store.add_semantic(memory, operation_key=operation_key)
-    return memory.id
+    created = store.add_long_term(memory, operation_key=operation_key)
+    return memory.id if created else None

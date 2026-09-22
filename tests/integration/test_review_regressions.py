@@ -44,14 +44,9 @@ from tests.unit.test_capability import candidate, registry
 async def test_r01_async_learning_can_validate_declared_commands(tmp_path: Path) -> None:
     store = registry(tmp_path)
     try:
-        record = store.create_candidate(candidate().model_copy(update={
-            "tests": [], "verification_commands": [PASSING],
-        }))
-        result = CandidateValidator(store).validate_to_trial(
-            record.manifest.skill_id, record.manifest.version
-        )
-        assert result.passed and result.behavior_verified
-        assert store.get(record.manifest.skill_id, 1).manifest.status == "trial"
+        record = store.create_skill(candidate().model_copy(update={"tests": []}))
+        record = store.get(record.manifest.skill_id)
+        assert record is not None and record.manifest.enabled
     finally:
         store.close()
 
@@ -104,13 +99,12 @@ async def test_r03_conflict_after_approval_preserves_external_edit(tmp_path: Pat
 def test_r04_nested_failing_skill_test_must_be_discovered(tmp_path: Path) -> None:
     store = registry(tmp_path)
     try:
-        record = store.create_candidate(candidate().model_copy(update={"tests": [
-            GeneratedFile(path="tests/nested/test_failure.py",
-                          content="def test_failure():\n    assert False\n"),
-        ]}))
-        result = CandidateValidator(store).validate_to_trial(record.manifest.skill_id, 1)
-        assert result.passed is False, result.model_dump()
-        assert store.get(record.manifest.skill_id, 1).manifest.status == "rejected"
+        with pytest.raises(Exception, match="validation failed"):
+            store.create_skill(candidate().model_copy(update={"tests": [
+                GeneratedFile(path="tests/nested/test_failure.py",
+                              content="def test_failure():\n    assert False\n"),
+            ]}))
+        assert store.list() == []
     finally:
         store.close()
 
@@ -125,7 +119,7 @@ async def test_r05_invalid_skill_arguments_are_rejected_without_use(
 ) -> None:
     store = registry(tmp_path)
     tools = create_worker_registry(FIXER_CAPABILITIES, tmp_path, capability_registry=store,
-                                   allowed_skill_refs={("selected", 1)})
+                                   allowed_skill_refs={"selected"})
     recorder = TrajectoryRecorder()
     gateway = ScriptedToolGateway([
         ToolModelResponse(tool_calls=[ToolCallRequest(
@@ -161,17 +155,18 @@ def test_r06_write_skill_invalidates_read_skill_snapshot(tmp_path: Path) -> None
         ("reader", "from pathlib import Path\nprint(Path('value.txt').read_text())\n", False),
         ("writer", "from pathlib import Path\nPath('value.txt').write_text('after')\n", True),
     ]:
-        record = store.create_candidate(candidate(script=script).model_copy(update={
+        record = store.create_skill(candidate(script=script).model_copy(update={
             "name": name, "tests": [],
             "permissions": SkillPermissions(execute=True, write_workspace=may_write),
         }))
-        assert CandidateValidator(store).validate_to_trial(record.manifest.skill_id, 1).passed
         records.append(record)
     tools = create_worker_registry(FIXER_CAPABILITIES, workspace, capability_registry=store,
-        allowed_skill_refs={(r.manifest.skill_id, 1) for r in records})
+        allowed_skill_refs={r.manifest.skill_id for r in records})
     def run(record):
+        if record.manifest.skill_id not in tools.activated_skill_ids:
+            tools.invoke("load_skill", skill_id=record.manifest.skill_id)
         return tools.invoke("run_skill_script", skill_id=record.manifest.skill_id,
-                            version=1, script_name="inspect_imports.py", args=[])
+                            script_name="inspect_imports.py", args=[])
     try:
         first = run(records[0])
         assert first.stdout.strip() == "before"
@@ -233,8 +228,10 @@ def test_r09_parent_pytest_quiet_config_cannot_reject_valid_skill(
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     store = registry(tmp_path)
     try:
-        record = store.create_candidate(candidate())
-        result = CandidateValidator(store).validate_to_trial(record.manifest.skill_id, 1)
+        record = store.create_skill(candidate())
+        result = CandidateValidator().validate_package(
+            Path(record.package_path), record.manifest
+        )
         assert result.passed, result.model_dump()
         assert result.tests_run == 1
     finally:
@@ -274,14 +271,14 @@ def test_r11_benchmark_metrics_include_deferred_learning(
     import json
 
     import evoci.cli as cli
-    from evoci.capability.miner import LearningDecision
+    from evoci.capability.miner import SkillLearningDecision
     from tests.integration.test_benchmark_variants import OfflineBenchmarkGateway, make_workspace
-    from tests.integration.test_graph import FakeExperienceMiner
+    from tests.integration.test_graph import FakeSkillMiner
 
     class MiningGateway(OfflineBenchmarkGateway):
         async def complete(self, **kwargs):
-            if kwargs["response_model"] is LearningDecision:
-                decision = await FakeExperienceMiner().decide({})
+            if kwargs["response_model"] is SkillLearningDecision:
+                decision = await FakeSkillMiner().decide({})
                 return decision.model_copy(update={"candidate_skill":
                     decision.candidate_skill.model_copy(update={"tests": []})})
             return await super().complete(**kwargs)
@@ -302,7 +299,7 @@ def test_r11_benchmark_metrics_include_deferred_learning(
     async def live_with_forced_mining(*args, **kwargs):
         resources = await original_live(*args, **kwargs)
         # Ensure this small fixture exercises learning; production wiring and CLI remain real.
-        resources.runtime.experience_miner.tool_call_threshold = 0
+        resources.runtime.skill_miner.tool_call_threshold = 0
         close = resources.close
         async def capture_then_close():
             captured.extend(resources.registry.list())
@@ -310,7 +307,7 @@ def test_r11_benchmark_metrics_include_deferred_learning(
         return SimpleNamespace(runtime=resources.runtime, recorder=resources.recorder,
             checkpoint=resources.checkpoint, event_store=resources.event_store,
             run_store=resources.run_store, memory_store=resources.memory_store,
-            registry=resources.registry, gateway=resources.gateway, close=capture_then_close)
+            registry=resources.registry, gateway=resources.worker_gateway, close=capture_then_close)
 
     monkeypatch.setattr(cli, "_live_resources", live_with_forced_mining)
     output = tmp_path / "benchmark-output"

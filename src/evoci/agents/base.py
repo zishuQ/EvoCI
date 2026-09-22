@@ -2,92 +2,89 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from evoci.domain.models import (
     CIFailure,
-    Diagnosis,
-    EvidenceItem,
-    FixerOutput,
-    InvestigationPlan,
-    InvestigationTask,
+    FailedCandidateRef,
+    FileEdit,
     MemoryHit,
     RepoSpec,
-    ReviewResult,
-    SkillHit,
+    SkillCatalogEntry,
+    SupervisorDecision,
+    VerificationCommandSpec,
     VerificationResult,
-    WorkerResult,
+    WorkerExecutionResult,
+    WorkerTask,
+    parse_verification_plan,
 )
 from evoci.tools.policy import WorkerCapabilities
 
 
 @dataclass(frozen=True, slots=True)
-class AgentContext:
+class SupervisorContext:
     run_id: str
     repo: RepoSpec
     failure: CIFailure
     workspace_path: str
     invocation_id: str
     memories: tuple[MemoryHit, ...] = ()
-    skills: tuple[SkillHit, ...] = ()
-    previous_review_blockers: tuple[str, ...] = ()
+    skills: tuple[SkillCatalogEntry, ...] = ()
+    previous_decisions: tuple[str, ...] = ()
+    worker_result_summaries: tuple[dict[str, object], ...] = ()
+    last_verification: VerificationResult | None = None
+    verification_snapshot_id: str | None = None
+    remaining_batches: int = 0
+    remaining_model_calls: int = 0
+    remaining_tool_calls: int = 0
+    failed_candidates: tuple[FailedCandidateRef, ...] = ()
+    usage_complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerContext:
+    run_id: str
+    repo: RepoSpec
+    failure: CIFailure
+    workspace_path: str
+    invocation_id: str
+    task: WorkerTask
+    memories: tuple[MemoryHit, ...] = ()
+    recommended_skills: tuple[SkillCatalogEntry, ...] = ()
+    baseline_snapshot_id: str = ""
     previous_attempt_summary: str | None = None
+    resume_artifact_ref: str | None = None
 
 
-class Coordinator(Protocol):
-    async def plan(
+@dataclass(frozen=True, slots=True)
+class WorkerRun:
+    result: WorkerExecutionResult
+    edits: list[FileEdit] = field(default_factory=list)
+    commands_run: list[str] = field(default_factory=list)
+    verification_plan: list[VerificationCommandSpec] = field(default_factory=list)
+    risk: str = "low"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "verification_plan", parse_verification_plan(self.verification_plan)
+        )
+
+
+class Supervisor(Protocol):
+    async def decide(self, *, context: SupervisorContext) -> SupervisorDecision: ...
+
+
+class Worker(Protocol):
+    async def execute(
         self,
         *,
-        context: AgentContext,
-        evidence: list[EvidenceItem],
-        round_number: int,
-        remaining_task_budget: int,
-    ) -> InvestigationPlan: ...
-
-
-class Investigator(Protocol):
-    async def run(
-        self,
-        *,
-        task: InvestigationTask,
-        context: AgentContext,
+        context: WorkerContext,
         capabilities: WorkerCapabilities,
-    ) -> WorkerResult: ...
-
-
-class Diagnoser(Protocol):
-    async def diagnose(
-        self, *, context: AgentContext, evidence: list[EvidenceItem]
-    ) -> Diagnosis: ...
-
-
-class Fixer(Protocol):
-    async def propose(
-        self,
-        *,
-        context: AgentContext,
-        diagnosis: Diagnosis,
-        evidence: list[EvidenceItem],
-        previous_verification: VerificationResult | None,
-    ) -> FixerOutput: ...
-
-
-class Reviewer(Protocol):
-    async def review(
-        self,
-        *,
-        context: AgentContext,
-        diagnosis: Diagnosis,
-        patch: FixerOutput,
-        verification: VerificationResult,
-    ) -> ReviewResult: ...
+    ) -> WorkerRun: ...
 
 
 @dataclass(frozen=True, slots=True)
 class AgentSuite:
-    coordinator: Coordinator
-    investigator: Investigator
-    diagnoser: Diagnoser
-    fixer: Fixer
-    reviewer: Reviewer
+    supervisor: Supervisor
+    worker: Worker

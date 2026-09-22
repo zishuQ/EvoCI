@@ -1,1 +1,1 @@
-"""Cross-run episodic and semantic memory."""
+"""Cross-run episodic and repository long-term memory."""

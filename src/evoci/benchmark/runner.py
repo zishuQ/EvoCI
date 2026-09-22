@@ -20,6 +20,15 @@ from evoci.benchmark.models import (
 RunTask = Callable[[BenchmarkManifestEntry, BenchmarkVariant], Awaitable[RunMetrics]]
 
 
+def _median(values: list[int]) -> float | None:
+    if not values:
+        return None
+    middle = len(values) // 2
+    if len(values) % 2:
+        return float(values[middle])
+    return (values[middle - 1] + values[middle]) / 2
+
+
 class BenchmarkRunner:
     def __init__(self, run_task: RunTask) -> None:
         self.run_task = run_task
@@ -161,15 +170,18 @@ class BenchmarkRunner:
             values = sorted(
                 int(getattr(result.metrics, field)) for result in completed if result.metrics
             )
-            if not values:
-                return None
-            middle = len(values) // 2
-            return (
-                float(values[middle])
-                if len(values) % 2
-                else (values[middle - 1] + values[middle]) / 2
-            )
+            return _median(values)
 
+        resolved_token_values = sorted(
+            int(result.metrics.total_tokens)
+            for result in completed
+            if (
+                result.metrics is not None
+                and result.metrics.benchmark_verification_status == "passed"
+            )
+        )
+        total_tokens = total("total_tokens")
+        learning_tokens = total("learning_tokens")
         aggregate.update(
             {
                 "selected_tasks": len(results),
@@ -181,8 +193,17 @@ class BenchmarkRunner:
                 "median_tool_calls": median("tool_calls"),
                 "total_attempts": total("repair_attempts"),
                 "median_attempts": median("repair_attempts"),
+                "provider_requests": total("provider_requests"),
                 "input_tokens": total("input_tokens"),
                 "output_tokens": total("output_tokens"),
+                "total_tokens": total_tokens,
+                "repair_tokens": total("repair_tokens"),
+                "learning_tokens": learning_tokens,
+                "learning_overhead_ratio": (
+                    learning_tokens / total_tokens if total_tokens else None
+                ),
+                "median_tokens_per_task": median("total_tokens"),
+                "median_tokens_per_resolved_task": _median(resolved_token_values),
                 "wall_time": sum(
                     result.metrics.wall_time for result in completed if result.metrics
                 ),
@@ -205,9 +226,7 @@ class BenchmarkRunner:
                     default=0,
                 ),
                 "tokens_per_resolved_task": (
-                    (total("input_tokens") + total("output_tokens")) / resolved
-                    if resolved
-                    else None
+                    total_tokens / resolved if resolved else None
                 ),
                 "tool_calls_per_resolved_task": total("tool_calls") / resolved
                 if resolved

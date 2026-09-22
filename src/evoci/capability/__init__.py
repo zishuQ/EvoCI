@@ -1,1 +1,1 @@
-"""Validated, versioned self-evolving capabilities."""
+"""Validated current-package self-evolving capabilities."""

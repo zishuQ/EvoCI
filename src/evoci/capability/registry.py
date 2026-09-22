@@ -1,15 +1,19 @@
-"""Immutable on-disk packages with mutable SQLite lifecycle metadata."""
+"""Single-package skill storage with mutable SQLite metadata."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 from evoci.capability.models import (
@@ -18,26 +22,29 @@ from evoci.capability.models import (
     SkillCandidate,
     SkillFile,
     SkillManifest,
+    SkillMemoryEntry,
     SkillStats,
-    SkillStatus,
-    SkillVersionRef,
 )
+from evoci.capability.skill_memory import (
+    format_skill_memory_block,
+    memory_marker,
+    parse_skill_memory_entries,
+)
+from evoci.learning_state import LegacyLearningStateError
 from evoci.tools.policy import PolicyViolation, WorkspaceBoundary
+
+_MEMORY_LOCKS: dict[str, Lock] = {}
+_MEMORY_LOCKS_GUARD = Lock()
+
+
+def _memory_thread_lock(path: Path) -> Lock:
+    key = str(path.resolve())
+    with _MEMORY_LOCKS_GUARD:
+        return _MEMORY_LOCKS.setdefault(key, Lock())
 
 
 class CapabilityRegistryError(RuntimeError):
     pass
-
-
-ALLOWED_TRANSITIONS: dict[SkillStatus, set[SkillStatus]] = {
-    "candidate": {"trial", "rejected"},
-    "trial": {"active", "rejected", "stale"},
-    "active": {"stale", "superseded"},
-    "stale": {"active", "archived", "superseded"},
-    "archived": set(),
-    "rejected": set(),
-    "superseded": set(),
-}
 
 
 def _slug(value: str) -> str:
@@ -56,31 +63,64 @@ def _safe_relative(path: str, expected_prefix: str | None = None) -> Path:
     return candidate
 
 
+def _writable_rmtree(path: Path) -> None:
+    if not path.exists():
+        return
+    for item in path.rglob("*"):
+        if item.is_file() or item.is_symlink():
+            with contextlib.suppress(OSError):
+                item.chmod(item.stat().st_mode | 0o200)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _make_package_readonly(package: Path) -> None:
+    for item in package.rglob("*"):
+        if item.is_file():
+            item.chmod(item.stat().st_mode & ~0o222)
+
+
+def _fts_content(candidate: SkillCandidate) -> str:
+    return " ".join(
+        [
+            candidate.name,
+            candidate.description,
+            *candidate.triggers,
+            *candidate.task_families,
+        ]
+    )
+
+
 class CapabilityRegistry:
-    def __init__(self, root: Path, database_path: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        database_path: Path,
+        *,
+        validation_timeout: float = 10.0,
+    ) -> None:
         self.root = root.resolve()
+        self._validation_timeout = validation_timeout
         self.root.mkdir(parents=True, exist_ok=True)
         self._boundary = WorkspaceBoundary(self.root)
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
+        self._assert_fresh_schema()
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS skills (
-                skill_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                status TEXT NOT NULL,
+                skill_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
                 manifest_json TEXT NOT NULL,
-                package_path TEXT NOT NULL,
-                PRIMARY KEY(skill_id, version)
+                package_path TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS skill_fts USING fts5(
-                skill_key UNINDEXED, content
+                skill_id UNINDEXED,
+                content
             );
             CREATE TABLE IF NOT EXISTS skill_stats (
-                skill_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
+                skill_id TEXT PRIMARY KEY,
                 retrieval_count INTEGER NOT NULL DEFAULT 0,
                 selected_count INTEGER NOT NULL DEFAULT 0,
                 use_count INTEGER NOT NULL DEFAULT 0,
@@ -88,12 +128,8 @@ class CapabilityRegistry:
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 patch_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                last_used_at TEXT,
-                last_modified_at TEXT,
-                avg_tool_calls_when_used REAL,
-                avg_attempts_when_used REAL,
-                utility_score REAL,
-                PRIMARY KEY(skill_id, version)
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT
             );
             CREATE TABLE IF NOT EXISTS applied_operations (
                 operation_key TEXT PRIMARY KEY,
@@ -104,61 +140,124 @@ class CapabilityRegistry:
         )
         self._connection.commit()
 
-    def create_candidate(
+    def _assert_fresh_schema(self) -> None:
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "skills" not in tables:
+            return
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(skills)").fetchall()
+        }
+        if "version" in columns or "status" in columns:
+            raise LegacyLearningStateError()
+
+    def create_skill(
         self,
         candidate: SkillCandidate,
         *,
         skill_id: str | None = None,
-        parent_version: int | None = None,
-        supersedes: list[SkillVersionRef] | None = None,
         operation_key: str | None = None,
     ) -> RegisteredSkill:
         if operation_key:
             prior = self.operation_result(operation_key)
             if prior is not None:
                 prior_skill_id = prior.get("skill_id")
-                prior_version = prior.get("version")
-                if not isinstance(prior_skill_id, str) or not isinstance(prior_version, int):
+                if not isinstance(prior_skill_id, str):
                     raise CapabilityRegistryError(
                         f"operation {operation_key} has an invalid stored result"
                     )
-                existing = self.get(prior_skill_id, prior_version)
+                existing = self.get(prior_skill_id)
                 if existing is None:
                     raise CapabilityRegistryError(
                         f"operation {operation_key} references a missing skill"
                     )
                 return existing
         resolved_id = _slug(skill_id or candidate.name)
-        latest = self.get(resolved_id)
-        if latest is not None and parent_version is None:
-            raise CapabilityRegistryError(
-                f"new skill slug already exists: {resolved_id}; use update_skill with lineage"
+        if self.get(resolved_id) is not None:
+            raise CapabilityRegistryError(f"skill already exists: {resolved_id}")
+        staging, manifest = self._write_staging(candidate, resolved_id)
+        try:
+            from evoci.capability.validator import CandidateValidator
+
+            validation = CandidateValidator(timeout=self._validation_timeout).validate_package(
+                staging, manifest
             )
-        if parent_version is not None and self.get(resolved_id, parent_version) is None:
-            raise CapabilityRegistryError(
-                f"update parent does not exist: {resolved_id} v{parent_version}"
-            )
-        row = self._connection.execute(
-            "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM skills WHERE skill_id = ?",
-            (resolved_id,),
-        ).fetchone()
-        version = int(row["next"])
-        package = self._boundary.resolve(f"{resolved_id}/v{version}")
-        if package.exists():
-            manifest_path = package / "manifest.json"
-            if operation_key and manifest_path.is_file():
-                recovered = SkillManifest.model_validate_json(
-                    manifest_path.read_text(encoding="utf-8")
+            if not validation.passed:
+                raise CapabilityRegistryError(
+                    "skill validation failed: " + "; ".join(validation.errors)
                 )
-                if recovered.operation_key == operation_key:
-                    self._insert_candidate_rows(
-                        recovered, package, candidate, operation_key=operation_key
+            return self._install_new(
+                resolved_id, staging, manifest, candidate, operation_key=operation_key
+            )
+        except Exception:
+            _writable_rmtree(staging)
+            raise
+
+    def update_skill(
+        self,
+        skill_id: str,
+        candidate: SkillCandidate,
+        *,
+        operation_key: str | None = None,
+    ) -> RegisteredSkill:
+        if operation_key:
+            prior = self.operation_result(operation_key)
+            if prior is not None:
+                prior_skill_id = prior.get("skill_id")
+                if not isinstance(prior_skill_id, str):
+                    raise CapabilityRegistryError(
+                        f"operation {operation_key} has an invalid stored result"
                     )
-                    record = self.get(recovered.skill_id, recovered.version)
-                    assert record is not None
-                    return record
-            raise CapabilityRegistryError(f"immutable package already exists: {package}")
-        temporary = self._boundary.resolve(f".staging-{resolved_id}-{uuid4().hex}")
+                existing = self.get(prior_skill_id)
+                if existing is None:
+                    raise CapabilityRegistryError(
+                        f"operation {operation_key} references a missing skill"
+                    )
+                return existing
+        current = self.get(skill_id)
+        if current is None:
+            raise CapabilityRegistryError(f"unknown skill: {skill_id}")
+        staging, manifest = self._write_staging(
+            candidate,
+            skill_id,
+            created_at=current.manifest.created_at,
+            source_run_ids=list(
+                dict.fromkeys([*current.manifest.source_run_ids, *candidate.source_run_ids])
+            ),
+            enabled=current.manifest.enabled,
+        )
+        try:
+            from evoci.capability.validator import CandidateValidator
+
+            validation = CandidateValidator(timeout=self._validation_timeout).validate_package(
+                staging, manifest
+            )
+            if not validation.passed:
+                raise CapabilityRegistryError(
+                    "skill validation failed: " + "; ".join(validation.errors)
+                )
+            return self._install_update(
+                skill_id, staging, manifest, candidate, operation_key=operation_key
+            )
+        except Exception:
+            _writable_rmtree(staging)
+            raise
+
+    def _write_staging(
+        self,
+        candidate: SkillCandidate,
+        skill_id: str,
+        *,
+        created_at: datetime | None = None,
+        source_run_ids: list[str] | None = None,
+        enabled: bool = True,
+    ) -> tuple[Path, SkillManifest]:
+        temporary = self._boundary.resolve(f".staging-{skill_id}-{uuid4().hex}")
         temporary.mkdir(parents=True)
         files_to_write: list[GeneratedFile] = [
             GeneratedFile(path="SKILL.md", content=candidate.skill_md),
@@ -185,43 +284,98 @@ class CapabilityRegistry:
                         executable=generated.executable,
                     )
                 )
+            now = datetime.now(UTC)
             manifest = SkillManifest(
-                skill_id=resolved_id,
-                version=version,
+                skill_id=skill_id,
                 name=candidate.name,
                 description=candidate.description,
-                status="candidate",
                 triggers=candidate.triggers,
                 task_families=candidate.task_families,
                 permissions=candidate.permissions,
-                source_run_ids=candidate.source_run_ids,
-                parent_version=parent_version,
-                supersedes=supersedes or [],
+                source_run_ids=source_run_ids or list(candidate.source_run_ids),
+                enabled=enabled,
                 files=skill_files,
-                verification_commands=candidate.verification_commands,
-                operation_key=operation_key,
+                created_at=created_at or now,
+                updated_at=now,
             )
             manifest_path = temporary / "manifest.json"
             manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
-            os.chmod(manifest_path, 0o444)
-            for item in temporary.rglob("*"):
-                if item.is_file():
-                    item.chmod(item.stat().st_mode & ~0o222)
-            package.parent.mkdir(parents=True, exist_ok=True)
-            temporary.rename(package)
+            return temporary, manifest
         except Exception:
-            if temporary.exists():
-                for item in temporary.rglob("*"):
-                    if item.is_file():
-                        item.chmod(item.stat().st_mode | 0o200)
-                import shutil
-
-                shutil.rmtree(temporary)
+            _writable_rmtree(temporary)
             raise
-        self._insert_candidate_rows(manifest, package, candidate, operation_key=operation_key)
+
+    def _install_new(
+        self,
+        skill_id: str,
+        staging: Path,
+        manifest: SkillManifest,
+        candidate: SkillCandidate,
+        *,
+        operation_key: str | None,
+    ) -> RegisteredSkill:
+        skill_root = self._boundary.resolve(skill_id)
+        package = skill_root / "package"
+        if package.exists():
+            raise CapabilityRegistryError(f"skill package already exists: {package}")
+        skill_root_existed = skill_root.exists()
+        skill_root.mkdir(parents=True, exist_ok=True)
+        memory_path = skill_root / "memory.md"
+        memory_existed = memory_path.exists()
+        if not memory_existed:
+            memory_path.write_text("", encoding="utf-8")
+        _make_package_readonly(staging)
+        try:
+            staging.rename(package)
+            self._upsert_rows(manifest, package, candidate, operation_key=operation_key)
+        except Exception:
+            _writable_rmtree(package)
+            if not memory_existed:
+                memory_path.unlink(missing_ok=True)
+            if not skill_root_existed:
+                _writable_rmtree(skill_root)
+            _writable_rmtree(staging)
+            raise
         return RegisteredSkill(manifest=manifest, package_path=str(package))
 
-    def _insert_candidate_rows(
+    def _install_update(
+        self,
+        skill_id: str,
+        staging: Path,
+        manifest: SkillManifest,
+        candidate: SkillCandidate,
+        *,
+        operation_key: str | None,
+    ) -> RegisteredSkill:
+        skill_root = self._boundary.resolve(skill_id)
+        current = skill_root / "package"
+        previous = skill_root / "previous"
+        old_previous = skill_root / f".old-previous-{uuid4().hex}"
+        if not current.is_dir():
+            _writable_rmtree(staging)
+            raise CapabilityRegistryError(f"current package missing for {skill_id}")
+        _make_package_readonly(staging)
+        moved_current = False
+        try:
+            if previous.exists():
+                previous.rename(old_previous)
+            current.rename(previous)
+            moved_current = True
+            staging.rename(current)
+            self._upsert_rows(manifest, current, candidate, operation_key=operation_key)
+        except Exception:
+            if moved_current and current.exists():
+                _writable_rmtree(current)
+            if not current.exists() and previous.exists():
+                previous.rename(current)
+            if old_previous.exists() and not previous.exists():
+                old_previous.rename(previous)
+            _writable_rmtree(staging)
+            raise
+        _writable_rmtree(old_previous)
+        return RegisteredSkill(manifest=manifest, package_path=str(current))
+
+    def _upsert_rows(
         self,
         manifest: SkillManifest,
         package: Path,
@@ -230,47 +384,41 @@ class CapabilityRegistry:
         operation_key: str | None,
     ) -> None:
         manifest_json = manifest.model_dump_json()
-        resolved_id = manifest.skill_id
-        version = manifest.version
-        key = f"{resolved_id}:{version}"
         now = datetime.now(UTC).isoformat()
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
-                "INSERT OR IGNORE INTO skills VALUES (?, ?, 'candidate', ?, ?)",
-                (resolved_id, version, manifest_json, str(package)),
+                """
+                INSERT INTO skills(skill_id, enabled, manifest_json, package_path)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(skill_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    manifest_json=excluded.manifest_json,
+                    package_path=excluded.package_path
+                """,
+                (manifest.skill_id, int(manifest.enabled), manifest_json, str(package)),
             )
-            fts_exists = self._connection.execute(
-                "SELECT 1 FROM skill_fts WHERE skill_key = ?", (key,)
-            ).fetchone()
-            if fts_exists is None:
-                self._connection.execute(
-                    "INSERT INTO skill_fts(skill_key, content) VALUES (?, ?)",
-                    (
-                        key,
-                        " ".join(
-                            [
-                                candidate.name,
-                                candidate.description,
-                                *candidate.triggers,
-                                *candidate.task_families,
-                            ]
-                        ),
-                    ),
-                )
+            self._connection.execute(
+                "DELETE FROM skill_fts WHERE skill_id = ?", (manifest.skill_id,)
+            )
+            self._connection.execute(
+                "INSERT INTO skill_fts(skill_id, content) VALUES (?, ?)",
+                (manifest.skill_id, _fts_content(candidate)),
+            )
             self._connection.execute(
                 """
-                INSERT OR IGNORE INTO skill_stats(skill_id, version, created_at)
+                INSERT INTO skill_stats(skill_id, created_at, updated_at)
                 VALUES (?, ?, ?)
+                ON CONFLICT(skill_id) DO UPDATE SET updated_at=excluded.updated_at
                 """,
-                (resolved_id, version, now),
+                (manifest.skill_id, now, now),
             )
             if operation_key:
                 self._connection.execute(
                     "INSERT OR IGNORE INTO applied_operations VALUES (?, ?, ?)",
                     (
                         operation_key,
-                        json.dumps({"skill_id": resolved_id, "version": version}),
+                        json.dumps({"skill_id": manifest.skill_id}),
                         now,
                     ),
                 )
@@ -287,60 +435,57 @@ class CapabilityRegistry:
             result.append(generated)
         return result
 
-    def get(self, skill_id: str, version: int | None = None) -> RegisteredSkill | None:
-        if version is None:
-            row = self._connection.execute(
-                "SELECT * FROM skills WHERE skill_id = ? ORDER BY version DESC LIMIT 1",
-                (skill_id,),
-            ).fetchone()
-        else:
-            row = self._connection.execute(
-                "SELECT * FROM skills WHERE skill_id = ? AND version = ?",
-                (skill_id, version),
-            ).fetchone()
+    def get(self, skill_id: str) -> RegisteredSkill | None:
+        row = self._connection.execute(
+            "SELECT * FROM skills WHERE skill_id = ?",
+            (skill_id,),
+        ).fetchone()
         if row is None:
             return None
         manifest = SkillManifest.model_validate_json(str(row["manifest_json"]))
-        manifest = manifest.model_copy(update={"status": str(row["status"])})
+        manifest = manifest.model_copy(update={"enabled": bool(row["enabled"])})
         return RegisteredSkill(manifest=manifest, package_path=str(row["package_path"]))
 
-    def list(self, statuses: set[SkillStatus] | None = None) -> list[RegisteredSkill]:
-        rows = self._connection.execute(
-            "SELECT skill_id, version FROM skills ORDER BY skill_id, version"
-        ).fetchall()
-        records = [
-            record
-            for row in rows
-            if (record := self.get(str(row["skill_id"]), int(row["version"]))) is not None
-        ]
-        return [
-            record for record in records if statuses is None or record.manifest.status in statuses
-        ]
+    def list(self, *, enabled_only: bool = True) -> list[RegisteredSkill]:
+        query = "SELECT skill_id FROM skills"
+        params: tuple[object, ...] = ()
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY skill_id"
+        rows = self._connection.execute(query, params).fetchall()
+        records = [self.get(str(row["skill_id"])) for row in rows]
+        return [record for record in records if record is not None]
 
-    def transition(self, skill_id: str, version: int, target: SkillStatus) -> None:
-        record = self.get(skill_id, version)
+    def enable(self, skill_id: str) -> None:
+        self._set_enabled(skill_id, True)
+
+    def disable(self, skill_id: str) -> None:
+        self._set_enabled(skill_id, False)
+
+    def _set_enabled(self, skill_id: str, enabled: bool) -> None:
+        record = self.get(skill_id)
         if record is None:
-            raise KeyError(f"unknown skill: {skill_id} v{version}")
-        current = record.manifest.status
-        if target not in ALLOWED_TRANSITIONS[current]:
-            raise CapabilityRegistryError(f"invalid lifecycle transition: {current} -> {target}")
+            raise KeyError(f"unknown skill: {skill_id}")
+        manifest = record.manifest.model_copy(update={"enabled": enabled})
         self._connection.execute(
-            "UPDATE skills SET status = ? WHERE skill_id = ? AND version = ?",
-            (target, skill_id, version),
-        )
-        self._connection.execute(
-            "UPDATE skill_stats SET last_modified_at = ? WHERE skill_id = ? AND version = ?",
-            (datetime.now(UTC).isoformat(), skill_id, version),
+            "UPDATE skills SET enabled = ?, manifest_json = ? WHERE skill_id = ?",
+            (int(enabled), manifest.model_dump_json(), skill_id),
         )
         self._connection.commit()
 
-    def stats(self, skill_id: str, version: int) -> SkillStats:
+    def stats(self, skill_id: str) -> SkillStats:
         row = self._connection.execute(
-            "SELECT * FROM skill_stats WHERE skill_id = ? AND version = ?", (skill_id, version)
+            "SELECT * FROM skill_stats WHERE skill_id = ?", (skill_id,)
         ).fetchone()
         if row is None:
-            raise KeyError(f"unknown skill stats: {skill_id} v{version}")
+            raise KeyError(f"unknown skill stats: {skill_id}")
         return SkillStats.model_validate(dict(row))
+
+    def skill_root(self, skill_id: str) -> Path:
+        record = self.get(skill_id)
+        if record is None:
+            raise KeyError(f"unknown skill: {skill_id}")
+        return Path(record.package_path).resolve().parent
 
     def operation_result(self, operation_key: str) -> dict[str, object] | None:
         row = self._connection.execute(
@@ -363,29 +508,30 @@ class CapabilityRegistry:
 
     def record_retrieval(
         self,
-        refs: Sequence[SkillVersionRef],
+        skill_ids: Sequence[str],
         *,
         selected: bool = False,
         operation_key: str | None = None,
     ) -> bool:
         column = "selected_count" if selected else "retrieval_count"
+        now = datetime.now(UTC).isoformat()
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             if operation_key and self.operation_result(operation_key) is not None:
                 self._connection.rollback()
                 return False
             self._connection.executemany(
-                f"UPDATE skill_stats SET {column} = {column} + 1 "
-                "WHERE skill_id = ? AND version = ?",
-                [(ref.skill_id, ref.version) for ref in refs],
+                f"UPDATE skill_stats SET {column} = {column} + 1, updated_at = ? "
+                "WHERE skill_id = ?",
+                [(now, skill_id) for skill_id in skill_ids],
             )
             if operation_key:
                 self._connection.execute(
                     "INSERT INTO applied_operations VALUES (?, ?, ?)",
                     (
                         operation_key,
-                        json.dumps({"count": len(refs), "selected": selected}),
-                        datetime.now(UTC).isoformat(),
+                        json.dumps({"count": len(skill_ids), "selected": selected}),
+                        now,
                     ),
                 )
             self._connection.commit()
@@ -393,31 +539,23 @@ class CapabilityRegistry:
         except Exception as exc:
             self._connection.rollback()
             raise RuntimeError(
-                f"Failed to record retrieval for {len(refs)} skills: {exc}"
+                f"Failed to record retrieval for {len(skill_ids)} skills: {exc}"
             ) from exc
 
     def record_use(
         self,
-        ref: SkillVersionRef,
+        skill_id: str,
         *,
         success: bool,
-        tool_calls: int,
-        attempts: int,
         patched: bool,
         operation_key: str | None = None,
     ) -> bool:
+        now = datetime.now(UTC).isoformat()
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             if operation_key and self.operation_result(operation_key) is not None:
                 self._connection.rollback()
                 return False
-
-            stats = self.stats(ref.skill_id, ref.version)
-            uses = stats.use_count + 1
-
-            def average(previous: float | None, value: int) -> float:
-                return ((previous or 0.0) * stats.use_count + value) / uses
-
             self._connection.execute(
                 """
             UPDATE skill_stats SET
@@ -426,19 +564,16 @@ class CapabilityRegistry:
                 failure_count = failure_count + ?,
                 patch_count = patch_count + ?,
                 last_used_at = ?,
-                avg_tool_calls_when_used = ?,
-                avg_attempts_when_used = ?
-            WHERE skill_id = ? AND version = ?
+                updated_at = ?
+            WHERE skill_id = ?
             """,
                 (
                     int(success),
                     int(not success),
                     int(patched),
-                    datetime.now(UTC).isoformat(),
-                    average(stats.avg_tool_calls_when_used, tool_calls),
-                    average(stats.avg_attempts_when_used, attempts),
-                    ref.skill_id,
-                    ref.version,
+                    now,
+                    now,
+                    skill_id,
                 ),
             )
             if operation_key:
@@ -447,7 +582,7 @@ class CapabilityRegistry:
                     (
                         operation_key,
                         json.dumps({"recorded": True}),
-                        datetime.now(UTC).isoformat(),
+                        now,
                     ),
                 )
             self._connection.commit()
@@ -456,12 +591,62 @@ class CapabilityRegistry:
             self._connection.rollback()
             raise
 
-    def set_utility(self, ref: SkillVersionRef, score: float) -> None:
-        self._connection.execute(
-            "UPDATE skill_stats SET utility_score = ? WHERE skill_id = ? AND version = ?",
-            (score, ref.skill_id, ref.version),
-        )
-        self._connection.commit()
+    def append_skill_memory(self, skill_id: str, entry: SkillMemoryEntry) -> bool:
+        skill_root = self.root / skill_id
+        if not (skill_root / "package").is_dir():
+            return False
+        memory_path = skill_root / "memory.md"
+        lock_path = skill_root / ".memory.lock"
+        skill_root.mkdir(parents=True, exist_ok=True)
+        with _memory_thread_lock(memory_path), lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                with memory_path.open("a+", encoding="utf-8") as handle:
+                    handle.seek(0)
+                    existing = handle.read()
+                    marker = memory_marker(entry.run_id, skill_id)
+                    if marker in existing:
+                        return False
+                    block = format_skill_memory_block(skill_id, entry)
+                    prefix = ""
+                    if existing and not existing.endswith("\n"):
+                        prefix = "\n"
+                    if existing.strip():
+                        prefix += "\n"
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(prefix + block)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                return True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def read_skill_memory(
+        self,
+        skill_id: str,
+        *,
+        limit: int = 8,
+        max_chars: int = 4_000,
+    ) -> Sequence[SkillMemoryEntry]:
+        try:
+            skill_root = self.skill_root(skill_id)
+        except KeyError:
+            return []
+        memory_path = skill_root / "memory.md"
+        if not memory_path.is_file():
+            return []
+        entries = parse_skill_memory_entries(memory_path.read_text(encoding="utf-8"))
+        recent = entries[-limit:] if limit >= 0 else entries
+        selected: list[SkillMemoryEntry] = []
+        used = 0
+        for entry in reversed(recent):
+            size = len(entry.lesson) + len(entry.task_summary) + 32
+            if selected and used + size > max_chars:
+                break
+            selected.append(entry)
+            used += size
+        selected.reverse()
+        return selected
 
     @property
     def connection(self) -> sqlite3.Connection:

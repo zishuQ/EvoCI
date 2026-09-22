@@ -15,6 +15,7 @@ from evoci.domain.models import (
     CIFailure,
     Diagnosis,
     EvidenceItem,
+    FailedCandidateRef,
     FileEdit,
     FixerOutput,
     InvestigationPlan,
@@ -26,8 +27,12 @@ from evoci.domain.models import (
     SkillHit,
     SkillRef,
     SkillUsage,
+    SupervisorDecision,
+    TaskBudget,
     VerificationCommandResult,
     VerificationResult,
+    WorkerExecutionResult,
+    WorkerTask,
 )
 from evoci.runtime.events import EventType, RunEvent
 
@@ -36,6 +41,7 @@ _SERIALIZED_TYPES = (
     Diagnosis,
     EvidenceItem,
     EventType,
+    FailedCandidateRef,
     FileEdit,
     FixerOutput,
     InvestigationPlan,
@@ -48,13 +54,18 @@ _SERIALIZED_TYPES = (
     SkillHit,
     SkillRef,
     SkillUsage,
+    SupervisorDecision,
+    TaskBudget,
     VerificationCommandResult,
     VerificationResult,
+    WorkerExecutionResult,
+    WorkerTask,
 )
 
 
 def _serializer() -> JsonPlusSerializer:
-    return JsonPlusSerializer(allowed_msgpack_modules=_SERIALIZED_TYPES)
+    allowed = [(cls.__module__, cls.__name__) for cls in _SERIALIZED_TYPES]
+    return JsonPlusSerializer(allowed_msgpack_modules=allowed)
 
 
 @dataclass(slots=True)

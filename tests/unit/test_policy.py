@@ -5,7 +5,6 @@ import pytest
 
 from evoci.capability.models import GeneratedFile, SkillCandidate, SkillPermissions
 from evoci.capability.registry import CapabilityRegistry
-from evoci.capability.validator import CandidateValidator
 from evoci.tools.filesystem import FileTools
 from evoci.tools.policy import (
     FIXER_CAPABILITIES,
@@ -165,7 +164,7 @@ Inspect the disposable output.
 # Bundled Resources
 The writer script is bundled.
 """
-    created = capability_registry.create_candidate(
+    created = capability_registry.create_skill(
         SkillCandidate(
             name="isolated-writer",
             description="Exercise workspace isolation",
@@ -185,22 +184,17 @@ The writer script is bundled.
             permissions=SkillPermissions(execute=True, write_workspace=False),
         )
     )
-    assert (
-        CandidateValidator(capability_registry)
-        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
-        .passed
-    )
     registry = create_worker_registry(
         INVESTIGATOR_CAPABILITIES,
         workspace,
         capability_registry=capability_registry,
-        allowed_skill_refs={(created.manifest.skill_id, created.manifest.version)},
+        allowed_skill_refs={created.manifest.skill_id},
     )
     try:
+        registry.invoke("load_skill", skill_id=created.manifest.skill_id)
         result = await registry.ainvoke(
             "run_skill_script",
             skill_id=created.manifest.skill_id,
-            version=created.manifest.version,
             script_name="write.py",
             args=[],
         )
@@ -218,7 +212,7 @@ async def test_read_only_worker_rejects_skill_that_requests_workspace_write(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     capability_registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "capabilities.sqlite")
-    created = capability_registry.create_candidate(
+    created = capability_registry.create_skill(
         SkillCandidate(
             name="workspace-writer",
             description="Request a workspace-writing permission",
@@ -254,23 +248,18 @@ The writer script is bundled.
             permissions=SkillPermissions(execute=True, write_workspace=True),
         )
     )
-    assert (
-        CandidateValidator(capability_registry)
-        .validate_to_trial(created.manifest.skill_id, created.manifest.version)
-        .passed
-    )
     registry = create_worker_registry(
         INVESTIGATOR_CAPABILITIES,
         workspace,
         capability_registry=capability_registry,
-        allowed_skill_refs={(created.manifest.skill_id, created.manifest.version)},
+        allowed_skill_refs={created.manifest.skill_id},
     )
     try:
+        registry.invoke("load_skill", skill_id=created.manifest.skill_id)
         with pytest.raises(PolicyViolation, match="worker role"):
             await registry.ainvoke(
                 "run_skill_script",
                 skill_id=created.manifest.skill_id,
-                version=created.manifest.version,
                 script_name="write.py",
                 args=[],
             )

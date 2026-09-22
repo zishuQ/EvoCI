@@ -14,11 +14,11 @@ REQUIRED_SKILL_SECTIONS = (
 )
 
 
-def render_skill_markdown(spec: SkillSpec, *, version: int = 1) -> str:
+def render_skill_markdown(spec: SkillSpec) -> str:
     """Render a complete, valid SKILL.md. Models never have to emit this format."""
 
     return (
-        f"---\nname: {spec.name}\ndescription: {spec.description}\nversion: {version}\n---\n\n"
+        f"---\nname: {spec.name}\ndescription: {spec.description}\n---\n\n"
         f"# Purpose\n{spec.purpose.strip()}\n\n"
         f"# When to Use\n{spec.when_to_use.strip()}\n\n"
         f"# Procedure\n{spec.procedure.strip()}\n\n"

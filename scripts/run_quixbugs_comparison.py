@@ -35,9 +35,8 @@ def main() -> None:
     summary = {
         "protocol": "online_continual_same_order_fresh_state_per_variant",
         "model": config.model_name,
-        "model_fast": config.fast_model_name,
-        "model_strong": config.strong_model_name,
-        "model_aux": config.aux_model_name,
+        "supervisor": config.supervisor_runtime().model_dump(),
+        "worker": config.worker_runtime().model_dump(),
         "max_run_model_calls": config.max_run_model_calls,
         "max_run_tool_calls": config.max_run_tool_calls,
         "task_ids": [entry["task_id"] for entry in entries],

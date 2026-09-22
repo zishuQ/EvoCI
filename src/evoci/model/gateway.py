@@ -2,12 +2,39 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
+
+RequestKind = Literal[
+    "structured",
+    "plain_json_correction",
+    "tool_action",
+    "structured_finalize",
+]
+
+
+class ModelUsage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    model_name: str | None = None
+    provider_request_id: str | None = None
+    request_kind: RequestKind
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+UsageObserver = Callable[[ModelUsage], None]
 
 
 class ModelGatewayError(RuntimeError):
@@ -68,6 +95,8 @@ class ModelGateway(Protocol):
         user_prompt: str,
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ResponseT:
         """Return a validated structured response."""
         ...
@@ -80,6 +109,8 @@ class ToolLoopGateway(ModelGateway, Protocol):
         messages: list[ToolLoopMessage],
         tools: list[ToolDefinition],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ToolModelResponse:
         """Return a provider-neutral assistant turn and any requested tool calls."""
         ...
@@ -90,6 +121,8 @@ class ToolLoopGateway(ModelGateway, Protocol):
         messages: list[ToolLoopMessage],
         response_model: type[ResponseT],
         agent_id: str,
+        usage_observer: UsageObserver | None = None,
+        max_output_tokens: int | None = None,
     ) -> ResponseT:
         """Produce the existing validated leaf-agent output schema."""
         ...

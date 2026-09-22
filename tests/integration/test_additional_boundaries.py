@@ -24,17 +24,17 @@ def _digest(content: str) -> str:
 
 
 async def _pause_before_apply(graph, state, config: dict[str, object]):
-    pending = await graph.ainvoke(state, config, interrupt_before=["apply_patch"])
+    pending = await graph.ainvoke(state, config, interrupt_before=["apply_candidate"])
     snapshot = await graph.aget_state(config)
-    while snapshot.next and snapshot.next[0] != "apply_patch":
+    while snapshot.next and snapshot.next[0] != "apply_candidate":
         if pending.get("__interrupt__") or snapshot.next[0] == "approval":
             pending = await graph.ainvoke(
-                Command(resume=True), config, interrupt_before=["apply_patch"]
+                Command(resume=True), config, interrupt_before=["apply_candidate"]
             )
         else:
-            pending = await graph.ainvoke(None, config, interrupt_before=["apply_patch"])
+            pending = await graph.ainvoke(None, config, interrupt_before=["apply_candidate"])
         snapshot = await graph.aget_state(config)
-    assert snapshot.next == ("apply_patch",)
+    assert snapshot.next == ("apply_candidate",)
     return pending
 
 
@@ -63,9 +63,9 @@ async def test_checkpoint_replay_accepts_already_applied_first_edit(tmp_path):
 
     graph = build_graph(_runtime(tmp_path, Fixer()), checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "resume-partial-patch"}}
-    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_patch"])
+    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_candidate"])
     snapshot = await graph.aget_state(config)
-    assert snapshot.next == ("apply_patch",)
+    assert snapshot.next == ("apply_candidate",)
     # Reproduce the persisted-state/filesystem boundary after a process dies:
     # one atomic file replacement completed, but the node has not checkpointed.
     apply_edit(tmp_path, FileTools(tmp_path, writable=True), edits[0])
@@ -139,7 +139,7 @@ async def test_checkpoint_replay_accepts_fully_applied_patch(tmp_path):
 
     graph = build_graph(_runtime(tmp_path, Fixer()), checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "resume-full-patch"}}
-    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_patch"])
+    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_candidate"])
     tools = FileTools(tmp_path, writable=True)
     for edit in edits:
         apply_edit(tmp_path, tools, edit)
@@ -175,7 +175,7 @@ async def test_checkpoint_replay_preserves_third_party_conflict(tmp_path):
 
     graph = build_graph(_runtime(tmp_path, Fixer()), checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "resume-third-party"}}
-    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_patch"])
+    await graph.ainvoke(_failure(tmp_path, [PASSING]), config, interrupt_before=["apply_candidate"])
     apply_edit(tmp_path, FileTools(tmp_path, writable=True), edits[0])
     (tmp_path / "b.py").write_text(third)
     result = await graph.ainvoke(None, config)

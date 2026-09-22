@@ -59,20 +59,10 @@ class MemoryRetriever:
             )
         )
         retrieved += self.store.search_episodes(query, repo=repo.full_name, limit=4)
-        retrieved += self.store.search_semantic(
+        retrieved += self.store.search_long_term(
             query,
-            namespaces=[f"repo:{repo.full_name}"],
-            limit=3,
-        )
-        retrieved += self.store.search_semantic(
-            query,
-            namespaces=[f"family:{failure.task_family}"],
-            limit=1,
-        )
-        retrieved += self.store.search_semantic(
-            query,
-            namespaces=["global:ci"],
-            limit=1,
+            repository=repo.full_name,
+            limit=4,
         )
 
         deduplicated: list[MemoryHit] = []

@@ -11,7 +11,6 @@ from evoci.capability.materializer import CapabilityMaterializer
 from evoci.capability.models import GeneratedFile, SkillCandidate, SkillPermissions, SkillSpec
 from evoci.capability.registry import CapabilityRegistry
 from evoci.capability.retrieval import CapabilityRetriever
-from evoci.capability.validator import CandidateValidator
 from evoci.domain.models import CIFailure
 from evoci.graph.builder import build_graph, persist_run_outcome
 from evoci.memory.store import SQLiteMemoryStore
@@ -23,7 +22,7 @@ from tests.integration.test_correctness import VALUE_ORACLE, RealValueFixer, _fa
 from tests.integration.test_graph import (
     FakeCoordinator,
     FakeDiagnoser,
-    FakeExperienceMiner,
+    FakeSkillMiner,
     SkillUsingInvestigator,
     initial_state,
     make_runtime,
@@ -31,10 +30,17 @@ from tests.integration.test_graph import (
 )
 
 
-class E2EMiner(FakeExperienceMiner):
-    async def decide(self, trajectory_summary: object, *, existing_skills: object = None) -> object:
-        del existing_skills
-        decision = await super().decide(trajectory_summary)
+class E2EMiner(FakeSkillMiner):
+    async def decide(
+        self,
+        trajectory_summary: object,
+        *,
+        existing_skills: object = None,
+        used_skill_ids: object = None,
+        **kwargs: object,
+    ) -> object:
+        del existing_skills, used_skill_ids
+        decision = await super().decide(trajectory_summary, **kwargs)
         assert decision.candidate_skill is not None
         skill = decision.candidate_skill.model_copy(
             update={
@@ -67,8 +73,7 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     runtime_a = replace(
         _runtime(tmp_path, RealValueFixer()),
         capability_registry=registry,
-        experience_miner=E2EMiner(),
-        candidate_validator=CandidateValidator(registry),
+        skill_miner=E2EMiner(),
         memory_store=memory,
         recorder=TrajectoryRecorder(),
     )
@@ -78,9 +83,9 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     )
     assert result_a["status"] == "success"
     assert result_a["candidate_skill_id"] == "assertion-repair"
-    learned = registry.get("assertion-repair", 1)
+    learned = registry.get("assertion-repair")
     assert learned is not None
-    assert learned.manifest.status == "trial"
+    assert learned.manifest.enabled
     episode = memory.get_episode("run-1")
     assert episode is not None
     assert episode.success is True
@@ -88,7 +93,7 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     workspace_b = tmp_path / "task-b"
     workspace_b.mkdir()
     (workspace_b / "app.py").write_text("VALUE = 0\n")
-    hits = CapabilityRetriever(registry).retrieve(
+    catalog = CapabilityRetriever(registry).retrieve(
         initial_state(workspace_b)["repo"],  # type: ignore[arg-type]
         CIFailure(
             summary="test failed AssertionError",
@@ -96,27 +101,39 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
             failed_commands=[VALUE_ORACLE],
         ),
     )
-    assert hits
+    assert catalog.entries
+    skill_id = catalog.entries[0].skill_id
+    from evoci.domain.models import SkillHit
+
     CapabilityMaterializer(registry, tmp_path / "runtime", allow_relocate=True).materialize(
-        hits, run_id="t2", workspace=workspace_b
+        [
+            SkillHit(
+                skill_id=skill_id,
+                name=catalog.entries[0].name,
+                description=catalog.entries[0].description,
+                skill_md="",
+                score=1.0,
+            )
+        ],
+        run_id="t2",
+        workspace=workspace_b,
     )
     tools = create_worker_registry(
         FIXER_CAPABILITIES,
         workspace_b,
         capability_registry=registry,
-        allowed_skill_refs={(hits[0].skill_id, hits[0].version)},
+        allowed_skill_refs={skill_id},
     )
+    tools.invoke("load_skill", skill_id=skill_id)
     resource = tools.invoke(
         "read_skill_resource",
-        skill_id=hits[0].skill_id,
-        version=hits[0].version,
+        skill_id=skill_id,
         path="references/notes.md",
     )
     assert "VALUE" in resource["content"]
     first = tools.invoke(
         "run_skill_script",
-        skill_id=hits[0].skill_id,
-        version=hits[0].version,
+        skill_id=skill_id,
         script_name="inspect_assertion.py",
         args=[],
     )
@@ -124,8 +141,7 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     tools.invoke("apply_patch", files={"app.py": "VALUE = 1\n"})
     second = tools.invoke(
         "run_skill_script",
-        skill_id=hits[0].skill_id,
-        version=hits[0].version,
+        skill_id=skill_id,
         script_name="inspect_assertion.py",
         args=[],
     )
@@ -154,9 +170,7 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     def EvoCIConfig_from(workspace: Path) -> object:
         from evoci.config import EvoCIConfig
 
-        return EvoCIConfig.from_env(cwd=tmp_path).model_copy(
-            update={"trial_min_uses": 2, "trial_min_successes": 2}
-        )
+        return EvoCIConfig.from_env(cwd=tmp_path)
 
     runtime_b = reuse_runtime(workspace_b, "t2")
     state_b = _failure(workspace_b, [VALUE_ORACLE])
@@ -171,13 +185,13 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
     state_c["workspace_path"] = str(workspace_b)
     result_c = await build_graph(runtime_c).ainvoke(state_c)
     assert result_c["status"] == "success"
-    promoted = registry.get("assertion-repair", 1)
+    promoted = registry.get("assertion-repair")
     assert promoted is not None
-    assert promoted.manifest.status == "active"
+    assert promoted.manifest.enabled
 
-    uses_before = registry.stats("assertion-repair", 1).use_count
+    uses_before = registry.stats("assertion-repair").use_count
     await persist_run_outcome(runtime_c, result_c, success=True, failure_reason=None)
-    assert registry.stats("assertion-repair", 1).use_count == uses_before
+    assert registry.stats("assertion-repair").use_count == uses_before
     registry.close()
     memory.close()
 
@@ -185,7 +199,7 @@ async def test_offline_skill_pipeline_generate_use_promote(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_offline_negative_skill_failure_does_not_promote(tmp_path: Path) -> None:
     registry = CapabilityRegistry(tmp_path / "skills", tmp_path / "caps.sqlite")
-    created = registry.create_candidate(
+    created = registry.create_skill(
         SkillCandidate(
             name="flaky-inspector",
             description="fails on purpose",
@@ -210,19 +224,16 @@ async def test_offline_negative_skill_failure_does_not_promote(tmp_path: Path) -
             permissions=SkillPermissions(execute=True),
         )
     )
-    assert CandidateValidator(registry).validate_to_trial(
-        created.manifest.skill_id, created.manifest.version
-    ).passed
     tools = create_worker_registry(
         FIXER_CAPABILITIES,
         tmp_path,
         capability_registry=registry,
-        allowed_skill_refs={(created.manifest.skill_id, created.manifest.version)},
+        allowed_skill_refs={created.manifest.skill_id},
     )
+    tools.invoke("load_skill", skill_id=created.manifest.skill_id)
     executed = tools.invoke(
         "run_skill_script",
         skill_id=created.manifest.skill_id,
-        version=created.manifest.version,
         script_name="inspect_assertion.py",
         args=[],
     )
@@ -234,7 +245,7 @@ async def test_offline_negative_skill_failure_does_not_promote(tmp_path: Path) -
         event_key="select",
         payload={
             "skills": [
-                {"skill_id": created.manifest.skill_id, "version": created.manifest.version}
+                {"skill_id": created.manifest.skill_id}
             ]
         },
     )
@@ -245,7 +256,6 @@ async def test_offline_negative_skill_failure_does_not_promote(tmp_path: Path) -
         event_key="skill-fail",
         payload={
             "skill_id": created.manifest.skill_id,
-            "version": created.manifest.version,
             "resource": "inspect_assertion.py",
             "success": False,
         },
@@ -260,11 +270,11 @@ async def test_offline_negative_skill_failure_does_not_promote(tmp_path: Path) -
     state["run_id"] = "neg-run"
     result = await build_graph(runtime).ainvoke(state)
     assert result["status"] == "success"
-    stats = registry.stats(created.manifest.skill_id, created.manifest.version)
+    stats = registry.stats(created.manifest.skill_id)
     assert stats.failure_count >= 1
     assert stats.success_count == 0
-    current = registry.get(created.manifest.skill_id, created.manifest.version)
+    current = registry.get(created.manifest.skill_id)
     assert current is not None
-    assert current.manifest.status == "trial"
+    assert current.manifest.enabled
     tools.close()
     registry.close()

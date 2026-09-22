@@ -13,7 +13,7 @@ from langgraph.errors import NodeCancelledError
 
 from evoci.agents.tool_loop import BoundedToolAgent
 from evoci.capability.execution import run_skill_script
-from evoci.capability.validator import CandidateValidator
+from evoci.capability.models import GeneratedFile
 from evoci.cli import _drive_single
 from evoci.domain.models import VerificationResult, WorkerResult
 from evoci.graph.builder import build_graph
@@ -30,7 +30,7 @@ from tests.integration.test_correctness import (
     _failure,
     _runtime,
 )
-from tests.integration.test_graph import FakeExperienceMiner
+from tests.integration.test_graph import FakeSkillMiner
 from tests.integration.test_tool_loop import ScriptedToolGateway, worker_result
 from tests.unit.test_capability import candidate, registry
 
@@ -89,10 +89,12 @@ async def test_n03_validation_obeys_scheduled_cancellation(tmp_path):
     (tmp_path / "app.py").write_text("VALUE = 0\n")
     timers = []
 
-    class SlowValidationMiner(FakeExperienceMiner):
-        async def decide(self, trajectory_summary, *, existing_skills=None):
-            del existing_skills
-            decision = await super().decide(trajectory_summary)
+    class SlowValidationMiner(FakeSkillMiner):
+        async def decide(
+            self, trajectory_summary, *, existing_skills=None, used_skill_ids=None, **kwargs
+        ):
+            del existing_skills, used_skill_ids
+            decision = await super().decide(trajectory_summary, **kwargs)
             timers.append(
                 asyncio.get_running_loop().call_later(0.05, asyncio.current_task().cancel)
             )
@@ -100,9 +102,15 @@ async def test_n03_validation_obeys_scheduled_cancellation(tmp_path):
                 update={
                     "candidate_skill": decision.candidate_skill.model_copy(
                         update={
-                            "tests": [],
-                            "verification_commands": [
-                                ["python", "-c", "import time; time.sleep(0.5)"]
+                            "tests": [
+                                GeneratedFile(
+                                    path="tests/test_slow.py",
+                                    content=(
+                                        "import time\n"
+                                        "def test_slow() -> None:\n"
+                                        "    time.sleep(0.5)\n"
+                                    ),
+                                )
                             ],
                         }
                     )
@@ -112,8 +120,7 @@ async def test_n03_validation_obeys_scheduled_cancellation(tmp_path):
     runtime = replace(
         _runtime(tmp_path, RealValueFixer()),
         capability_registry=store,
-        experience_miner=SlowValidationMiner(),
-        candidate_validator=CandidateValidator(store),
+        skill_miner=SlowValidationMiner(),
     )
     try:
         with pytest.raises((asyncio.CancelledError, NodeCancelledError)):
@@ -130,8 +137,7 @@ def test_n04_output_limit_also_bounds_buffer_memory(tmp_path, runner, stream):
     # 8 MiB output is safe to reproduce, yet far beyond the requested 1 KiB buffer.
     script = f"import sys\nfor _ in range(128):\n    sys.{stream}.write('x' * 65536)\n"
     store = registry(tmp_path)
-    record = store.create_candidate(candidate(script=script).model_copy(update={"tests": []}))
-    assert CandidateValidator(store).validate_to_trial(record.manifest.skill_id, 1).passed
+    record = store.create_skill(candidate(script=script).model_copy(update={"tests": []}))
     tracemalloc.start()
     try:
         if runner == "validation_runner":
@@ -146,7 +152,6 @@ def test_n04_output_limit_also_bounds_buffer_memory(tmp_path, runner, stream):
             result = run_skill_script(
                 store,
                 skill_id=record.manifest.skill_id,
-                version=1,
                 script_name="inspect_imports.py",
                 args=[],
                 workspace=tmp_path,
@@ -164,13 +169,12 @@ def test_n04_output_limit_also_bounds_buffer_memory(tmp_path, runner, stream):
 @pytest.mark.asyncio
 async def test_n05_coerced_version_execution_is_attributed(tmp_path):
     store = registry(tmp_path)
-    record = store.create_candidate(candidate().model_copy(update={"tests": []}))
-    assert CandidateValidator(store).validate_to_trial(record.manifest.skill_id, 1).passed
+    record = store.create_skill(candidate().model_copy(update={"tests": []}))
     tools = create_worker_registry(
         FIXER_CAPABILITIES,
         tmp_path,
         capability_registry=store,
-        allowed_skill_refs={(record.manifest.skill_id, 1)},
+        allowed_skill_refs={record.manifest.skill_id},
     )
     recorder = TrajectoryRecorder()
     gateway = ScriptedToolGateway(
@@ -178,11 +182,19 @@ async def test_n05_coerced_version_execution_is_attributed(tmp_path):
             ToolModelResponse(
                 tool_calls=[
                     ToolCallRequest(
+                        call_id="load",
+                        name="load_skill",
+                        arguments={"skill_id": record.manifest.skill_id},
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
                         call_id="coerced",
                         name="run_skill_script",
                         arguments={
                             "skill_id": record.manifest.skill_id,
-                            "version": "1",
                             "script_name": "inspect_imports.py",
                             "args": [],
                         },
@@ -194,7 +206,7 @@ async def test_n05_coerced_version_execution_is_attributed(tmp_path):
         worker_result(),
     )
     try:
-        await BoundedToolAgent(gateway, recorder, max_iterations=3, max_tool_calls=3).run(
+        await BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4).run(
             run_id="coerced",
             agent_id="fixer",
             invocation_id="repair:1",
@@ -204,7 +216,12 @@ async def test_n05_coerced_version_execution_is_attributed(tmp_path):
             output_schema=WorkerResult,
         )
         events = recorder.events("coerced")
-        executions = [e for e in events if e.type == EventType.TOOL_RESULT]
+        executions = [
+            event
+            for event in events
+            if event.type == EventType.TOOL_RESULT
+            and event.payload.get("tool_name") == "run_skill_script"
+        ]
         assert executions[0].payload["success"] is True
         assert "imports-ok" in executions[0].payload["result"]["stdout"]
         used = [e for e in events if e.type == EventType.SKILL_USED]

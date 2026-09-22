@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from threading import RLock
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,11 +57,11 @@ class SkillUseTrace(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     skill_id: str
-    version: int
     agent_id: str
     invocation_id: str | None = None
     resource: str | None = None
     execution_success: bool | None = None
+    usage_kind: Literal["procedure", "script"] | None = None
 
 
 class TrajectoryView(BaseModel):
@@ -184,8 +184,9 @@ class TrajectoryRecorder:
         created_files: set[str] = set()
         modified_files: set[str] = set()
         memory_ids: dict[EventType, set[str]] = defaultdict(set)
-        skill_refs: dict[EventType, set[tuple[str, int]]] = defaultdict(set)
+        skill_refs: dict[EventType, set[str]] = defaultdict(set)
         skill_use_traces: list[SkillUseTrace] = []
+        seen_skill_traces: set[tuple[object, ...]] = set()
         for event in events:
             agent = event.agent_id or "harness"
             if event.type == EventType.MODEL_CALL:
@@ -237,6 +238,9 @@ class TrajectoryRecorder:
                 diagnoses.append(dict(event.payload.get("diagnosis", {})))
             elif event.type == EventType.PATCH_CREATED:
                 patches.append(dict(event.payload.get("fixer_output", {})))
+                modified_files.update(
+                    str(path) for path in event.payload.get("changed_files", [])
+                )
             elif event.type in {
                 EventType.MEMORY_RETRIEVED,
                 EventType.MEMORY_SELECTED,
@@ -250,37 +254,37 @@ class TrajectoryRecorder:
                 EventType.SKILL_SELECTED,
                 EventType.SKILL_USED,
             }:
-                raw_refs = event.payload.get("skills", [])
-                for raw in raw_refs:
-                    if isinstance(raw, dict):
+                skill_ids: list[str] = []
+                if event.payload.get("skill_id"):
+                    skill_ids.append(str(event.payload["skill_id"]))
+                for raw in event.payload.get("skills") or []:
+                    if isinstance(raw, dict) and raw.get("skill_id"):
                         skill_id = str(raw["skill_id"])
-                        version = int(raw["version"])
-                        skill_refs[event.type].add((skill_id, version))
-                        if event.type == EventType.SKILL_USED:
-                            skill_use_traces.append(
-                                SkillUseTrace(
-                                    skill_id=skill_id,
-                                    version=version,
-                                    agent_id=agent,
-                                    invocation_id=event.invocation_id,
-                                    resource=event.payload.get("resource"),
-                                    execution_success=event.payload.get("success"),
-                                )
-                            )
-                if event.type == EventType.SKILL_USED and "skill_id" in event.payload:
-                    skill_id = str(event.payload["skill_id"])
-                    version = int(event.payload["version"])
-                    skill_refs[event.type].add((skill_id, version))
-                    skill_use_traces.append(
-                        SkillUseTrace(
-                            skill_id=skill_id,
-                            version=version,
-                            agent_id=agent,
-                            invocation_id=event.invocation_id,
-                            resource=event.payload.get("resource"),
-                            execution_success=event.payload.get("success"),
-                        )
+                        if skill_id not in skill_ids:
+                            skill_ids.append(skill_id)
+                for skill_id in skill_ids:
+                    skill_refs[event.type].add(skill_id)
+                    if event.type != EventType.SKILL_USED:
+                        continue
+                    raw_kind = event.payload.get("usage_kind")
+                    usage_kind = (
+                        cast("Literal['procedure', 'script']", raw_kind)
+                        if raw_kind in {"procedure", "script"}
+                        else None
                     )
+                    trace = SkillUseTrace(
+                        skill_id=skill_id,
+                        agent_id=agent,
+                        invocation_id=event.invocation_id,
+                        resource=event.payload.get("resource"),
+                        execution_success=event.payload.get("success"),
+                        usage_kind=usage_kind,
+                    )
+                    key = (event.event_id, skill_id)
+                    if key in seen_skill_traces:
+                        continue
+                    seen_skill_traces.add(key)
+                    skill_use_traces.append(trace)
         agents = [
             AgentTrace(
                 agent_id=agent_id,
@@ -292,10 +296,7 @@ class TrajectoryRecorder:
         ]
 
         def refs(event_type: EventType) -> list[SkillRef]:
-            return [
-                SkillRef(skill_id=skill_id, version=version)
-                for skill_id, version in sorted(skill_refs[event_type])
-            ]
+            return [SkillRef(skill_id=skill_id) for skill_id in sorted(skill_refs[event_type])]
 
         return TrajectoryView(
             run_id=run_id,

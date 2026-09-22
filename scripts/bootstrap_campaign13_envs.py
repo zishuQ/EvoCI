@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
-
 
 ROOT = Path("campaign13").resolve()
 DATASET = ROOT / "prepared" / "dataset.jsonl"

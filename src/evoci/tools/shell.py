@@ -47,7 +47,7 @@ def _kill_process_group(process: Any) -> None:
 
 
 _process_cancel: ContextVar[threading.Event | None] = ContextVar("process_cancel", default=None)
-ContainerExecutor = Callable[[list[str], str, bool], Awaitable[CommandResult]]
+ContainerExecutor = Callable[[list[str], str, bool, Path], Awaitable[CommandResult]]
 _container_executor: ContextVar[ContainerExecutor | None] = ContextVar(
     "container_executor", default=None
 )
@@ -170,7 +170,8 @@ class CommandRunner:
     ) -> CommandResult:
         executor = _container_executor.get()
         if executor is not None:
-            return await executor(argv, cwd, network)
+            validate_command(argv, network=network)
+            return await executor(argv, cwd, network, self.boundary.root)
         return await run_cancellable(
             self.run_sync,
             argv,

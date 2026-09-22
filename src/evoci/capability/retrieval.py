@@ -1,15 +1,12 @@
-"""Precision-first retrieval restricted to trial and active capabilities."""
+"""Precision-first ranking of enabled capabilities into a compact catalog."""
 
 from __future__ import annotations
 
+import json
 import re
-import sqlite3
-from pathlib import Path
 
-from evoci.capability.models import RegisteredSkill, SkillVersionRef
 from evoci.capability.registry import CapabilityRegistry
-from evoci.domain.models import CIFailure, RepoSpec, SkillHit
-
+from evoci.domain.models import CIFailure, RepoSpec, SkillCatalog, SkillCatalogEntry
 
 _STOPWORDS = {
     "bug",
@@ -25,6 +22,7 @@ _STOPWORDS = {
     "test",
     "tests",
 }
+_MAX_DESCRIPTION_CHARS = 400
 
 
 def _tokens(text: str) -> set[str]:
@@ -40,52 +38,62 @@ def _query(text: str) -> str:
     return " OR ".join(f'"{token}"' for token in tokens)
 
 
-def _matches_source_task(record: RegisteredSkill, task_id: str | None) -> bool:
-    return bool(task_id) and any(
-        source_run_id.endswith(task_id) for source_run_id in record.manifest.source_run_ids
-    )
+def _truncate(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit == 1:
+        return "…"
+    return text[: limit - 1].rstrip() + "…"
 
 
-def _relevance(
-    record: RegisteredSkill,
+def _entry_chars(entry: SkillCatalogEntry) -> int:
+    return len(entry.skill_id) + len(entry.name) + len(entry.description)
+
+
+def _rank_score(
     *,
+    name: str,
+    description: str,
+    triggers: list[str],
+    task_families: list[str],
     repo: RepoSpec,
     failure: CIFailure,
-    task_id: str | None,
-    status: str,
-) -> float | None:
-    """Apply deterministic precision gates after broad FTS candidate generation."""
-
-    if _matches_source_task(record, task_id):
-        return 100.0 + (1.0 if status == "active" else 0.0)
-
-    manifest = record.manifest
+) -> float:
+    del repo
     query_tokens = _tokens(
         f"{failure.task_family} {failure.summary} {failure.log_excerpt[:1200]}"
     )
-    skill_tokens = _tokens(
-        " ".join(
-            [
-                manifest.name,
-                manifest.description,
-                *manifest.triggers,
-                *manifest.task_families,
-            ]
-        )
-    )
+    skill_tokens = _tokens(" ".join([name, description, *triggers, *task_families]))
     overlap = len(query_tokens & skill_tokens)
     family_overlap = len(_tokens(failure.task_family) & skill_tokens)
-    if overlap < 2 and family_overlap == 0:
-        return None
+    return float(overlap) + 4.0 * family_overlap
 
-    repo_tokens = _tokens(repo.full_name)
-    source_tokens = _tokens(" ".join(manifest.source_run_ids))
-    return (
-        float(overlap)
-        + 4.0 * family_overlap
-        + (1.0 if repo_tokens & source_tokens else 0.0)
-        + (1.0 if status == "active" else 0.0)
-    )
+
+def _fit_catalog(
+    entries: list[SkillCatalogEntry], limit: int
+) -> tuple[list[SkillCatalogEntry], int, int]:
+    fitted = [
+        entry.model_copy(
+            update={"description": _truncate(entry.description, _MAX_DESCRIPTION_CHARS)}
+        )
+        if len(entry.description) > _MAX_DESCRIPTION_CHARS
+        else entry
+        for entry in entries
+    ]
+    omitted = 0
+    while fitted and sum(_entry_chars(entry) for entry in fitted) > limit:
+        if len(fitted) == 1:
+            only = fitted[0]
+            room = limit - len(only.skill_id) - len(only.name)
+            fitted = [
+                only.model_copy(update={"description": _truncate(only.description, max(room, 0))})
+            ]
+            break
+        fitted.pop()
+        omitted += 1
+    return fitted, omitted, sum(_entry_chars(entry) for entry in fitted)
 
 
 class CapabilityRetriever:
@@ -94,112 +102,73 @@ class CapabilityRetriever:
         registry: CapabilityRegistry,
         *,
         top_k: int = 2,
-        trial_slots: int = 1,
+        catalog_limit_chars: int = 8_000,
     ) -> None:
-        if top_k < 1 or trial_slots < 0 or trial_slots > top_k:
+        if top_k < 1:
             raise ValueError("invalid capability retrieval quotas")
+        if catalog_limit_chars < 1:
+            raise ValueError("skill catalog character budget must be positive")
         self.registry = registry
         self.top_k = top_k
-        self.trial_slots = trial_slots
+        self.catalog_limit_chars = catalog_limit_chars
 
     def retrieve(
         self,
         repo: RepoSpec,
         failure: CIFailure,
         *,
-        task_id: str | None = None,
         operation_key: str | None = None,
-    ) -> list[SkillHit]:
-        expression = _query(
+    ) -> SkillCatalog:
+        query_text = (
             f"{repo.full_name} {failure.task_family} {failure.summary} {failure.log_excerpt[:2000]}"
         )
-        if not expression:
-            return []
+        expression = _query(query_text)
+        fts_rank: dict[str, float] = {}
+        if expression:
+            rows = self.registry.connection.execute(
+                """
+                SELECT s.skill_id, bm25(skill_fts) AS rank
+                FROM skill_fts
+                JOIN skills s ON skill_fts.skill_id = s.skill_id
+                WHERE skill_fts MATCH ? AND s.enabled = 1
+                """,
+                (expression,),
+            ).fetchall()
+            for row in rows:
+                fts_rank[str(row["skill_id"])] = abs(float(row["rank"]))
 
-        candidate_limit = max(20, self.top_k * 8)
-
-        def ranked(status: str) -> list[sqlite3.Row]:
-            return list(
-                self.registry.connection.execute(
-                    """
-            SELECT s.skill_id, s.version, s.package_path, s.manifest_json,
-                   s.status, bm25(skill_fts) AS rank
-            FROM skill_fts
-            JOIN skills s ON skill_fts.skill_key = s.skill_id || ':' || s.version
-            WHERE skill_fts MATCH ? AND s.status = ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-                    (expression, status, candidate_limit),
-                ).fetchall()
-            )
-
-        candidate_rows = [*ranked("active"), *ranked("trial")]
-        if task_id:
-            candidate_rows.extend(
-                self.registry.connection.execute(
-                    """
-                    SELECT skill_id, version, package_path, manifest_json, status, 0.0 AS rank
-                    FROM skills
-                    WHERE status IN ('active', 'trial') AND manifest_json LIKE ?
-                    """,
-                    (f"%{task_id}%",),
-                ).fetchall()
-            )
-
-        ranked_rows: list[tuple[float, sqlite3.Row, RegisteredSkill]] = []
-        seen_refs: set[tuple[str, int]] = set()
-        for row in candidate_rows:
-            ref = (str(row["skill_id"]), int(row["version"]))
-            if ref in seen_refs:
-                continue
-            seen_refs.add(ref)
-            record = self.registry.get(*ref)
-            if record is None:
-                continue
-            score = _relevance(
-                record,
+        ranked: list[tuple[float, str, SkillCatalogEntry]] = []
+        for row in self.registry.connection.execute(
+            """
+            SELECT skill_id, manifest_json FROM skills WHERE enabled = 1 ORDER BY skill_id
+            """
+        ).fetchall():
+            skill_id = str(row["skill_id"])
+            manifest = json.loads(str(row["manifest_json"]))
+            name = str(manifest.get("name") or skill_id)
+            description = str(manifest.get("description") or "")
+            triggers = [str(item) for item in manifest.get("triggers") or []]
+            families = [str(item) for item in manifest.get("task_families") or []]
+            overlap = _rank_score(
+                name=name,
+                description=description,
+                triggers=triggers,
+                task_families=families,
                 repo=repo,
                 failure=failure,
-                task_id=task_id,
-                status=str(row["status"]),
             )
-            if score is not None:
-                ranked_rows.append((score, row, record))
-        ranked_rows.sort(key=lambda item: item[0], reverse=True)
-
-        selected: list[tuple[float, sqlite3.Row, RegisteredSkill]] = []
-        trial_count = 0
-        for item in ranked_rows:
-            if str(item[1]["status"]) == "trial":
-                if trial_count >= self.trial_slots:
-                    continue
-                trial_count += 1
-            selected.append(item)
-            if len(selected) >= self.top_k:
-                break
-
-        rows = [row for _, row, _ in selected]
-        refs = [
-            SkillVersionRef(skill_id=str(row["skill_id"]), version=int(row["version"]))
-            for row in rows
-        ]
-        self.registry.record_retrieval(refs, operation_key=operation_key)
-
-        hits: list[SkillHit] = []
-        for score, _, record in selected:
-            package = Path(record.package_path)
-            hits.append(
-                SkillHit(
-                    skill_id=record.manifest.skill_id,
-                    version=record.manifest.version,
-                    name=record.manifest.name,
-                    description=record.manifest.description,
-                    skill_md=(package / "SKILL.md").read_text(encoding="utf-8"),
-                    score=score,
-                    resources=[
-                        file.path for file in record.manifest.files if file.path != "SKILL.md"
-                    ],
+            fts_boost = 1.0 / (1.0 + fts_rank[skill_id]) if skill_id in fts_rank else 0.0
+            ranked.append(
+                (
+                    overlap + fts_boost,
+                    skill_id,
+                    SkillCatalogEntry(skill_id=skill_id, name=name, description=description),
                 )
             )
-        return hits
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        entries = [entry for _, _, entry in ranked]
+        fitted, omitted, context_chars = _fit_catalog(entries, self.catalog_limit_chars)
+        self.registry.record_retrieval(
+            [entry.skill_id for entry in fitted], operation_key=operation_key
+        )
+        return SkillCatalog(entries=fitted, omitted_count=omitted, context_chars=context_chars)

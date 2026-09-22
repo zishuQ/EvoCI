@@ -21,8 +21,11 @@ class WorkerCapabilities:
     network: bool = False
 
 
+SUPERVISOR_CAPABILITIES = WorkerCapabilities(True, True, True, False, False)
 INVESTIGATOR_CAPABILITIES = WorkerCapabilities(True, True, True, True, False)
-FIXER_CAPABILITIES = WorkerCapabilities(True, True, True, True, True)
+WORKER_INVESTIGATE_CAPABILITIES = INVESTIGATOR_CAPABILITIES
+WORKER_REPAIR_CAPABILITIES = WorkerCapabilities(True, True, True, True, True)
+FIXER_CAPABILITIES = WORKER_REPAIR_CAPABILITIES
 REVIEWER_CAPABILITIES = WorkerCapabilities(True, True, True, True, False)
 
 

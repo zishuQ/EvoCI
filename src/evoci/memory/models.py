@@ -38,39 +38,31 @@ class Episode(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class SemanticMemory(BaseModel):
+class LongTermMemory(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str = Field(default_factory=lambda: str(uuid4()))
-    namespace: str
+    repository: str
     content: str
-    importance: float = Field(ge=0, le=1)
     confidence: float = Field(ge=0, le=1)
     source_run_ids: list[str]
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_accessed_at: datetime | None = None
 
-    @model_validator(mode="after")
-    def known_namespace(self) -> SemanticMemory:
-        if not self.namespace.startswith(("repo:", "family:", "global:")):
-            raise ValueError("memory namespace must be repo, family, or global")
-        return self
 
-
-class MemoryCandidate(BaseModel):
+class LongTermFactCandidate(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    type: Literal["semantic", "none"]
+    type: Literal["fact", "none"]
     content: str | None = None
-    namespace: str | None = None
     confidence: float = Field(ge=0, le=1)
     evidence_event_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def semantic_fields_are_complete(self) -> MemoryCandidate:
-        if self.type == "semantic" and (not self.content or not self.namespace):
-            raise ValueError("semantic candidate requires content and namespace")
+    def fact_fields_are_complete(self) -> LongTermFactCandidate:
+        if self.type == "fact" and not self.content:
+            raise ValueError("fact candidate requires content")
         return self
 
 

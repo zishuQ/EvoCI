@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from evoci.domain.models import MemoryHit
-from evoci.memory.models import Episode, SemanticMemory
+from evoci.learning_state import LegacyLearningStateError
+from evoci.memory.models import Episode, LongTermMemory
 
 
 class MemoryStore(Protocol):
@@ -19,14 +19,20 @@ class MemoryStore(Protocol):
 
     def get_episode(self, run_id: str) -> Episode | None: ...
 
-    def add_semantic(self, memory: SemanticMemory, *, operation_key: str | None = None) -> bool: ...
+    def add_long_term(
+        self, memory: LongTermMemory, *, operation_key: str | None = None
+    ) -> bool: ...
+
+    def list_long_term(
+        self, *, repository: str, limit: int = 8
+    ) -> list[LongTermMemory]: ...
 
     def operation_result(self, operation_key: str) -> dict[str, object] | None: ...
 
     def record_operation(self, operation_key: str, result: dict[str, object]) -> bool: ...
 
-    def search_semantic(
-        self, query: str, *, namespaces: Sequence[str], limit: int
+    def search_long_term(
+        self, query: str, *, repository: str, limit: int
     ) -> list[MemoryHit]: ...
 
     def search_episodes(
@@ -151,6 +157,7 @@ class SQLiteMemoryStore:
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
+        self._assert_fresh_schema()
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS episodes (
@@ -180,11 +187,10 @@ class SQLiteMemoryStore:
             CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
                 episode_id UNINDEXED, content
             );
-            CREATE TABLE IF NOT EXISTS semantic_memories (
+            CREATE TABLE IF NOT EXISTS long_term_memories (
                 id TEXT PRIMARY KEY,
-                namespace TEXT NOT NULL,
+                repository TEXT NOT NULL,
                 content TEXT NOT NULL,
-                importance REAL NOT NULL,
                 confidence REAL NOT NULL,
                 source_run_ids TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -192,9 +198,9 @@ class SQLiteMemoryStore:
                 last_accessed_at TEXT,
                 archived INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_namespace
-                ON semantic_memories(namespace, archived);
-            CREATE VIRTUAL TABLE IF NOT EXISTS semantic_fts USING fts5(
+            CREATE INDEX IF NOT EXISTS idx_long_term_repository
+                ON long_term_memories(repository, archived);
+            CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memory_fts USING fts5(
                 memory_id UNINDEXED, content
             );
             CREATE TABLE IF NOT EXISTS applied_operations (
@@ -229,6 +235,16 @@ class SQLiteMemoryStore:
             """
         )
         self._connection.commit()
+
+    def _assert_fresh_schema(self) -> None:
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "semantic_memories" in tables or "semantic_fts" in tables:
+            raise LegacyLearningStateError()
 
     def add_episode(self, episode: Episode) -> None:
         self._connection.execute(
@@ -300,86 +316,124 @@ class SQLiteMemoryStore:
         self._connection.commit()
         return cursor.rowcount == 1
 
-    def add_semantic(self, memory: SemanticMemory, *, operation_key: str | None = None) -> bool:
+    def _long_term_from_row(self, row: sqlite3.Row) -> LongTermMemory:
+        payload = dict(zip(row.keys(), tuple(row), strict=True))
+        raw_ids = payload.get("source_run_ids")
+        payload["source_run_ids"] = (
+            json.loads(str(raw_ids or "[]")) if not isinstance(raw_ids, list) else raw_ids
+        )
+        payload.pop("archived", None)
+        return LongTermMemory.model_validate(payload)
+
+    def list_long_term(self, *, repository: str, limit: int = 8) -> list[LongTermMemory]:
+        if not repository or limit <= 0:
+            return []
+        rows = self._connection.execute(
+            """
+            SELECT * FROM long_term_memories
+            WHERE repository = ? AND archived = 0
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (repository, limit),
+        ).fetchall()
+        return [self._long_term_from_row(row) for row in rows]
+
+    def add_long_term(
+        self, memory: LongTermMemory, *, operation_key: str | None = None
+    ) -> bool:
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             if operation_key and self.operation_result(operation_key) is not None:
                 self._connection.rollback()
                 return False
-            self._connection.execute(
-                """
-            INSERT INTO semantic_memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(id) DO UPDATE SET
-                content=excluded.content,
-                importance=excluded.importance,
-                confidence=excluded.confidence,
-                source_run_ids=excluded.source_run_ids,
-                updated_at=excluded.updated_at,
-                archived=0
-            """,
-                (
-                    memory.id,
-                    memory.namespace,
-                    memory.content,
-                    memory.importance,
-                    memory.confidence,
-                    json.dumps(memory.source_run_ids),
-                    memory.created_at.isoformat(),
-                    memory.updated_at.isoformat(),
-                    memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
-                ),
-            )
-            self._connection.execute("DELETE FROM semantic_fts WHERE memory_id = ?", (memory.id,))
-            self._connection.execute(
-                "INSERT INTO semantic_fts(memory_id, content) VALUES (?, ?)",
-                (memory.id, memory.content),
-            )
+            existing = self._connection.execute(
+                "SELECT * FROM long_term_memories WHERE id = ?", (memory.id,)
+            ).fetchone()
+            created = existing is None
+            now = datetime.now(UTC).isoformat()
+            if existing is not None:
+                current = self._long_term_from_row(existing)
+                merged_runs = list(
+                    dict.fromkeys([*current.source_run_ids, *memory.source_run_ids])
+                )
+                confidence = max(current.confidence, memory.confidence)
+                self._connection.execute(
+                    """
+                    UPDATE long_term_memories SET
+                        source_run_ids = ?,
+                        confidence = ?,
+                        updated_at = ?,
+                        archived = 0
+                    WHERE id = ?
+                    """,
+                    (json.dumps(merged_runs), confidence, now, memory.id),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO long_term_memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        memory.id,
+                        memory.repository,
+                        memory.content,
+                        memory.confidence,
+                        json.dumps(memory.source_run_ids),
+                        memory.created_at.isoformat(),
+                        memory.updated_at.isoformat(),
+                        memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
+                    ),
+                )
+                self._connection.execute(
+                    "INSERT INTO long_term_memory_fts(memory_id, content) VALUES (?, ?)",
+                    (memory.id, memory.content),
+                )
             if operation_key:
                 self._connection.execute(
                     "INSERT INTO applied_operations VALUES (?, ?, ?)",
                     (
                         operation_key,
-                        json.dumps({"memory_id": memory.id}),
-                        datetime.now(UTC).isoformat(),
+                        json.dumps({"memory_id": memory.id, "created": created}),
+                        now,
                     ),
                 )
             self._connection.commit()
-            return True
+            return created
         except Exception as exc:
             self._connection.rollback()
-            raise RuntimeError(f"Failed to add semantic memory {memory.id}: {exc}") from exc
+            raise RuntimeError(f"Failed to add long-term memory {memory.id}: {exc}") from exc
 
-    def search_semantic(
-        self, query: str, *, namespaces: Sequence[str], limit: int
+    def search_long_term(
+        self, query: str, *, repository: str, limit: int
     ) -> list[MemoryHit]:
         expression = _fts_query(query)
-        if not expression or not namespaces or limit <= 0:
+        if not expression or not repository or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in namespaces)
         rows = self._connection.execute(
-            f"""
-            SELECT m.id, m.namespace, m.content, bm25(semantic_fts) AS rank
-            FROM semantic_fts
-            JOIN semantic_memories m ON m.id = semantic_fts.memory_id
-            WHERE semantic_fts MATCH ?
-              AND m.namespace IN ({placeholders})
+            """
+            SELECT m.id, m.repository, m.content, bm25(long_term_memory_fts) AS rank
+            FROM long_term_memory_fts
+            JOIN long_term_memories m ON m.id = long_term_memory_fts.memory_id
+            WHERE long_term_memory_fts MATCH ?
+              AND m.repository = ?
               AND m.archived = 0
-            ORDER BY rank, m.importance DESC, m.confidence DESC
+            ORDER BY rank, m.confidence DESC
             LIMIT ?
             """,
-            (expression, *namespaces, limit),
+            (expression, repository, limit),
         ).fetchall()
         now = datetime.now(UTC).isoformat()
         ids = [str(row["id"]) for row in rows]
         self._connection.executemany(
-            "UPDATE semantic_memories SET last_accessed_at = ? WHERE id = ?",
+            "UPDATE long_term_memories SET last_accessed_at = ? WHERE id = ?",
             [(now, memory_id) for memory_id in ids],
         )
         self._connection.commit()
         return [
             MemoryHit(
                 memory_id=str(row["id"]),
-                namespace=str(row["namespace"]),
+                namespace=f"repo:{row['repository']}",
                 content=str(row["content"]),
                 score=1.0 / (1.0 + abs(float(row["rank"]))),
             )
@@ -451,7 +505,7 @@ class SQLiteMemoryStore:
 
     def archive(self, memory_id: str) -> None:
         self._connection.execute(
-            "UPDATE semantic_memories SET archived = 1 WHERE id = ?", (memory_id,)
+            "UPDATE long_term_memories SET archived = 1 WHERE id = ?", (memory_id,)
         )
         self._connection.commit()
 

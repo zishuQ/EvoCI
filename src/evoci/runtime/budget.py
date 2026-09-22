@@ -1,4 +1,4 @@
-"""Atomic run-level repair budgets shared by all current-task workers."""
+"""Atomic run-level repair budgets shared by sequential supervisor and worker calls."""
 
 from __future__ import annotations
 
@@ -11,6 +11,25 @@ from evoci.runtime.trajectory import TrajectoryRecorder
 
 class RepairBudgetExhausted(RuntimeError):
     pass
+
+
+FINALIZATION_MODEL_CALLS = 1
+
+
+def action_call_capacity(
+    *,
+    max_actions: int,
+    remaining_model_calls: int,
+    task_model_calls: int | None = None,
+) -> int:
+    """How many next_action turns fit after reserving one structured finalize call."""
+
+    if remaining_model_calls < 1 + FINALIZATION_MODEL_CALLS:
+        return 0
+    capacity = min(max_actions, remaining_model_calls - FINALIZATION_MODEL_CALLS)
+    if task_model_calls is not None:
+        capacity = min(capacity, max(0, task_model_calls - FINALIZATION_MODEL_CALLS))
+    return max(0, capacity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,24 +48,31 @@ class RunRepairBudget:
         max_tool_calls: int,
         model_calls: int = 0,
         tool_calls: int = 0,
+        exhausted_message: str = "run-level model-call budget exhausted",
     ) -> None:
         self.max_model_calls = max_model_calls
         self.max_tool_calls = max_tool_calls
         self._model_calls = model_calls
         self._tool_calls = tool_calls
+        self._model_message = exhausted_message
+        self._tool_message = exhausted_message.replace("model-call", "tool-call")
         self._lock = Lock()
 
     def consume_model_call(self) -> None:
         with self._lock:
             if self._model_calls >= self.max_model_calls:
-                raise RepairBudgetExhausted("run-level model-call budget exhausted")
+                raise RepairBudgetExhausted(self._model_message)
             self._model_calls += 1
 
     def consume_tool_call(self) -> None:
         with self._lock:
             if self._tool_calls >= self.max_tool_calls:
-                raise RepairBudgetExhausted("run-level tool-call budget exhausted")
+                raise RepairBudgetExhausted(self._tool_message)
             self._tool_calls += 1
+
+    def remaining_model_calls(self) -> int:
+        with self._lock:
+            return max(0, self.max_model_calls - self._model_calls)
 
     def remaining_tool_calls(self) -> int:
         with self._lock:
@@ -57,7 +83,7 @@ class RunRepairBudget:
             return
         with self._lock:
             if self._tool_calls + count > self.max_tool_calls:
-                raise RepairBudgetExhausted("run-level tool-call budget exhausted")
+                raise RepairBudgetExhausted(self._tool_message)
 
     def snapshot(self) -> BudgetSnapshot:
         with self._lock:
@@ -67,6 +93,21 @@ class RunRepairBudget:
                 max_model_calls=self.max_model_calls,
                 max_tool_calls=self.max_tool_calls,
             )
+
+
+class CombinedBudget:
+    """Consume run-level and task-level call budgets together."""
+
+    def __init__(self, *budgets: RunRepairBudget) -> None:
+        self._budgets = budgets
+
+    def consume_model_call(self) -> None:
+        for budget in self._budgets:
+            budget.consume_model_call()
+
+    def consume_tool_call(self) -> None:
+        for budget in self._budgets:
+            budget.consume_tool_call()
 
 
 class RunBudgetManager:

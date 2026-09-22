@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,8 +17,9 @@ from evoci.benchmark.models import (
     PreparedTask,
     RunMetrics,
 )
-from evoci.runtime.events import EventType
+from evoci.runtime.events import EventType, RunEvent
 from evoci.runtime.trajectory import TrajectoryRecorder
+from evoci.tools.isolation import copy_workspace_with_independent_git
 from evoci.tools.shell import CommandRunner
 from evoci.verification.service import VerificationService
 from evoci.workspace.manager import WorkspaceManager
@@ -183,7 +183,7 @@ def prepare_workspace(
                     update={"workspace_path": str(destination)}
                 )
             raise FileExistsError(f"benchmark workspace path is not a directory: {destination}")
-        shutil.copytree(source, destination)
+        copy_workspace_with_independent_git(source, destination)
         return destination, prepared.model_copy(update={"workspace_path": str(destination)})
     else:
         source_location = f"https://github.com/{view.repo_owner}/{view.repo_name}.git"
@@ -291,6 +291,53 @@ def collect_final_workspace_changes(workspace: Path) -> FinalWorkspaceChanges:
     )
 
 
+def token_metrics_from_events(events: list[RunEvent]) -> dict[str, int]:
+    usage_events = [event for event in events if event.type == EventType.MODEL_USAGE]
+    if usage_events:
+        source = usage_events
+        provider_requests = len(usage_events)
+    else:
+        source = [event for event in events if event.type == EventType.MODEL_CALL]
+        provider_requests = 0
+
+    def scoped(kind: str) -> list[RunEvent]:
+        if kind == "repair":
+            return [event for event in source if event.payload.get("budget_scope") != "post_run"]
+        return [event for event in source if event.payload.get("budget_scope") == "post_run"]
+
+    def field_sum(items: list[RunEvent], field: str) -> int:
+        total = 0
+        for event in items:
+            value = event.payload.get(field)
+            if value is None:
+                continue
+            total += int(value)
+        return total
+
+    repair = scoped("repair")
+    learning = scoped("post_run")
+    input_tokens = field_sum(source, "input_tokens")
+    output_tokens = field_sum(source, "output_tokens")
+    repair_input = field_sum(repair, "input_tokens")
+    repair_output = field_sum(repair, "output_tokens")
+    learning_input = field_sum(learning, "input_tokens")
+    learning_output = field_sum(learning, "output_tokens")
+    return {
+        "provider_requests": provider_requests,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "repair_input_tokens": repair_input,
+        "repair_output_tokens": repair_output,
+        "repair_tokens": repair_input + repair_output,
+        "learning_input_tokens": learning_input,
+        "learning_output_tokens": learning_output,
+        "learning_tokens": learning_input + learning_output,
+        "cached_input_tokens": field_sum(source, "cached_input_tokens"),
+        "reasoning_tokens": field_sum(source, "reasoning_tokens"),
+    }
+
+
 async def collect_metrics(
     *,
     result: dict[str, Any],
@@ -338,6 +385,7 @@ async def collect_metrics(
             task, workspace, benchmark_preflight
         )
     events = recorder.events(run_id)
+    tokens = token_metrics_from_events(events)
     repair_model_calls = sum(
         event.type == EventType.MODEL_CALL and event.payload.get("budget_scope") != "post_run"
         for event in events
@@ -355,14 +403,12 @@ async def collect_metrics(
         event.type == EventType.TOOL_CALL and event.payload.get("budget_scope") == "post_run"
         for event in events
     )
-    input_tokens = sum(int(event.payload.get("input_tokens") or 0) for event in events)
-    output_tokens = sum(int(event.payload.get("output_tokens") or 0) for event in events)
     investigators = {
         event.agent_id
         for event in events
         if event.type == EventType.AGENT_COMPLETED
         and event.agent_id
-        and event.agent_id.startswith("investigator:")
+        and event.agent_id.startswith("worker:")
     }
     skill_candidates = [
         event for event in events if event.type == EventType.SKILL_CANDIDATE_CREATED
@@ -383,18 +429,30 @@ async def collect_metrics(
         llm_calls=trajectory.model_call_count,
         repair_model_calls=repair_model_calls,
         post_run_model_calls=post_run_model_calls,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
+        provider_requests=tokens["provider_requests"],
+        input_tokens=tokens["input_tokens"],
+        output_tokens=tokens["output_tokens"],
+        total_tokens=tokens["total_tokens"],
+        repair_input_tokens=tokens["repair_input_tokens"],
+        repair_output_tokens=tokens["repair_output_tokens"],
+        repair_tokens=tokens["repair_tokens"],
+        learning_input_tokens=tokens["learning_input_tokens"],
+        learning_output_tokens=tokens["learning_output_tokens"],
+        learning_tokens=tokens["learning_tokens"],
+        cached_input_tokens=tokens["cached_input_tokens"],
+        reasoning_tokens=tokens["reasoning_tokens"],
         tool_calls=trajectory.tool_call_count,
         repair_tool_calls=repair_tool_calls,
         post_run_tool_calls=post_run_tool_calls,
         failed_tool_calls=sum(agent.failed_tool_calls for agent in trajectory.agents),
-        repair_attempts=int(result.get("repair_attempt", 0)),
+        repair_attempts=int(result.get("supervisor_batch", result.get("repair_attempt", 0))),
         files_changed=len(final_changes.changed_files),
         lines_changed=final_changes.lines_added + final_changes.lines_deleted,
         workers_spawned=len(investigators),
-        parallel_rounds=int(result.get("investigation_round", 0)),
-        investigation_rounds=int(result.get("investigation_round", 0)),
+        parallel_rounds=int(result.get("supervisor_batch", result.get("investigation_round", 0))),
+        investigation_rounds=int(
+            result.get("supervisor_batch", result.get("investigation_round", 0))
+        ),
         evidence_count=len(trajectory.evidence),
         memory_retrieval_count=len(trajectory.memories_retrieved),
         memory_selected_count=len(trajectory.memories_selected),
@@ -402,12 +460,11 @@ async def collect_metrics(
         skills_retrieved=len(trajectory.skills_retrieved),
         skills_selected=len(trajectory.skills_selected),
         skills_used=len(trajectory.skills_used),
-        skill_created=sum(
-            event.payload.get("parent_version") is None for event in skill_candidates
-        ),
-        skill_updated=int(decision.get("action") == "update_skill"),
-        skills_promoted=sum(event.type == EventType.SKILL_PROMOTED for event in events),
-        skills_rejected=sum(event.type == EventType.SKILL_REJECTED for event in events),
+        skill_created=len(skill_candidates),
+        skill_updated=int(decision.get("action") == "update_skill")
+        + sum(event.type == EventType.SKILL_UPDATED for event in events),
+        skills_promoted=0,
+        skills_rejected=0,
         skills_superseded=0,
         skill_registry_size=skill_registry_size,
         active_skill_count=active_skill_count,
@@ -432,6 +489,7 @@ def attach_learning_metrics(
         failure_reason=result.get("failure_reason"),
     )
     events = recorder.events(run_id)
+    tokens = token_metrics_from_events(events)
     skill_candidates = [
         event for event in events if event.type == EventType.SKILL_CANDIDATE_CREATED
     ]
@@ -444,6 +502,7 @@ def attach_learning_metrics(
                 and event.payload.get("budget_scope") == "post_run"
                 for event in events
             ),
+            **tokens,
             "post_run_tool_calls": sum(
                 event.type == EventType.TOOL_CALL
                 and event.payload.get("budget_scope") == "post_run"
@@ -451,12 +510,11 @@ def attach_learning_metrics(
             ),
             "skills_used": len(trajectory.skills_used),
             "skills_selected": len(trajectory.skills_selected),
-            "skill_created": sum(
-                event.payload.get("parent_version") is None for event in skill_candidates
-            ),
-            "skill_updated": int(decision.get("action") == "update_skill"),
-            "skills_promoted": sum(event.type == EventType.SKILL_PROMOTED for event in events),
-            "skills_rejected": sum(event.type == EventType.SKILL_REJECTED for event in events),
+            "skill_created": len(skill_candidates),
+            "skill_updated": int(decision.get("action") == "update_skill")
+            + sum(event.type == EventType.SKILL_UPDATED for event in events),
+            "skills_promoted": 0,
+            "skills_rejected": 0,
             "skill_registry_size": skill_registry_size,
             "active_skill_count": active_skill_count,
         }

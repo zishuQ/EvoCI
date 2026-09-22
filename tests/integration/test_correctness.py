@@ -7,32 +7,37 @@ from types import SimpleNamespace
 
 import pytest
 
+from evoci.agents.base import AgentSuite, WorkerContext, WorkerRun
 from evoci.capability.registry import CapabilityRegistry
-from evoci.capability.validator import CandidateValidator
 from evoci.config import EvoCIConfig
 from evoci.domain.models import (
     CIFailure,
     FileEdit,
     FixerOutput,
     PatchProposal,
-    ReviewResult,
     VerificationResult,
+    WorkerExecutionResult,
 )
 from evoci.graph.builder import GraphRuntime, build_graph, persist_run_outcome
 from evoci.memory.store import SQLiteMemoryStore
 from evoci.runtime.budget import RunBudgetManager
 from evoci.runtime.trajectory import TrajectoryRecorder
+from evoci.tools.policy import WorkerCapabilities
 from tests.integration.test_graph import (
+    CombinedWorker,
     FakeCoordinator,
     FakeDiagnoser,
-    FakeExperienceMiner,
     FakeFixer,
     FakeInvestigator,
-    FakeReviewer,
+    FakeSkillMiner,
     initial_state,
     make_runtime,
     task,
 )
+
+
+class AcceptingReviewer:
+    pass
 
 PASSING = ["python", "-c", "raise SystemExit(0)"]
 VALUE_ORACLE = ["python", "-c", "import app; assert app.VALUE == 1"]
@@ -80,26 +85,26 @@ class RealValueFixer:
         )
 
 
-class AcceptingReviewer:
-    async def review(self, **kwargs: object) -> ReviewResult:
-        del kwargs
-        return ReviewResult(accepted=True, confidence=1.0)
-
-
 class TwoCommandFixer:
     def __init__(self, commands: list[list[str]]) -> None:
         self.commands = commands
 
-    async def propose(self, **kwargs: object) -> FixerOutput:
-        del kwargs
-        return FixerOutput(
-            proposal=PatchProposal(
+    async def execute(
+        self,
+        *,
+        context: WorkerContext,
+        capabilities: WorkerCapabilities,
+    ) -> WorkerRun:
+        del capabilities
+        return WorkerRun(
+            result=WorkerExecutionResult(
+                task_id=context.task.task_id,
+                status="completed",
                 summary="no file edits",
-                changed_files=[],
-                risk="low",
-                verification_plan=self.commands,
+                base_revision=context.baseline_snapshot_id,
+                snapshot_id=context.baseline_snapshot_id,
             ),
-            edits=[],
+            verification_plan=self.commands,
         )
 
 
@@ -107,19 +112,27 @@ class HashMismatchFixer:
     def __init__(self, digest_a: str) -> None:
         self.digest_a = digest_a
 
-    async def propose(self, **kwargs: object) -> FixerOutput:
-        del kwargs
-        return FixerOutput(
-            proposal=PatchProposal(
+    async def execute(
+        self,
+        *,
+        context: WorkerContext,
+        capabilities: WorkerCapabilities,
+    ) -> WorkerRun:
+        del capabilities
+        return WorkerRun(
+            result=WorkerExecutionResult(
+                task_id=context.task.task_id,
+                status="completed",
                 summary="two-file patch",
                 changed_files=["a.txt", "b.txt"],
-                risk="low",
-                verification_plan=[PASSING],
+                base_revision=context.baseline_snapshot_id,
+                snapshot_id=context.baseline_snapshot_id,
             ),
             edits=[
                 FileEdit(path="a.txt", content="new-a\n", expected_sha256=self.digest_a),
                 FileEdit(path="b.txt", content="new-b\n", expected_sha256="0" * 64),
             ],
+            verification_plan=[PASSING],
         )
 
 
@@ -131,27 +144,39 @@ def _runtime(
     max_tool_calls: int = 256,
     reviewer: object | None = None,
 ) -> GraphRuntime:
+    del reviewer
     config = EvoCIConfig.from_env(cwd=tmp_path).model_copy(
         update={
-            "max_repair_attempts": max_repair_attempts,
+            "max_supervisor_batches": max_repair_attempts,
             "max_run_tool_calls": max_tool_calls,
         }
     )
+    coordinator = FakeCoordinator([])
+    write_scope = [
+        "a.txt",
+        "b.txt",
+        "a.py",
+        "b.py",
+        "app.py",
+        "notes.txt",
+        "gone.py",
+        "build.sh",
+    ]
+    if hasattr(fixer, "edit") and fixer.edit is not None:
+        write_scope.insert(0, fixer.edit.path)
+    coordinator.repair_task = task("repair", kind="repair", write_scope=write_scope)
     base = make_runtime(
         tmp_path,
-        FakeCoordinator([[task("inspect")]]),
+        coordinator,
         FakeInvestigator(),
         FakeDiagnoser(),
         FakeFixer(),
     )
+    worker = CombinedWorker(FakeInvestigator(), fixer)  # type: ignore[arg-type]
     return replace(
         base,
         config=config,
-        agents=replace(
-            base.agents,
-            fixer=fixer,
-            reviewer=reviewer or AcceptingReviewer(),
-        ),
+        agents=AgentSuite(supervisor=coordinator, worker=worker),
         budget_manager=RunBudgetManager(
             max_model_calls=config.max_run_model_calls,
             max_tool_calls=max_tool_calls,
@@ -200,9 +225,8 @@ async def test_a01_true_fix_runs_mandatory_and_supplementary_once(tmp_path: Path
     runtime = replace(
         _runtime(tmp_path, RealValueFixer()),
         memory_store=memory,
-        experience_miner=FakeExperienceMiner(),
+        skill_miner=FakeSkillMiner(),
         capability_registry=registry,
-        candidate_validator=CandidateValidator(registry),
     )
     result = await build_graph(runtime).ainvoke(
         _failure(tmp_path, [VALUE_ORACLE]),
@@ -243,7 +267,7 @@ async def test_a01_deferred_learning_waits_for_independent_verdict(tmp_path: Pat
         _runtime(tmp_path, RealValueFixer()),
         memory_store=memory,
         capability_registry=registry,
-        experience_miner=FakeExperienceMiner(),
+        skill_miner=FakeSkillMiner(),
         recorder=recorder,
         defer_success_learning=True,
     )
@@ -363,22 +387,19 @@ async def test_a04_single_incomplete_verification_is_not_success(tmp_path: Path)
 
     recorder = TrajectoryRecorder()
     config = EvoCIConfig.from_env(cwd=tmp_path).model_copy(
-        update={"max_repair_attempts": 1, "max_run_tool_calls": 1}
+        update={"max_supervisor_batches": 1, "max_run_tool_calls": 1}
     )
     budget = RunBudgetManager(max_model_calls=20, max_tool_calls=1, recorder=recorder)
     runtime = GraphRuntime(
         config=config,
         agents=AgentSuite(
-            coordinator=FakeCoordinator([[task("x")]]),
-            investigator=FakeInvestigator(),
-            diagnoser=FakeDiagnoser(),
-            fixer=TwoCommandFixer(
+            supervisor=FakeCoordinator([[task("x")]]),
+            worker=TwoCommandFixer(
                 [
                     ["python", "-c", "raise SystemExit(0)"],
                     ["python", "-c", "raise SystemExit(1)"],
                 ]
             ),
-            reviewer=FakeReviewer(),
         ),
         recorder=recorder,
         budget_manager=budget,
@@ -416,7 +437,7 @@ async def test_a04_single_second_failure_and_full_pass(tmp_path: Path) -> None:
     async def run_case(commands: list[list[str]], tool_calls: int) -> dict[str, object]:
         recorder = TrajectoryRecorder()
         config = EvoCIConfig.from_env(cwd=tmp_path).model_copy(
-            update={"max_repair_attempts": 1, "max_run_tool_calls": tool_calls}
+            update={"max_supervisor_batches": 1, "max_run_tool_calls": tool_calls}
         )
         budget = RunBudgetManager(
             max_model_calls=20, max_tool_calls=tool_calls, recorder=recorder
@@ -424,11 +445,8 @@ async def test_a04_single_second_failure_and_full_pass(tmp_path: Path) -> None:
         runtime = GraphRuntime(
             config=config,
             agents=AgentSuite(
-                coordinator=FakeCoordinator([[task("x")]]),
-                investigator=FakeInvestigator(),
-                diagnoser=FakeDiagnoser(),
-                fixer=TwoCommandFixer(commands),
-                reviewer=FakeReviewer(),
+                supervisor=FakeCoordinator([[task("x")]]),
+                worker=TwoCommandFixer(commands),
             ),
             recorder=recorder,
             budget_manager=budget,

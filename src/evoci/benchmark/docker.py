@@ -23,6 +23,7 @@ from evoci.benchmark.models import (
     EvalAttempt,
     PreparedTask,
 )
+from evoci.tools.policy import WorkspaceBoundary
 from evoci.tools.shell import CommandResult
 
 _TESTBED_PATH = (
@@ -544,6 +545,7 @@ class DockerReplayVerifier:
         self._work_containers: list[str] = []
         self._protected: ProtectedFiles | None = None
         self._base_sha: str | None = None
+        self._container_base_sha: str | None = None
 
     def protect(self, workspace: Path) -> None:
         self._protected = ProtectedFiles(workspace, self.spec.protected_files)
@@ -590,37 +592,18 @@ class DockerReplayVerifier:
         return name
 
     def start_work_container(self, workspace: Path) -> str:
-        """Agent work container. Bind-mounts the workspace; not used for scoring."""
+        """Agent work container using the image /testbed. Never bind-mounts host files."""
 
         if self._base_sha is None:
             parsed = _git(workspace, "rev-parse", "HEAD")
             if parsed.returncode == 0:
                 self._base_sha = parsed.stdout.strip()
-        name = self._container_name("work")
-        _checked(
-            self.cli,
-            [
-                "run",
-                "--detach",
-                "--name",
-                name,
-                "--mount",
-                f"type=bind,src={workspace.resolve()},dst=/testbed",
-                "--workdir",
-                "/testbed",
-                "--env",
-                f"PATH={_TESTBED_PATH}",
-                "--env",
-                "PYTHONDONTWRITEBYTECODE=1",
-                "--entrypoint",
-                "sleep",
-                self.pinned_image,
-                "infinity",
-            ],
-            timeout=120,
-            operation="start work container",
-        )
+        name = self._start_eval_container("work")
+        self._eval_containers.remove(name)
         self._work_containers.append(name)
+        head = self._exec(name, ["git", "-C", "/testbed", "rev-parse", "HEAD"])
+        if head.exit_code == 0 and head.stdout.strip():
+            self._container_base_sha = head.stdout.strip()
         return name
 
     def _remove(self, name: str) -> None:
@@ -631,13 +614,18 @@ class DockerReplayVerifier:
             self._work_containers.remove(name)
 
     def _exec(
-        self, container: str, command: list[str], *, timeout: float | None = None
+        self,
+        container: str,
+        command: list[str],
+        *,
+        timeout: float | None = None,
+        workdir: str = "/testbed",
     ) -> BenchmarkCommandResult:
         completed = self.cli.run(
             [
                 "exec",
                 "--workdir",
-                "/testbed",
+                workdir,
                 "--env",
                 "CI=1",
                 "--env",
@@ -682,7 +670,8 @@ class DockerReplayVerifier:
     ) -> BenchmarkCommandResult:
         self._copy_text(container, content, destination)
         applied = self._exec(
-            container, ["git", "-C", "/testbed", "apply", "--whitespace=nowarn", destination]
+            container,
+            ["git", "-C", "/testbed", "apply", "--binary", "--whitespace=nowarn", destination],
         )
         if applied.exit_code == 0:
             return applied
@@ -967,16 +956,69 @@ class DockerReplayVerifier:
         for name in remaining:
             self._remove(name)
 
-    async def execute_agent_command(
-        self, command: list[str], cwd: str = ".", network: bool = False
-    ) -> CommandResult:
-        del cwd, network
+    def _container_workdir(self, workspace_root: Path, cwd: str) -> str:
+        resolved = WorkspaceBoundary(workspace_root).resolve(cwd)
+        relative = resolved.relative_to(WorkspaceBoundary(workspace_root).root)
+        if str(relative) in {".", ""}:
+            return "/testbed"
+        return str(Path("/testbed") / relative)
+
+    def _restore_work_baseline(self, container: str) -> None:
+        revision = self._container_base_sha or "HEAD"
+        reset = self._exec(
+            container, ["git", "-C", "/testbed", "reset", "--hard", revision]
+        )
+        if reset.exit_code != 0 or reset.timed_out:
+            raise DockerError(
+                f"failed to restore container baseline: {(reset.stderr or reset.stdout).strip()}"
+            )
+        self._exec(container, ["git", "-C", "/testbed", "clean", "-fd"])
+
+    def _sync_workspace_into_container(self, workspace_root: Path) -> None:
         if not self._work_containers:
             raise DockerError("Docker work container is not running")
-        result = self._exec(self._work_containers[0], command, timeout=self.work_timeout)
+        container = self._work_containers[0]
+        self._restore_work_baseline(container)
+        protected = self.spec.protected_files if self._protected is not None else ()
+        patch = build_candidate_patch(workspace_root, protected_files=protected)
+        if patch.strip():
+            self._apply_patch(container, patch, "/tmp/candidate.patch")
+
+    async def execute_agent_command(
+        self,
+        command: list[str],
+        cwd: str = ".",
+        network: bool = False,
+        workspace_root: Path | None = None,
+    ) -> CommandResult:
+        del network
+        if workspace_root is None:
+            raise DockerError("Docker agent commands require workspace_root")
+        self._sync_workspace_into_container(workspace_root)
+        workdir = self._container_workdir(workspace_root, cwd)
+        container = self._work_containers[0]
+        result = self._exec(container, command, timeout=self.work_timeout, workdir=workdir)
+        env_reason = detect_infra_reason(
+            result,
+            {},
+        )
+        if (result.exit_code != 0 or result.timed_out) and env_reason:
+            self._restore_work_baseline(container)
+            baseline = self._exec(
+                container, command, timeout=self.work_timeout, workdir=workdir
+            )
+            baseline_reason = detect_infra_reason(baseline, {})
+            if baseline_reason == env_reason:
+                result = BenchmarkCommandResult(
+                    command=result.command,
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=f"{result.stderr}\nBASELINE_ENVIRONMENT_ERROR={env_reason}",
+                    timed_out=result.timed_out,
+                )
         return CommandResult(
             argv=tuple(command),
-            cwd="/testbed",
+            cwd=workdir,
             exit_code=result.exit_code,
             stdout=result.stdout,
             stderr=result.stderr,

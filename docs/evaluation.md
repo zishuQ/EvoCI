@@ -29,9 +29,8 @@ fail-before/pass-after, never merely agent success or command-after success.
 
 Benchmark workspaces automatically approve every durable HITL interrupt because they are disposable;
 interactive repair keeps manual approval. All variants share one atomic run-level repair model/tool
-budget. Single-agent mode can verify, receive failure feedback, and retry within that same budget;
-parallel agents do not receive independent copies of it. Evolution work is outside the repair cap
-and is reported as `post_run_model_calls` and `post_run_tool_calls`.
+budget. The serial Worker consumes that budget together with any task-level call limits. Evolution
+work is outside the repair cap and is reported as `post_run_model_calls` and `post_run_tool_calls`.
 
 Final patch scope comes only from `git status --porcelain`, `git diff --name-only`, and
 `git diff --numstat` in the real benchmark workspace, including untracked files. Trajectory file

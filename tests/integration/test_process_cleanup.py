@@ -15,7 +15,7 @@ from tests.unit.test_capability import candidate, registry
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["command", "skill", "validation_command", "validation_pytest"])
+@pytest.mark.parametrize("entry", ["command", "skill", "validation_pytest"])
 async def test_cancel_reaps_descendants_before_return(tmp_path: Path, entry: str) -> None:
     ready = tmp_path / "ready"
     survived = tmp_path / "survived"
@@ -36,9 +36,7 @@ async def test_cancel_reaps_descendants_before_return(tmp_path: Path, entry: str
         operation = CommandRunner(tmp_path).run(["python", "-c", script])
     else:
         skill = candidate(script=script).model_copy(update={"tests": []})
-        if entry == "validation_command":
-            skill = skill.model_copy(update={"verification_commands": [["python", "-c", script]]})
-        elif entry == "validation_pytest":
+        if entry == "validation_pytest":
             skill = skill.model_copy(
                 update={
                     "tests": [
@@ -50,22 +48,23 @@ async def test_cancel_reaps_descendants_before_return(tmp_path: Path, entry: str
                     ]
                 }
             )
-        record = store.create_candidate(skill)
-        validator = CandidateValidator(store, timeout=10)
+        validator = CandidateValidator(timeout=10)
         if entry.startswith("validation"):
-            operation = validator.avalidate_to_trial(record.manifest.skill_id, 1)
+            staging, manifest = store._write_staging(skill, "pytest-import-debugging")
+            record = type("Record", (), {"manifest": manifest})()
+            operation = validator.avalidate_package(staging, manifest)
         else:
-            assert validator.validate_to_trial(record.manifest.skill_id, 1).passed
+            record = store.create_skill(skill)
             tools = create_worker_registry(
                 FIXER_CAPABILITIES,
                 tmp_path,
                 capability_registry=store,
-                allowed_skill_refs={(record.manifest.skill_id, 1)},
+                allowed_skill_refs={record.manifest.skill_id},
             )
+            tools.invoke("load_skill", skill_id=record.manifest.skill_id)
             operation = tools.ainvoke(
                 "run_skill_script",
                 skill_id=record.manifest.skill_id,
-                version=1,
                 script_name="inspect_imports.py",
                 args=[],
             )
@@ -82,8 +81,7 @@ async def test_cancel_reaps_descendants_before_return(tmp_path: Path, entry: str
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=3)
         if entry.startswith("validation"):
-            current = store.get(record.manifest.skill_id, 1)
-            assert current is not None and current.manifest.status == "candidate"
+            assert store.get(record.manifest.skill_id) is None
         if tools is not None:
             tools.close()
             tools = None

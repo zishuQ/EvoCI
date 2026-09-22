@@ -1,4 +1,4 @@
-"""Deterministic offline demonstration of the full repair graph."""
+"""Deterministic offline demonstration of the supervisor-worker repair graph."""
 
 from __future__ import annotations
 
@@ -7,22 +7,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from evoci.agents.base import AgentContext, AgentSuite
+from evoci.agents.base import AgentSuite, SupervisorContext, WorkerContext, WorkerRun
 from evoci.config import EvoCIConfig
 from evoci.domain.models import (
     CIFailure,
-    Diagnosis,
     EvidenceItem,
     FileEdit,
-    FixerOutput,
-    Hypothesis,
-    InvestigationPlan,
-    InvestigationTask,
-    PatchProposal,
     RepoSpec,
-    ReviewResult,
-    VerificationResult,
-    WorkerResult,
+    SupervisorDecision,
+    WorkerExecutionResult,
+    WorkerTask,
+    parse_verification_plan,
 )
 from evoci.graph.builder import GraphRuntime, build_graph
 from evoci.memory.retrieval import MemoryRetriever
@@ -33,193 +28,145 @@ from evoci.runtime.run_store import SQLiteRunStore
 from evoci.tools.policy import WorkerCapabilities
 
 
-class DemoCoordinator:
-    async def plan(
-        self,
-        *,
-        context: AgentContext,
-        evidence: list[EvidenceItem],
-        round_number: int,
-        remaining_task_budget: int,
-    ) -> InvestigationPlan:
-        del context, evidence, round_number, remaining_task_budget
-        return InvestigationPlan(
-            tasks=[
-                InvestigationTask(
-                    task_id="logs",
-                    role="log",
-                    objective="identify the failed assertion",
-                    expected_evidence=["assertion"],
-                    priority=1,
-                ),
-                InvestigationTask(
-                    task_id="repository",
-                    role="repository",
-                    objective="inspect the calculator implementation",
-                    expected_evidence=["source"],
-                    priority=1,
-                ),
-                InvestigationTask(
-                    task_id="test",
-                    role="test",
-                    objective="confirm the intended addition behavior",
-                    expected_evidence=["test"],
-                    priority=1,
-                ),
-            ],
-            reasoning_summary="logs, implementation, and tests are independent evidence sources",
-        )
+class DemoSupervisor:
+    def __init__(self) -> None:
+        self.calls = 0
 
-
-class DemoInvestigator:
-    async def run(
-        self,
-        *,
-        task: InvestigationTask,
-        context: AgentContext,
-        capabilities: WorkerCapabilities,
-    ) -> WorkerResult:
-        assert not capabilities.write_files
-        await asyncio.sleep(0.02)
-        if task.role == "repository":
-            source = (Path(context.workspace_path) / "calculator.py").read_text()
-            claim = "add subtracts its second operand"
-            excerpt = source
-            kind = "source_code"
-        elif task.role == "test":
-            claim = "the test expects add(1, 2) to equal 3"
-            excerpt = (Path(context.workspace_path) / "test_calculator.py").read_text()
-            kind = "test_result"
-        else:
-            claim = "CI reports that -1 did not equal 3"
-            excerpt = context.failure.log_excerpt
-            kind = "ci_log"
-        evidence = EvidenceItem(
-            id=f"demo-{task.task_id}",
-            source_agent=task.task_id,
-            kind=kind,  # type: ignore[arg-type]
-            claim=claim,
-            excerpt=excerpt,
-            confidence=0.98,
-        )
-        return WorkerResult(task_id=task.task_id, summary=claim, evidence=[evidence])
-
-
-class DemoDiagnoser:
-    async def diagnose(self, *, context: AgentContext, evidence: list[EvidenceItem]) -> Diagnosis:
+    async def decide(self, *, context: SupervisorContext) -> SupervisorDecision:
         del context
-        return Diagnosis(
-            primary=Hypothesis(
-                root_cause="calculator.add uses subtraction instead of addition",
-                evidence_ids=[item.id for item in evidence],
-                confidence=0.99,
-                affected_files=["calculator.py"],
-                proposed_action="replace subtraction with addition",
-            ),
-            needs_more_evidence=False,
+        self.calls += 1
+        if self.calls == 1:
+            return SupervisorDecision(
+                action="dispatch",
+                reasoning_summary="Inspect the calculator implementation and failing test.",
+                tasks=[
+                    WorkerTask(
+                        task_id="repository",
+                        kind="investigate",
+                        objective="inspect the calculator implementation",
+                        acceptance_criteria=["locate the incorrect operator"],
+                    )
+                ],
+            )
+        if self.calls == 2:
+            return SupervisorDecision(
+                action="dispatch",
+                reasoning_summary="Repair the addition operator.",
+                tasks=[
+                    WorkerTask(
+                        task_id="repair-add",
+                        kind="repair",
+                        objective="fix addition",
+                        acceptance_criteria=["python -c add works"],
+                        write_scope=["calc.py", "calculator.py"],
+                    )
+                ],
+            )
+        return SupervisorDecision(
+            action="stop",
+            reasoning_summary="No further work after the serial investigate/repair pair.",
+            stop_reason="demo completed its serial queue",
         )
 
 
-class DemoFixer:
-    async def propose(
+class DemoWorker:
+    async def execute(
         self,
         *,
-        context: AgentContext,
-        diagnosis: Diagnosis,
-        evidence: list[EvidenceItem],
-        previous_verification: VerificationResult | None,
-    ) -> FixerOutput:
-        del context, diagnosis, evidence, previous_verification
-        return FixerOutput(
-            proposal=PatchProposal(
-                summary="correct calculator addition",
-                changed_files=["calculator.py"],
-                risk="low",
-                verification_plan=[["python", "-m", "unittest", "-q"]],
-            ),
-            edits=[
-                FileEdit(
-                    path="calculator.py",
-                    content=("def add(left: int, right: int) -> int:\n    return left + right\n"),
+        context: WorkerContext,
+        capabilities: WorkerCapabilities,
+    ) -> WorkerRun:
+        task = context.task
+        if task.kind == "investigate":
+            assert capabilities.write_files is False
+            evidence = EvidenceItem(
+                source_agent="repository",
+                kind="source_code",
+                claim="calc.add multiplies instead of adding",
+                file_path="calc.py",
+                confidence=0.95,
+            )
+            return WorkerRun(
+                result=WorkerExecutionResult(
+                    task_id=task.task_id,
+                    status="completed",
+                    summary="addition is implemented as multiplication",
+                    evidence=[evidence],
+                    base_revision=context.baseline_snapshot_id,
+                    snapshot_id=context.baseline_snapshot_id,
                 )
-            ],
+            )
+        assert capabilities.write_files is True
+        root = Path(context.workspace_path)
+        target = "calc.py" if (root / "calc.py").exists() else "calculator.py"
+        source = (root / target).read_text(encoding="utf-8")
+        repaired = (
+            source.replace("return a * b", "return a + b")
+            .replace("return left - right", "return left + right")
+        )
+        return WorkerRun(
+            result=WorkerExecutionResult(
+                task_id=task.task_id,
+                status="completed",
+                summary="replace the incorrect arithmetic operator",
+                changed_files=[target],
+                base_revision=context.baseline_snapshot_id,
+                snapshot_id=context.baseline_snapshot_id,
+            ),
+            edits=[FileEdit(path=target, content=repaired)],
+            verification_plan=parse_verification_plan([["python", "-m", "unittest", "-q"]]),
         )
 
 
-class DemoReviewer:
-    async def review(
-        self,
-        *,
-        context: AgentContext,
-        diagnosis: Diagnosis,
-        patch: FixerOutput,
-        verification: VerificationResult,
-    ) -> ReviewResult:
-        del context, diagnosis, patch
-        return ReviewResult(
-            accepted=verification.passed,
-            blockers=[] if verification.passed else ["verification failed"],
-            confidence=1.0,
-        )
-
-
-async def run_repair_demo(project_root: Path) -> dict[str, Any]:
-    config = EvoCIConfig.from_env(cwd=project_root)
-    config.ensure_directories()
-    workspace = project_root / ".evoci/demo-workspace"
+async def run_repair_demo(root: Path) -> dict[str, Any]:
+    workspace = root / ".evoci" / "demo-workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "calculator.py").write_text(
-        "def add(left: int, right: int) -> int:\n    return left - right\n"
-    )
-    (workspace / "test_calculator.py").write_text(
-        "import unittest\n\n"
-        "from calculator import add\n\n\n"
-        "class CalculatorTest(unittest.TestCase):\n"
-        "    def test_adds_operands(self) -> None:\n"
-        "        self.assertEqual(add(1, 2), 3)\n"
-    )
-    state_dir = config.state_dir
-    event_store = SQLiteEventStore(state_dir / "events.sqlite")
-    run_store = SQLiteRunStore(state_dir / "runs.sqlite")
-    memory_store = SQLiteMemoryStore(state_dir / "memory.sqlite")
-    checkpoint = await create_async_sqlite_checkpointer(state_dir / "checkpoints.sqlite")
-    run_id = f"demo-{uuid4().hex[:10]}"
+    (workspace / "calc.py").write_text("def add(a, b):\n    return a * b\n", encoding="utf-8")
+    config = EvoCIConfig.from_env(cwd=root)
+    event_store = SQLiteEventStore(config.state_dir / "events.sqlite")
+    run_store = SQLiteRunStore(config.state_dir / "runs.sqlite")
+    memory_store = SQLiteMemoryStore(config.state_dir / "memory.sqlite")
+    checkpoint = await create_async_sqlite_checkpointer(config.state_dir / "checkpoints.sqlite")
     runtime = GraphRuntime(
         config=config,
-        agents=AgentSuite(
-            coordinator=DemoCoordinator(),
-            investigator=DemoInvestigator(),
-            diagnoser=DemoDiagnoser(),
-            fixer=DemoFixer(),
-            reviewer=DemoReviewer(),
-        ),
+        agents=AgentSuite(supervisor=DemoSupervisor(), worker=DemoWorker()),
         event_store=event_store,
         run_store=run_store,
         memory_store=memory_store,
-        memory_retriever=MemoryRetriever(
-            memory_store, context_limit_chars=config.memory_context_limit_chars
-        ),
+        memory_retriever=MemoryRetriever(memory_store),
     )
     graph = build_graph(runtime, checkpointer=checkpoint.saver)
+    initial = {
+        "run_id": f"demo-{uuid4().hex[:8]}",
+        "task_id": "demo-add",
+        "repo": RepoSpec(name="demo"),
+        "ci_failure": CIFailure(
+            summary="add returns 6 for 2+3",
+            log_excerpt="AssertionError",
+            failed_commands=[["python", "-c", "from calc import add; assert add(2, 3) == 5"]],
+        ),
+        "workspace_path": str(workspace),
+    }
     try:
-        result = await graph.ainvoke(
-            {
-                "run_id": run_id,
-                "task_id": "demo-calculator",
-                "repo": RepoSpec(owner="evoci", name="demo"),
-                "ci_failure": CIFailure(
-                    summary="calculator addition test failed",
-                    log_excerpt="AssertionError: -1 != 3",
-                    failed_commands=[["python", "-m", "unittest", "-q"]],
-                    task_family="test",
-                ),
-                "workspace_path": str(workspace),
-            },
-            {"configurable": {"thread_id": run_id}},
-        )
-        return result
+        return await graph.ainvoke(initial, {"configurable": {"thread_id": initial["run_id"]}})
     finally:
         await checkpoint.close()
         memory_store.close()
         run_store.close()
         event_store.close()
+
+
+def main() -> None:
+    result = asyncio.run(run_repair_demo(Path.cwd()))
+    print(result.get("status"))
+
+
+if __name__ == "__main__":
+    main()
+
+
+DemoCoordinator = DemoSupervisor
+DemoInvestigator = DemoWorker
+DemoFixer = DemoWorker
+DemoDiagnoser = DemoSupervisor
+DemoReviewer = DemoSupervisor

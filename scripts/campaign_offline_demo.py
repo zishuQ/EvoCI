@@ -86,7 +86,7 @@ def _result(task_id: str) -> BenchmarkResult:
 def _seed_skill(config: EvoCIConfig, run_id: str) -> None:
     registry = CapabilityRegistry(config.capability_dir, config.state_dir / "capabilities.sqlite")
     try:
-        created = registry.create_candidate(
+        created = registry.create_skill(
             SkillCandidate(
                 name="Offline repair procedure",
                 description="Reusable offline repair procedure",
@@ -107,7 +107,7 @@ def _seed_skill(config: EvoCIConfig, run_id: str) -> None:
             ),
             operation_key=f"offline-demo:{run_id}:skill",
         )
-        registry.transition(created.manifest.skill_id, created.manifest.version, "trial")
+        del created
     finally:
         registry.close()
 
@@ -133,7 +133,7 @@ def run_round(root: Path, round_number: int) -> dict[str, object]:
                 branch.capability_dir, branch.state_dir / "capabilities.sqlite"
             )
             try:
-                hits = CapabilityRetriever(registry).retrieve(
+                catalog = CapabilityRetriever(registry).retrieve(
                     RepoSpec(owner="offline", name=task_id),
                     CIFailure(
                         summary="offline repair failure",
@@ -142,7 +142,7 @@ def run_round(root: Path, round_number: int) -> dict[str, object]:
                     ),
                     operation_key=f"offline-demo:retrieve:{run_id}",
                 )
-                retrieved_skills = [f"{hit.skill_id}:v{hit.version}" for hit in hits]
+                retrieved_skills = [entry.skill_id for entry in catalog.entries]
             finally:
                 registry.close()
         store = SQLiteMemoryStore(branch.state_dir / "memory.sqlite")

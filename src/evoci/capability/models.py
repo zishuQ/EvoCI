@@ -1,4 +1,4 @@
-"""Capability package, lifecycle, and usage models."""
+"""Capability package, usage, and skill-memory models."""
 
 from __future__ import annotations
 
@@ -6,16 +6,6 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-SkillStatus = Literal[
-    "candidate",
-    "trial",
-    "active",
-    "stale",
-    "archived",
-    "rejected",
-    "superseded",
-]
 
 
 class SkillPermissions(BaseModel):
@@ -25,13 +15,6 @@ class SkillPermissions(BaseModel):
     write_workspace: bool = False
     execute: bool = False
     network: bool = False
-
-
-class SkillVersionRef(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    skill_id: str
-    version: int
 
 
 class SkillFile(BaseModel):
@@ -46,21 +29,16 @@ class SkillManifest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     skill_id: str
-    version: int
     name: str
     description: str
-    status: SkillStatus
     triggers: list[str]
     task_families: list[str]
     permissions: SkillPermissions
     source_run_ids: list[str]
-    parent_version: int | None = None
-    supersedes: list[SkillVersionRef] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    enabled: bool = True
     files: list[SkillFile]
-    verification_commands: list[list[str]] = Field(default_factory=list)
-    operation_key: str | None = None
-    schema_version: int = 1
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class GeneratedFile(BaseModel):
@@ -82,7 +60,12 @@ class SkillSpec(BaseModel):
     when_to_use: str = Field(description="When an agent should select this skill")
     procedure: str = Field(description="Step-by-step procedure")
     pitfalls: str = Field(description="Mistakes to avoid")
-    verification: str = Field(description="How to verify the procedure worked")
+    verification: str = Field(
+        description=(
+            "Repository-level guidance for future agents on how to verify a repair after using "
+            "this skill. Written into SKILL.md; never executed during skill installation."
+        )
+    )
     bundled_resources: str = Field(
         default="No bundled files are required.",
         description="Declared scripts, references, and templates",
@@ -105,7 +88,6 @@ class SkillCandidate(BaseModel):
     source_run_ids: list[str]
     confidence: float = Field(ge=0, le=1)
     permissions: SkillPermissions = Field(default_factory=SkillPermissions)
-    verification_commands: list[list[str]] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -146,7 +128,6 @@ class SkillStats(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     skill_id: str
-    version: int
     retrieval_count: int = 0
     selected_count: int = 0
     use_count: int = 0
@@ -154,11 +135,19 @@ class SkillStats(BaseModel):
     failure_count: int = 0
     patch_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_used_at: datetime | None = None
-    last_modified_at: datetime | None = None
-    avg_tool_calls_when_used: float | None = None
-    avg_attempts_when_used: float | None = None
-    utility_score: float | None = None
+
+
+class SkillMemoryEntry(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    repository: str
+    task_summary: str
+    outcome: Literal["success", "failure"]
+    lesson: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ValidationResult(BaseModel):

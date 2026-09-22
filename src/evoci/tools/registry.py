@@ -17,6 +17,7 @@ from evoci.tools.filesystem import FileTools
 from evoci.tools.git import GitTools
 from evoci.tools.isolation import copy_workspace_with_independent_git
 from evoci.tools.policy import PolicyViolation, WorkerCapabilities
+from evoci.tools.scope import assert_write_path_allowed, normalize_write_scope
 from evoci.tools.shell import CommandRunner, run_cancellable
 
 if TYPE_CHECKING:
@@ -89,7 +90,6 @@ class DeleteFileArgs(BaseModel):
 class RunSkillScriptArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     skill_id: str
-    version: int = Field(ge=1)
     script_name: str
     args: list[str] = Field(default_factory=list, max_length=100)
 
@@ -97,10 +97,14 @@ class RunSkillScriptArgs(BaseModel):
 class ReadSkillResourceArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     skill_id: str
-    version: int = Field(ge=1)
     path: str
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=8_000, ge=1, le=32_000)
+
+
+class LoadSkillArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    skill_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +121,21 @@ _WRITE_PATH_TOOLS = frozenset(
 _WRITE_PATH_KEYS = ("created_files", "modified_files", "deleted_files")
 
 
+def _resolve_skill_package_file(package: Path, relative: str) -> Path:
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise PolicyViolation(f"unsafe skill resource path: {relative}")
+    current = package
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            raise PolicyViolation("skill resource must not be a symlink")
+    resolved = current.resolve()
+    if package not in resolved.parents or not current.is_file():
+        raise PolicyViolation("skill resource is missing or escaped the package")
+    return resolved
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -130,6 +149,8 @@ class ToolRegistry:
         self._temporary_workspaces: list[tempfile.TemporaryDirectory[str]] = []
         self.execution_workspace: Path | None = None
         self._changed_paths: set[str] = set()
+        self.available_skill_ids: set[str] = set()
+        self.activated_skill_ids: set[str] = set()
 
     def changed_paths(self) -> list[str]:
         return sorted(self._changed_paths)
@@ -251,8 +272,9 @@ def create_worker_registry(
     timeout: float = 120.0,
     max_chars: int = 32_000,
     capability_registry: CapabilityRegistry | None = None,
-    allowed_skill_refs: set[tuple[str, int]] | None = None,
+    allowed_skill_refs: set[str] | None = None,
     tool_allowlist: set[str] | None = None,
+    write_scope: list[str] | tuple[str, ...] | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry(capabilities, tool_allowlist=tool_allowlist)
     file_tools = FileTools(workspace, writable=capabilities.write_files, max_chars=max_chars)
@@ -278,6 +300,15 @@ def create_worker_registry(
             copy_workspace_with_independent_git(source, disposable)
             registry.own_temporary_workspace(temporary, disposable)
         return disposable
+
+    allowed_writes = set(normalize_write_scope(write_scope or ()))
+    if capabilities.write_files and write_scope is not None and not allowed_writes:
+        raise PolicyViolation("repair workers require a non-empty write_scope")
+
+    def _require_write_path(path: str) -> str:
+        if not capabilities.write_files:
+            raise PolicyViolation("worker does not have write permission")
+        return assert_write_path_allowed(path, allowed_writes, workspace=workspace)
 
     command_workspace = workspace if capabilities.write_files else disposable_workspace()
     runner = CommandRunner(command_workspace, timeout=timeout, max_chars=max_chars)
@@ -354,7 +385,8 @@ def create_worker_registry(
         args_model=RunCommandArgs,
     )
     def apply_patch(files: dict[str, str]) -> Any:
-        result = file_tools.apply_patch(files)
+        guarded = {_require_write_path(path): content for path, content in files.items()}
+        result = file_tools.apply_patch(guarded)
         invalidate_snapshots()
         return result
 
@@ -364,6 +396,7 @@ def create_worker_registry(
         new_text: str,
         expected_replacements: int = 1,
     ) -> Any:
+        _require_write_path(path)
         result = file_tools.replace_text(
             path, old_text, new_text, expected_replacements=expected_replacements
         )
@@ -371,11 +404,13 @@ def create_worker_registry(
         return result
 
     def create_file(path: str, content: str) -> Any:
+        _require_write_path(path)
         result = file_tools.create_file(path, content)
         invalidate_snapshots()
         return result
 
     def delete_file(path: str) -> Any:
+        _require_write_path(path)
         result = file_tools.delete_file(path)
         invalidate_snapshots()
         return result
@@ -416,13 +451,71 @@ def create_worker_registry(
     )
     if capability_registry is not None:
         from evoci.capability.execution import run_skill_script
+        from evoci.capability.skill_memory import format_skill_memory_lines
 
-        def execute_skill(skill_id: str, version: int, script_name: str, args: list[str]) -> Any:
-            if allowed_skill_refs is not None and (skill_id, version) not in allowed_skill_refs:
-                raise PolicyViolation("skill was not selected for this run")
-            record = capability_registry.get(skill_id, version)
+        if allowed_skill_refs is None:
+            registry.available_skill_ids = {
+                record.manifest.skill_id
+                for record in capability_registry.list(enabled_only=True)
+            }
+        else:
+            registry.available_skill_ids = set(allowed_skill_refs)
+
+        def _require_available(skill_id: str) -> None:
+            if skill_id not in registry.available_skill_ids:
+                raise PolicyViolation(f"skill {skill_id} is not in the current catalog")
+
+        def _require_activated(skill_id: str) -> None:
+            _require_available(skill_id)
+            if skill_id not in registry.activated_skill_ids:
+                raise PolicyViolation(
+                    f"Skill {skill_id} must be loaded with load_skill before accessing "
+                    "its resources or scripts."
+                )
+
+        def load_skill(skill_id: str) -> dict[str, Any]:
+            _require_available(skill_id)
+            if skill_id in registry.activated_skill_ids:
+                return {"skill_id": skill_id, "already_loaded": True}
+            record = capability_registry.get(skill_id)
             if record is None:
-                raise KeyError(f"unknown skill: {skill_id} v{version}")
+                raise KeyError(f"unknown skill: {skill_id}")
+            if not record.manifest.enabled:
+                raise PolicyViolation("only enabled skills may be loaded")
+            package = Path(record.package_path).resolve()
+            declared = {file.path: file.sha256 for file in record.manifest.files}
+            if "SKILL.md" not in declared:
+                raise PolicyViolation("SKILL.md is not declared in the skill manifest")
+            skill_path = _resolve_skill_package_file(package, "SKILL.md")
+            payload = skill_path.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != declared["SKILL.md"]:
+                raise PolicyViolation("skill resource hash mismatch: SKILL.md")
+            procedure = payload.decode("utf-8", errors="replace")
+            procedure_limit = 16_000
+            if len(procedure) > procedure_limit:
+                procedure = procedure[:procedure_limit] + "\n...[truncated]"
+            memory_entries = capability_registry.read_skill_memory(skill_id)
+            registry.activated_skill_ids.add(skill_id)
+            capability_registry.record_retrieval([skill_id], selected=True)
+            return {
+                "skill_id": record.manifest.skill_id,
+                "name": record.manifest.name,
+                "description": record.manifest.description,
+                "procedure": procedure,
+                "usage_memory": format_skill_memory_lines(memory_entries),
+                "resources": [
+                    file.path for file in record.manifest.files if file.path != "SKILL.md"
+                ],
+            }
+
+        def execute_skill(skill_id: str, script_name: str, args: list[str]) -> Any:
+            _require_activated(skill_id)
+            record = capability_registry.get(skill_id)
+            if record is None:
+                raise KeyError(f"unknown skill: {skill_id}")
+            if not record.manifest.enabled:
+                raise PolicyViolation("only enabled skill scripts may execute")
             if record.manifest.permissions.write_workspace and not capabilities.write_files:
                 raise PolicyViolation(
                     "skill requests workspace writes that this worker role does not permit"
@@ -430,10 +523,9 @@ def create_worker_registry(
             may_write = capabilities.write_files and record.manifest.permissions.write_workspace
             script_workspace = workspace if may_write else disposable_workspace()
             try:
-                return run_skill_script(
+                result = run_skill_script(
                     capability_registry,
                     skill_id=skill_id,
-                    version=version,
                     script_name=script_name,
                     args=args,
                     workspace=script_workspace,
@@ -444,33 +536,32 @@ def create_worker_registry(
             finally:
                 if may_write:
                     invalidate_snapshots()
+            if may_write:
+                payload = result.model_dump() if isinstance(result, BaseModel) else result
+                if isinstance(payload, dict):
+                    for key in _WRITE_PATH_KEYS:
+                        for path in payload.get(key) or []:
+                            if isinstance(path, str) and path:
+                                _require_write_path(path)
+            return result
 
         def read_skill_resource(
             skill_id: str,
-            version: int,
             path: str,
             offset: int = 0,
             limit: int = 8_000,
         ) -> dict[str, Any]:
-            if allowed_skill_refs is not None and (skill_id, version) not in allowed_skill_refs:
-                raise PolicyViolation("skill was not selected for this run")
-            record = capability_registry.get(skill_id, version)
+            _require_activated(skill_id)
+            record = capability_registry.get(skill_id)
             if record is None:
-                raise KeyError(f"unknown skill: {skill_id} v{version}")
-            if record.manifest.status not in {"trial", "active"}:
-                raise PolicyViolation("only trial or active skill resources may be read")
+                raise KeyError(f"unknown skill: {skill_id}")
+            if not record.manifest.enabled:
+                raise PolicyViolation("only enabled skill resources may be read")
             package = Path(record.package_path).resolve()
-            relative = Path(path)
-            if relative.is_absolute() or ".." in relative.parts:
-                raise PolicyViolation(f"unsafe skill resource path: {path}")
             declared = {file.path: file.sha256 for file in record.manifest.files}
             if path not in declared:
                 raise PolicyViolation("resource is not declared in the skill manifest")
-            target = (package / relative).resolve()
-            if package not in target.parents or not target.is_file():
-                raise PolicyViolation("skill resource escaped the package")
-            if target.is_symlink():
-                raise PolicyViolation("skill resource must not be a symlink")
+            target = _resolve_skill_package_file(package, path)
             payload = target.read_bytes()
             digest = hashlib.sha256(payload).hexdigest()
             if digest != declared[path]:
@@ -479,7 +570,6 @@ def create_worker_registry(
             fragment = text[offset : offset + limit]
             return {
                 "skill_id": skill_id,
-                "version": version,
                 "path": path,
                 "offset": offset,
                 "limit": limit,
@@ -490,11 +580,22 @@ def create_worker_registry(
             }
 
         registry.register(
+            "load_skill",
+            "read_files",
+            load_skill,
+            description=(
+                "Load a catalog skill's procedure, recent usage memory, and resource list. "
+                "Call this before read_skill_resource or run_skill_script. "
+                "Repeated calls return skill_id and already_loaded without the procedure."
+            ),
+            args_model=LoadSkillArgs,
+        )
+        registry.register(
             "run_skill_script",
             "execute_tests",
             execute_skill,
             description=(
-                "Run a declared script from a retrieved trial or active capability package."
+                "Run a declared script from a loaded enabled capability package."
             ),
             args_model=RunSkillScriptArgs,
         )
@@ -503,7 +604,7 @@ def create_worker_registry(
             "read_files",
             read_skill_resource,
             description=(
-                "Read a declared reference, template, or other file from a selected skill package."
+                "Read a declared reference, template, or other file from a loaded skill package."
             ),
             args_model=ReadSkillResourceArgs,
         )

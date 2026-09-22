@@ -16,7 +16,6 @@ def run_skill_script(
     registry: CapabilityRegistry,
     *,
     skill_id: str,
-    version: int,
     script_name: str,
     args: list[str],
     workspace: Path,
@@ -24,11 +23,11 @@ def run_skill_script(
     max_chars: int = 32_000,
     observed_revision: int | None = None,
 ) -> ScriptExecutionResult:
-    record = registry.get(skill_id, version)
+    record = registry.get(skill_id)
     if record is None:
-        raise KeyError(f"unknown skill: {skill_id} v{version}")
-    if record.manifest.status not in {"trial", "active"}:
-        raise PolicyViolation("only trial or active skill scripts may execute")
+        raise KeyError(f"unknown skill: {skill_id}")
+    if not record.manifest.enabled:
+        raise PolicyViolation("only enabled skill scripts may execute")
     if not record.manifest.permissions.execute:
         raise PolicyViolation("skill does not declare execute permission")
     package = Path(record.package_path).resolve()

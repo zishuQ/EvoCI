@@ -70,13 +70,11 @@ class CapabilityMaterializer:
         runtime_root.mkdir(parents=True, exist_ok=True)
         destinations: list[Path] = []
         for hit in hits:
-            record = self.registry.get(hit.skill_id, hit.version)
-            if record is None or record.manifest.status not in {"trial", "active"}:
-                raise PolicyViolation(f"skill is not materializable: {hit.skill_id} v{hit.version}")
+            record = self.registry.get(hit.skill_id)
+            if record is None or not record.manifest.enabled:
+                raise PolicyViolation(f"skill is not materializable: {hit.skill_id}")
             source = Path(record.package_path).resolve()
-            destination = (
-                runtime_root / record.manifest.skill_id / f"v{record.manifest.version}"
-            ).resolve()
+            destination = (runtime_root / record.manifest.skill_id).resolve()
             if runtime_root not in destination.parents:
                 raise PolicyViolation("materialized skill path escaped runtime root")
             if destination.exists():

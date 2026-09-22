@@ -12,14 +12,13 @@ class VariantFeatures:
     multi_agent: bool
     long_term_memory: bool
     capabilities: bool
-    curator: bool
 
 
 FEATURES: dict[BenchmarkVariant, VariantFeatures] = {
-    "single": VariantFeatures(False, False, False, False),
-    "multi": VariantFeatures(True, False, False, False),
-    "multi-memory": VariantFeatures(True, True, False, False),
-    "evo": VariantFeatures(True, True, True, True),
+    "single": VariantFeatures(False, False, False),
+    "multi": VariantFeatures(True, False, False),
+    "multi-memory": VariantFeatures(True, True, False),
+    "evo": VariantFeatures(True, True, True),
 }
 
 

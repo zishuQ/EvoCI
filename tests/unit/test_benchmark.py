@@ -6,8 +6,11 @@ import pytest
 
 from evoci.agents.base import AgentSuite
 from evoci.benchmark.adapters import FixtureAdapter, normalize_ci_failure
-from evoci.benchmark.execution import FailedCommandReplayVerifier, collect_metrics
-from evoci.benchmark.execution import prepare_workspace
+from evoci.benchmark.execution import (
+    FailedCommandReplayVerifier,
+    collect_metrics,
+    token_metrics_from_events,
+)
 from evoci.benchmark.manifest import generate_balanced_manifest
 from evoci.benchmark.models import (
     AgentTaskView,
@@ -25,10 +28,7 @@ from evoci.benchmark.variants import variant_features
 from evoci.config import EvoCIConfig
 from evoci.demo import (
     DemoCoordinator,
-    DemoDiagnoser,
-    DemoFixer,
     DemoInvestigator,
-    DemoReviewer,
 )
 from evoci.domain.models import (
     CIFailure,
@@ -225,7 +225,6 @@ def test_ablation_features_are_incremental() -> None:
     assert variant_features("multi").multi_agent
     assert variant_features("multi-memory").long_term_memory
     assert variant_features("evo").capabilities
-    assert variant_features("evo").curator
 
 
 @pytest.mark.asyncio
@@ -258,11 +257,8 @@ async def test_fixture_benchmark_metrics_come_from_actual_graph_run(tmp_path: Pa
     runtime = GraphRuntime(
         config=EvoCIConfig.from_env(cwd=tmp_path),
         agents=AgentSuite(
-            coordinator=DemoCoordinator(),
-            investigator=DemoInvestigator(),
-            diagnoser=DemoDiagnoser(),
-            fixer=DemoFixer(),
-            reviewer=DemoReviewer(),
+            supervisor=DemoCoordinator(),
+            worker=DemoInvestigator(),
         ),
         recorder=recorder,
     )
@@ -305,8 +301,8 @@ async def test_fixture_benchmark_metrics_come_from_actual_graph_run(tmp_path: Pa
     assert metrics.targeted_verification_passed
     assert metrics.review_passed
     assert metrics.tool_calls >= 2
-    assert metrics.workers_spawned == 3
-    assert metrics.parallel_rounds == 1
+    assert metrics.workers_spawned >= 1
+    assert metrics.parallel_rounds >= 1
 
 
 def _prepared_task(commands: list[list[str]]) -> PreparedTask:
@@ -471,6 +467,21 @@ async def test_preflight_passing_candidate_is_not_a_benchmark_oracle(
     assert metrics.final_workspace_changes.changed_files == []
 
 
+def _metrics_with_tokens(status: str, input_tokens: int, output_tokens: int = 0) -> RunMetrics:
+    return _benchmark_metrics(status).model_validate(
+        {
+            **_benchmark_metrics(status).model_dump(),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "repair_input_tokens": input_tokens,
+            "repair_output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "repair_tokens": input_tokens + output_tokens,
+            "learning_tokens": 0,
+        }
+    )
+
+
 def _benchmark_metrics(status: str) -> RunMetrics:
     verification = BenchmarkVerificationResult(
         status=status,  # type: ignore[arg-type]
@@ -581,3 +592,200 @@ async def test_benchmark_results_are_incremental_before_process_abort(
     persisted = (tmp_path / "runs.jsonl").read_text().splitlines()
     assert len(persisted) == 1
     assert json.loads(persisted[0])["task_id"] == "first"
+
+
+def _usage_event(
+    recorder: TrajectoryRecorder,
+    *,
+    run_id: str,
+    key: str,
+    input_tokens: int,
+    output_tokens: int,
+    budget_scope: str = "repair",
+    cached: int | None = None,
+    reasoning: int | None = None,
+    agent_id: str = "fixer",
+) -> None:
+    recorder.emit(
+        run_id=run_id,
+        event_type=EventType.MODEL_USAGE,
+        agent_id=agent_id,
+        invocation_id="repair:1",
+        event_key=key,
+        payload={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": cached,
+            "reasoning_tokens": reasoning,
+            "request_kind": "structured",
+            "budget_scope": budget_scope,
+        },
+    )
+
+
+def test_run_metrics_sum_all_model_usage_events() -> None:
+    recorder = TrajectoryRecorder()
+    _usage_event(recorder, run_id="r", key="u1", input_tokens=10, output_tokens=2)
+    _usage_event(recorder, run_id="r", key="u2", input_tokens=20, output_tokens=4)
+    metrics = token_metrics_from_events(recorder.events("r"))
+    assert metrics["input_tokens"] == 30
+    assert metrics["output_tokens"] == 6
+    assert metrics["total_tokens"] == 36
+    assert metrics["provider_requests"] == 2
+
+
+def test_run_metrics_separate_repair_and_learning_tokens() -> None:
+    recorder = TrajectoryRecorder()
+    _usage_event(recorder, run_id="r", key="repair", input_tokens=100, output_tokens=10)
+    _usage_event(
+        recorder,
+        run_id="r",
+        key="learn",
+        input_tokens=40,
+        output_tokens=5,
+        budget_scope="post_run",
+        agent_id="skill-miner",
+    )
+    metrics = token_metrics_from_events(recorder.events("r"))
+    assert metrics["repair_tokens"] == 110
+    assert metrics["learning_tokens"] == 45
+    assert metrics["total_tokens"] == 155
+
+
+def test_run_metrics_fall_back_to_legacy_events_only_when_usage_events_absent() -> None:
+    recorder = TrajectoryRecorder()
+    recorder.emit(
+        run_id="legacy",
+        event_type=EventType.MODEL_CALL,
+        agent_id="fixer",
+        event_key="tool-turn:1",
+        payload={"input_tokens": 12, "output_tokens": 3},
+    )
+    recorder.emit(
+        run_id="legacy",
+        event_type=EventType.MODEL_CALL,
+        agent_id="skill-miner",
+        event_key="final",
+        payload={"input_tokens": 8, "output_tokens": 2, "budget_scope": "post_run"},
+    )
+    fallback = token_metrics_from_events(recorder.events("legacy"))
+    assert fallback["input_tokens"] == 20
+    assert fallback["repair_tokens"] == 15
+    assert fallback["learning_tokens"] == 10
+    assert fallback["provider_requests"] == 0
+
+    _usage_event(recorder, run_id="legacy", key="usage-1", input_tokens=100, output_tokens=1)
+    usage_only = token_metrics_from_events(recorder.events("legacy"))
+    assert usage_only["input_tokens"] == 100
+    assert usage_only["total_tokens"] == 101
+    assert usage_only["provider_requests"] == 1
+
+
+def test_total_tokens_equal_repair_plus_learning() -> None:
+    metrics = RunMetrics(
+        agent_declared_success=True,
+        targeted_verification_passed=True,
+        review_passed=True,
+        benchmark_verification=BenchmarkVerificationResult(status="passed", details="ok"),
+        benchmark_verification_status="passed",
+        benchmark_resolved=True,
+        final_workspace_changes=FinalWorkspaceChanges(changed_files=[]),
+        wall_time=0.1,
+        input_tokens=150,
+        output_tokens=20,
+        repair_input_tokens=100,
+        repair_output_tokens=10,
+        learning_input_tokens=50,
+        learning_output_tokens=10,
+    )
+    assert metrics.total_tokens == 170
+    assert metrics.repair_tokens + metrics.learning_tokens == metrics.total_tokens
+
+
+@pytest.mark.asyncio
+async def test_tokens_per_resolved_task_includes_failed_task_spend(tmp_path: Path) -> None:
+    payloads = iter(
+        [
+            _metrics_with_tokens("passed", 80, 20),
+            _metrics_with_tokens("failed", 40, 10),
+        ]
+    )
+
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del entry, variant
+        return next(payloads)
+
+    await BenchmarkRunner(run_task).run(  # type: ignore[arg-type]
+        [
+            BenchmarkManifestEntry(task_id="ok", category="test"),
+            BenchmarkManifestEntry(task_id="bad", category="test"),
+        ],
+        variant="multi",
+        output_dir=tmp_path,
+    )
+    aggregate = json.loads((tmp_path / "aggregate.json").read_text())
+    assert aggregate["total_tokens"] == 150
+    assert aggregate["benchmark_resolved"] == 1
+    assert aggregate["tokens_per_resolved_task"] == 150
+
+
+@pytest.mark.asyncio
+async def test_median_tokens_per_task(tmp_path: Path) -> None:
+    totals = iter([10, 30, 20])
+
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del entry, variant
+        total = next(totals)
+        return _metrics_with_tokens("passed", total)
+
+    await BenchmarkRunner(run_task).run(  # type: ignore[arg-type]
+        [BenchmarkManifestEntry(task_id=str(i), category="test") for i in range(3)],
+        variant="multi",
+        output_dir=tmp_path,
+    )
+    aggregate = json.loads((tmp_path / "aggregate.json").read_text())
+    assert aggregate["median_tokens_per_task"] == 20
+
+
+@pytest.mark.asyncio
+async def test_median_tokens_per_resolved_task_uses_only_official_passes(
+    tmp_path: Path,
+) -> None:
+    payloads = iter(
+        [
+            ("passed", 10),
+            ("failed", 999),
+            ("passed", 30),
+        ]
+    )
+
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del entry, variant
+        status, total = next(payloads)
+        return _metrics_with_tokens(status, total)
+
+    await BenchmarkRunner(run_task).run(  # type: ignore[arg-type]
+        [BenchmarkManifestEntry(task_id=str(i), category="test") for i in range(3)],
+        variant="multi",
+        output_dir=tmp_path,
+    )
+    aggregate = json.loads((tmp_path / "aggregate.json").read_text())
+    assert aggregate["median_tokens_per_resolved_task"] == 20
+    assert aggregate["median_tokens_per_task"] == 30
+
+
+@pytest.mark.asyncio
+async def test_zero_resolved_tasks_produce_null_efficiency_metrics(tmp_path: Path) -> None:
+    async def run_task(entry: BenchmarkManifestEntry, variant: str) -> RunMetrics:
+        del entry, variant
+        return _metrics_with_tokens("failed", 40, 10)
+
+    await BenchmarkRunner(run_task).run(  # type: ignore[arg-type]
+        [BenchmarkManifestEntry(task_id="one", category="test")],
+        variant="multi",
+        output_dir=tmp_path,
+    )
+    aggregate = json.loads((tmp_path / "aggregate.json").read_text())
+    assert aggregate["tokens_per_resolved_task"] is None
+    assert aggregate["median_tokens_per_resolved_task"] is None
+    assert aggregate["total_tokens"] == 50
