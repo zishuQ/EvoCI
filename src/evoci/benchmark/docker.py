@@ -23,8 +23,9 @@ from evoci.benchmark.models import (
     EvalAttempt,
     PreparedTask,
 )
+from evoci.domain.models import VerificationCommandResult, VerificationResult, VerificationStatus
 from evoci.tools.policy import WorkspaceBoundary
-from evoci.tools.shell import CommandResult
+from evoci.tools.shell import CommandResult, run_cancellable
 
 _TESTBED_PATH = (
     "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:"
@@ -862,7 +863,9 @@ class DockerReplayVerifier:
             return BenchmarkPreflightResult(
                 status="not_available", details="no FAIL_TO_PASS tests in dataset"
             )
-        score = self.score_patches(phase="baseline", candidate_patch="", run_pass_to_pass=False)
+        score = await run_cancellable(
+            self.score_patches, phase="baseline", candidate_patch="", run_pass_to_pass=False
+        )
         if score.infra_reason:
             return BenchmarkPreflightResult(
                 status="infra_error",
@@ -913,7 +916,9 @@ class DockerReplayVerifier:
                 status="not_available", details=f"benchmark oracle unavailable: {preflight.details}"
             )
         try:
-            candidate = build_candidate_patch(workspace, self._base_sha, self.spec.protected_files)
+            candidate = await run_cancellable(
+                build_candidate_patch, workspace, self._base_sha, self.spec.protected_files
+            )
         except ProtectedPatchError as exc:
             return BenchmarkVerificationResult(
                 status="infra_error",
@@ -926,7 +931,9 @@ class DockerReplayVerifier:
                 details=f"candidate patch could not be built: {exc}",
                 failure_class="infra",
             )
-        score = self.score_patches(phase="final", candidate_patch=candidate, run_pass_to_pass=True)
+        score = await run_cancellable(
+            self.score_patches, phase="final", candidate_patch=candidate, run_pass_to_pass=True
+        )
         if score.infra_reason:
             return BenchmarkVerificationResult(
                 status="infra_error",
@@ -957,6 +964,54 @@ class DockerReplayVerifier:
             ftp_results=score.ftp_results,
             ptp_results=score.ptp_results,
             attempts=score.attempts,
+        )
+
+    async def verify_candidate(
+        self, task: PreparedTask, workspace: Path, preflight: BenchmarkPreflightResult
+    ) -> VerificationResult:
+        """Run the official tests on this candidate and return bounded feedback."""
+
+        official = await self.verify(task, workspace, preflight)
+        tests = [
+            item
+            for item in official.commands
+            if item.command[:3] == ["python", "-m", "pytest"]
+            or item.command[:2] == ["python", "tests/runtests.py"]
+        ]
+        commands = [
+            VerificationCommandResult(
+                command=item.command,
+                exit_code=item.exit_code,
+                stdout=item.stdout[-4000:],
+                stderr=item.stderr[-4000:],
+                timed_out=item.timed_out,
+                source="mandatory",
+            )
+            for item in tests
+        ]
+        failure = next(
+            (item for item in reversed(tests) if item.exit_code != 0 or item.timed_out),
+            None,
+        )
+        excerpt = (failure.stderr or failure.stdout)[-4000:] if failure else ""
+        reason = f"{official.details}\n{excerpt}".strip() if official.status != "passed" else None
+        status: VerificationStatus
+        if official.status == "passed":
+            status = "passed"
+        elif official.status == "failed":
+            status = "failed"
+        elif official.status == "infra_error":
+            status = "infra_error"
+        else:
+            status = "unavailable"
+        return VerificationResult(
+            passed=official.status == "passed",
+            status=status,
+            commands=commands,
+            expected_count=len(commands),
+            executed_count=len(commands),
+            incomplete_reason=reason,
+            oracle_source="harness" if status != "unavailable" else "none",
         )
 
     def close(self) -> None:
@@ -998,6 +1053,17 @@ class DockerReplayVerifier:
         cwd: str = ".",
         network: bool = False,
         workspace_root: Path | None = None,
+    ) -> CommandResult:
+        return await run_cancellable(
+            self._execute_agent_command_sync, command, cwd, network, workspace_root
+        )
+
+    def _execute_agent_command_sync(
+        self,
+        command: list[str],
+        cwd: str,
+        network: bool,
+        workspace_root: Path | None,
     ) -> CommandResult:
         del network
         if workspace_root is None:

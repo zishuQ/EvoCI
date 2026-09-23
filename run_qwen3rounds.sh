@@ -13,6 +13,7 @@ export EVO_WORKER_REASONING_EFFORT=medium
 export PYTHONUNBUFFERED=1
 
 CAMPAIGN_DIR="${CAMPAIGN_DIR:-results/evo-campaign-qwen38-single-worker-c13-v2}"
+TASK_PARALLELISM="${TASK_PARALLELISM:-1}"
 DATASET="campaign13-python-behavior/prepared/dataset.jsonl"
 
 mkdir -p "$CAMPAIGN_DIR"
@@ -28,7 +29,7 @@ for ROUND in 1 2 3; do
     --round "$ROUND" \
     --freeze-learning-within-round \
     --docker-official-images \
-    --parallelism 1 \
+    --parallelism "$TASK_PARALLELISM" \
     2>&1 | tee "$CAMPAIGN_DIR/round-${ROUND}.log"
 
   status=${PIPESTATUS[0]}

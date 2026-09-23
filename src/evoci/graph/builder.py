@@ -13,6 +13,8 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from evoci.agents.base import AgentSuite, SupervisorContext, WorkerContext
+from evoci.benchmark.docker import DockerReplayVerifier, build_test_command, is_django_node
+from evoci.benchmark.models import BenchmarkPreflightResult, PreparedTask
 from evoci.capability.materializer import CapabilityMaterializer
 from evoci.capability.miner import SkillMining
 from evoci.capability.registry import CapabilityRegistry
@@ -24,6 +26,7 @@ from evoci.domain.models import (
     SkillCatalogEntry,
     SkillRef,
     SupervisorDecision,
+    VerificationResult,
     WorkerExecutionResult,
     WorkerTask,
 )
@@ -95,6 +98,9 @@ class GraphRuntime:
     recorder: TrajectoryRecorder | None = None
     budget_manager: RunBudgetManager | None = None
     defer_success_learning: bool = False
+    official_verifier: DockerReplayVerifier | None = None
+    official_preflight: BenchmarkPreflightResult | None = None
+    official_task: PreparedTask | None = None
 
 
 def _event(
@@ -236,7 +242,13 @@ def _caused_by_timeout(exc: BaseException) -> bool:
         if marker in seen:
             continue
         seen.add(marker)
-        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.lower():
+        response = getattr(current, "response", None)
+        if (
+            isinstance(current, TimeoutError)
+            or "timeout" in type(current).__name__.lower()
+            or getattr(current, "status_code", None) == 524
+            or getattr(response, "status_code", None) == 524
+        ):
             return True
         if current.__cause__ is not None:
             pending.append(current.__cause__)
@@ -978,7 +990,27 @@ def build_graph(
     async def verify(state: EvoCIState) -> dict[str, Any]:
         output = state.get("fixer_output")
         supplementary = output.proposal.verification_plan if output is not None else []
-        planned = build_verification_plan(state["ci_failure"].failed_commands, supplementary)
+        official = runtime.official_verifier
+        if official is not None:
+            ftp = official.spec.fail_to_pass
+            ptp = official.spec.pass_to_pass
+            django = all(is_django_node(node) for node in ftp)
+            if django and ptp:
+                planned_commands = [
+                    {"argv": build_test_command([*ftp, *ptp]), "cwd": "."}
+                ]
+            else:
+                junit_xml = None if django else "/tmp/evoci-junit.xml"
+                planned_commands = [
+                    {"argv": build_test_command(ftp, junit_xml=junit_xml), "cwd": "."}
+                ]
+                if ptp:
+                    planned_commands.append(
+                        {"argv": build_test_command(ptp, junit_xml=junit_xml), "cwd": "."}
+                    )
+        else:
+            planned = build_verification_plan(state["ci_failure"].failed_commands, supplementary)
+            planned_commands = [{"argv": item.command, "cwd": item.cwd} for item in planned]
         batch = state.get("supervisor_batch", 0)
         events = [
             _event(
@@ -987,11 +1019,15 @@ def build_graph(
                 EventType.VERIFICATION_STARTED,
                 discriminator=str(batch),
                 payload={
-                    "commands": [
-                        {"argv": item.command, "cwd": item.cwd} for item in planned
-                    ],
+                    "commands": planned_commands,
                     "oracle_source": (
-                        "harness" if any(item.source == "mandatory" for item in planned) else "none"
+                        "official_image"
+                        if official is not None
+                        else (
+                            "harness"
+                            if any(item.source == "mandatory" for item in planned)
+                            else "none"
+                        )
                     ),
                     "snapshot_id": workspace_snapshot_id(Path(state["workspace_path"])),
                 },
@@ -1001,7 +1037,7 @@ def build_graph(
 
         async def on_command_start(index: int, command: list[str], source: str) -> None:
             del source
-            cwd = planned[index].cwd if index < len(planned) else "."
+            cwd = planned[index].cwd if official is None and index < len(planned) else "."
             events.append(
                 _event(
                     runtime,
@@ -1042,17 +1078,71 @@ def build_graph(
         assert runtime.budget_manager is not None
         snapshot_id = workspace_snapshot_id(Path(state["workspace_path"]))
         try:
-            verification = await VerificationService(
-                timeout=config.command_timeout_seconds,
-                max_chars=config.output_limit_chars,
-            ).run(
-                workspace=Path(state["workspace_path"]),
-                mandatory=state["ci_failure"].failed_commands,
-                supplementary=supplementary,
-                budget=runtime.budget_manager.for_run(state["run_id"]),
-                on_command_start=on_command_start,
-                on_command_done=on_command_done,
-            )
+            if official is not None:
+                assert runtime.official_preflight is not None
+                assert runtime.official_task is not None
+                try:
+                    runtime.budget_manager.for_run(state["run_id"]).consume_tool_call()
+                except RepairBudgetExhausted as exc:
+                    verification = VerificationResult(
+                        passed=False,
+                        status="incomplete",
+                        commands=[],
+                        expected_count=1,
+                        executed_count=0,
+                        incomplete_reason=str(exc),
+                        incomplete_cause="budget",
+                    )
+                else:
+                    call_id = f"verify:{batch}:official"
+                    events.append(
+                        _event(
+                            runtime,
+                            state,
+                            EventType.TOOL_CALL,
+                            agent_id="harness",
+                            discriminator=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "tool_name": "verify_official_candidate",
+                                "arguments": {"commands": planned_commands},
+                            },
+                        )
+                    )
+                    verification = await official.verify_candidate(
+                        runtime.official_task,
+                        Path(state["workspace_path"]),
+                        runtime.official_preflight,
+                    )
+                    events.append(
+                        _event(
+                            runtime,
+                            state,
+                            EventType.TOOL_RESULT,
+                            agent_id="harness",
+                            discriminator=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "tool_name": "verify_official_candidate",
+                                "source": "official_image",
+                                "success": verification.passed,
+                                "error": verification.incomplete_reason,
+                                "duration_seconds": monotonic() - started_at,
+                            },
+                        )
+                    )
+            else:
+                verification = await VerificationService(
+                    timeout=config.command_timeout_seconds,
+                    max_chars=config.output_limit_chars,
+                ).run(
+                    workspace=Path(state["workspace_path"]),
+                    mandatory=state["ci_failure"].failed_commands,
+                    supplementary=supplementary,
+                    budget=runtime.budget_manager.for_run(state["run_id"]),
+                    on_command_start=on_command_start,
+                    on_command_done=on_command_done,
+                )
         except BaseException:
             snapshot = state.get("batch_snapshot_path")
             if snapshot:

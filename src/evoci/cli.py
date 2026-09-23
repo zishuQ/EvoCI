@@ -7,7 +7,7 @@ import json
 import shutil
 import sqlite3
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Literal, cast
@@ -636,10 +636,11 @@ async def _drive_graph_automated(
     resources: LiveResources,
     initial: dict[str, object],
     run_id: str,
+    runtime: GraphRuntime | None = None,
 ) -> dict[str, Any]:
     """Drive benchmark interrupts deterministically without interactive input."""
 
-    graph = build_graph(resources.runtime, checkpointer=resources.checkpoint.saver)
+    graph = build_graph(runtime or resources.runtime, checkpointer=resources.checkpoint.saver)
     invocation_config: RunnableConfig = {"configurable": {"thread_id": run_id}}
     result = cast(dict[str, Any], await graph.ainvoke(cast(Any, initial), invocation_config))
     while "__interrupt__" in result:
@@ -1468,7 +1469,19 @@ def benchmark_run(
                 if selected_variant == "single":
                     result = await _drive_single(resources, initial)
                 else:
-                    result = await _drive_graph_automated(resources, initial, run_id)
+                    task_runtime = (
+                        replace(
+                            resources.runtime,
+                            official_verifier=verifier,
+                            official_preflight=benchmark_preflight,
+                            official_task=prepared,
+                        )
+                        if isinstance(verifier, DockerReplayVerifier)
+                        else resources.runtime
+                    )
+                    result = await _drive_graph_automated(
+                        resources, initial, run_id, runtime=task_runtime
+                    )
                 elapsed = monotonic() - started
                 truth = adapter.ground_truth(entry.task_id)
                 registry_size = len(resources.registry.list()) if features.capabilities else 0
