@@ -10,9 +10,13 @@ EvoCI keeps three layers distinct:
 
 Long-term facts are strictly scoped to the current repository. The model cannot choose a namespace;
 the harness binds each fact to `RepoSpec.full_name`. Workflows belong in Skills, not long-term
-memory. Retrieval asks for same-repository episodes and repository facts, then enforces a
-6,000-character context budget. Retrieved, selected, and actually used identifiers remain distinct
-telemetry.
+memory. Retrieval selects current-repository facts first, then same-repository episodes with
+a matching failure fingerprint, followed by broader Episode matches. Broader matches can include
+other repositories; their namespace stays visible. Supervisor and Worker receive brief entries within
+a 10,000-character catalog budget. They can call `read_memory` by an ID visible to that invocation
+to inspect complete content in bounded pages; Worker only sees IDs forwarded in `fact_refs`.
+Reading an entry is a tool call, not a claim of use. Retrieved, selected, and actually used identifiers
+remain distinct telemetry.
 
 Only the post-run consolidator may commit a long-term fact. Model output is a typed
 `LongTermFactCandidate`; the harness validates content and performs an idempotent commit derived

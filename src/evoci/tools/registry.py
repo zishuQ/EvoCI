@@ -22,6 +22,7 @@ from evoci.tools.shell import CommandRunner, run_cancellable
 
 if TYPE_CHECKING:
     from evoci.capability.registry import CapabilityRegistry
+    from evoci.memory.store import MemoryStore
 
 
 class ReadFileArgs(BaseModel):
@@ -29,6 +30,13 @@ class ReadFileArgs(BaseModel):
     path: str
     offset: int = Field(default=0, ge=0)
     limit: int | None = Field(default=None, ge=1, le=32_000)
+
+
+class ReadMemoryArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    memory_id: str
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=8_000, ge=1, le=8_000)
 
 
 class ListFilesArgs(BaseModel):
@@ -275,6 +283,9 @@ def create_worker_registry(
     max_chars: int = 32_000,
     capability_registry: CapabilityRegistry | None = None,
     allowed_skill_refs: set[str] | None = None,
+    memory_store: MemoryStore | None = None,
+    allowed_memory_refs: dict[str, str] | None = None,
+    memory_repository: str | None = None,
     tool_allowlist: set[str] | None = None,
     write_scope: list[str] | tuple[str, ...] | None = None,
 ) -> ToolRegistry:
@@ -322,6 +333,37 @@ def create_worker_registry(
         if capabilities.write_files:
             invalidate_snapshots()
         return result
+
+    if memory_store is not None:
+        visible_memories = dict(allowed_memory_refs or {})
+
+        def read_memory(memory_id: str, offset: int = 0, limit: int = 8_000) -> dict[str, Any]:
+            if memory_id not in visible_memories:
+                raise PolicyViolation("memory is not available to this agent invocation")
+            if not memory_repository:
+                raise PolicyViolation("memory repository is missing")
+            hit = memory_store.get_memory_hit(memory_id, repository=memory_repository)
+            if hit is None or hit.namespace != visible_memories[memory_id]:
+                raise PolicyViolation("memory is unavailable or has changed since retrieval")
+            end = min(offset + limit, len(hit.content))
+            return {
+                "memory_id": memory_id,
+                "namespace": hit.namespace,
+                "content": hit.content[offset:end],
+                "total_chars": len(hit.content),
+                "next_offset": end if end < len(hit.content) else None,
+            }
+
+        registry.register(
+            "read_memory",
+            "read_files",
+            read_memory,
+            description=(
+                "Read the full Episode or repository memory for a memory_id in this "
+                "invocation's catalog. Use offset and limit for longer entries."
+            ),
+            args_model=ReadMemoryArgs,
+        )
 
     registry.register(
         "read_file",

@@ -8,6 +8,8 @@ from evoci.memory.fingerprint import failure_fingerprint
 from evoci.memory.models import Episode, LongTermFactCandidate, LongTermMemory
 from evoci.memory.retrieval import MemoryRetriever
 from evoci.memory.store import SQLiteMemoryStore
+from evoci.tools.policy import SUPERVISOR_CAPABILITIES, PolicyViolation
+from evoci.tools.registry import create_worker_registry
 
 
 def test_long_term_memory_is_repository_scoped(tmp_path: Path) -> None:
@@ -414,3 +416,118 @@ def test_legacy_memory_schema_requires_fresh_state(tmp_path: Path) -> None:
     connection.close()
     with pytest.raises(LegacyLearningStateError, match=LEGACY_LEARNING_STATE_MESSAGE):
         SQLiteMemoryStore(path)
+
+
+def test_repository_fact_precedes_brief_episode_and_full_text_is_preserved(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    repo = RepoSpec(owner="org", name="a")
+    failure = CIFailure(
+        summary="pytest import fails",
+        log_excerpt="pytest import error",
+        task_family="test",
+    )
+    fact = "pytest imports require src on PYTHONPATH " + "and a local path " * 30
+    store.add_long_term(
+        LongTermMemory(
+            id="fact-a",
+            repository=repo.full_name,
+            content=fact,
+            confidence=0.9,
+            source_run_ids=["prior-run"],
+        )
+    )
+    detail = "pytest import error " * 150
+    store.add_episode(
+        Episode(
+            id="episode:prior-run",
+            run_id="prior-run",
+            repo=repo.full_name,
+            task_family="test",
+            failure_summary=failure.summary,
+            failure_reason=detail,
+            success=False,
+            attempts=1,
+            failure_fingerprint=failure_fingerprint(repo, failure),
+        )
+    )
+    catalog = MemoryRetriever(store).retrieve(repo, failure)
+    assert [hit.memory_id for hit in catalog.hits][:2] == ["fact-a", "episode:prior-run"]
+    assert catalog.hits[0].content.startswith("FACT=")
+    assert len(catalog.hits[1].content) < 600
+    assert "OUTCOME=failed" in catalog.hits[1].content
+    assert "FAILURE_REASON=" in catalog.hits[1].content
+    assert catalog.telemetry.context_chars <= 10_000
+    full_fact = store.get_memory_hit("fact-a", repository=repo.full_name)
+    assert full_fact is not None and full_fact.content == fact
+    full_episode = store.get_memory_hit("episode:prior-run", repository=repo.full_name)
+    assert full_episode is not None
+    assert full_episode.content.count("pytest import error") >= 150
+    store.close()
+
+
+def test_read_memory_pages_only_invocation_visible_ids(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite")
+    store.add_long_term(
+        LongTermMemory(
+            id="fact-a",
+            repository="org/a",
+            content="pytest import requires src on PYTHONPATH " * 20,
+            confidence=0.9,
+            source_run_ids=["run-a"],
+        )
+    )
+    store.add_long_term(
+        LongTermMemory(
+            id="fact-b",
+            repository="org/b",
+            content="pytest import requires a separate layout",
+            confidence=0.9,
+            source_run_ids=["run-b"],
+        )
+    )
+    store.add_episode(
+        Episode(
+            id="episode:run-b",
+            run_id="run-b",
+            repo="org/b",
+            task_family="test",
+            failure_summary="pytest import fails",
+            success=False,
+            attempts=1,
+        )
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tools = create_worker_registry(
+        SUPERVISOR_CAPABILITIES,
+        workspace,
+        memory_store=store,
+        allowed_memory_refs={"fact-a": "repo:org/a", "episode:run-b": "episode:org/b"},
+        memory_repository="org/a",
+        tool_allowlist={"read_memory"},
+    )
+    try:
+        first = tools.invoke("read_memory", memory_id="fact-a", limit=32)
+        assert first["content"] == ("pytest import requires src on PYTHONPATH " * 20)[:32]
+        assert first["next_offset"] == 32
+        rest = tools.invoke("read_memory", memory_id="fact-a", offset=32)
+        full_fact = store.get_memory_hit("fact-a", repository="org/a")
+        assert full_fact is not None
+        assert first["content"] + rest["content"] == full_fact.content
+        assert rest["next_offset"] is None
+        assert tools.invoke("read_memory", memory_id="episode:run-b")["namespace"] == (
+            "episode:org/b"
+        )
+        with pytest.raises(PolicyViolation, match="not available"):
+            tools.invoke("read_memory", memory_id="fact-b")
+        with pytest.raises(PolicyViolation, match="not available"):
+            tools.invoke("read_memory", memory_id="episode:run-a")
+        assert store.get_memory_hit("fact-a", repository="org/b") is None
+        store.archive("fact-a")
+        with pytest.raises(PolicyViolation, match="unavailable"):
+            tools.invoke("read_memory", memory_id="fact-a")
+    finally:
+        tools.close()
+        store.close()

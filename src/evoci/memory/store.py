@@ -19,6 +19,8 @@ class MemoryStore(Protocol):
 
     def get_episode(self, run_id: str) -> Episode | None: ...
 
+    def get_memory_hit(self, memory_id: str, *, repository: str) -> MemoryHit | None: ...
+
     def add_long_term(
         self, memory: LongTermMemory, *, operation_key: str | None = None
     ) -> bool: ...
@@ -296,6 +298,29 @@ class SQLiteMemoryStore:
         if row is None:
             return None
         return _episode_from_row(row)
+
+    def get_memory_hit(self, memory_id: str, *, repository: str) -> MemoryHit | None:
+        """Fetch a catalog entry's full text from the current generation."""
+        if not repository:
+            return None
+        if memory_id.startswith("episode:"):
+            row = self._connection.execute(
+                "SELECT * FROM episodes WHERE id = ?", (memory_id,)
+            ).fetchone()
+            return self._hit_from_episode_row(row) if row is not None else None
+        row = self._connection.execute(
+            "SELECT id, repository, content FROM long_term_memories "
+            "WHERE id = ? AND repository = ? AND archived = 0",
+            (memory_id, repository),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryHit(
+            memory_id=str(row["id"]),
+            namespace=f"repo:{row['repository']}",
+            content=str(row["content"]),
+            score=1.0,
+        )
 
     def operation_result(self, operation_key: str) -> dict[str, object] | None:
         row = self._connection.execute(

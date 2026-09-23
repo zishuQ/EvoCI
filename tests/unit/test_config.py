@@ -16,6 +16,15 @@ def test_config_reads_only_evoci_environment(monkeypatch, tmp_path: Path) -> Non
     assert "codex" not in str(config.state_dir).lower()
 
 
+def test_memory_catalog_budget_defaults_to_10000_and_reads_env(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("EVO_MEMORY_CONTEXT_LIMIT_CHARS", raising=False)
+    assert EvoCIConfig.from_env(cwd=tmp_path).memory_context_limit_chars == 10_000
+    monkeypatch.setenv("EVO_MEMORY_CONTEXT_LIMIT_CHARS", "12000")
+    assert EvoCIConfig.from_env(cwd=tmp_path).memory_context_limit_chars == 12_000
+
+
 def test_config_creates_runtime_directories(tmp_path: Path) -> None:
     config = EvoCIConfig.from_env(cwd=tmp_path)
     config.ensure_directories()

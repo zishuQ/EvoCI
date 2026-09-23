@@ -28,6 +28,7 @@ from evoci.graph.integration import (
     integrate_edits,
     load_patch_artifact,
 )
+from evoci.memory.store import MemoryStore
 from evoci.model.gateway import ModelGatewayError, ToolLoopGateway
 from evoci.runtime.budget import (
     FINALIZATION_MODEL_CALLS,
@@ -87,6 +88,10 @@ def _validated_usage[OutputT: BaseModel](
 
 def _tool_context_prompt() -> str:
     return (
+        "Memory entries in the task context are brief previews. If a memory "
+        "is relevant, call read_memory with its memory_id for full evidence. "
+        "Failure Episodes are counterevidence, and unverified hypotheses are not facts. "
+        "Reading a memory does not mean it was used in the final decision. "
         "Available skill summaries are listed in the task context. "
         "If a skill directly applies, call load_skill with its skill_id before using "
         "its procedure, resources, or scripts. You may choose to load no skill. "
@@ -107,6 +112,7 @@ class ModelSupervisor:
         recorder: TrajectoryRecorder | None = None,
         *,
         capability_registry: CapabilityRegistry | None = None,
+        memory_store: MemoryStore | None = None,
         max_iterations: int = 8,
         max_tool_calls: int = 16,
         timeout: float = 120.0,
@@ -123,6 +129,7 @@ class ModelSupervisor:
         )
         self.recorder = recorder
         self.capability_registry = capability_registry
+        self.memory_store = memory_store
         self.timeout = timeout
         self.max_chars = max_chars
         self.budget_manager = budget_manager
@@ -159,8 +166,12 @@ class ModelSupervisor:
             max_chars=self.max_chars,
             capability_registry=self.capability_registry,
             allowed_skill_refs={skill.skill_id for skill in context.skills},
+            memory_store=self.memory_store,
+            allowed_memory_refs={memory.memory_id: memory.namespace for memory in context.memories},
+            memory_repository=context.repo.full_name,
             tool_allowlist={
                 "read_file",
+                "read_memory",
                 "list_files",
                 "search_code",
                 "git_status",
@@ -203,6 +214,7 @@ class ModelWorker:
         recorder: TrajectoryRecorder,
         *,
         capability_registry: CapabilityRegistry | None = None,
+        memory_store: MemoryStore | None = None,
         max_iterations: int = 8,
         max_tool_calls: int = 16,
         timeout: float = 120.0,
@@ -217,6 +229,7 @@ class ModelWorker:
             budget_manager=budget_manager,
         )
         self.capability_registry = capability_registry
+        self.memory_store = memory_store
         self.timeout = timeout
         self.max_chars = max_chars
         self.max_iterations = max_iterations
@@ -525,6 +538,11 @@ class ModelWorker:
                 max_chars=self.max_chars,
                 capability_registry=self.capability_registry,
                 allowed_skill_refs={skill.skill_id for skill in context.recommended_skills},
+                memory_store=self.memory_store,
+                allowed_memory_refs={
+                    memory.memory_id: memory.namespace for memory in context.memories
+                },
+                memory_repository=context.repo.full_name,
                 write_scope=write_scope,
             )
             system = (

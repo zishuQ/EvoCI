@@ -104,7 +104,7 @@ class EvoCIConfig(BaseModel):
     model_timeout_seconds: float = Field(default=120.0, gt=0)
     command_timeout_seconds: float = Field(default=120.0, gt=0)
     output_limit_chars: int = Field(default=32_000, ge=1_000)
-    memory_context_limit_chars: int = Field(default=6_000, ge=1_000)
+    memory_context_limit_chars: int = Field(default=10_000, ge=1_000)
     max_supervisor_batches: int = Field(default=3, ge=1, le=8)
     max_leaf_iterations: int = Field(default=15, ge=1, le=20)
     max_leaf_tool_calls: int = Field(default=30, ge=1, le=50)
@@ -179,6 +179,9 @@ class EvoCIConfig(BaseModel):
             max_leaf_tool_calls=int(os.environ.get("EVO_MAX_LEAF_TOOL_CALLS", "30")),
             max_run_model_calls=int(os.environ.get("EVO_MAX_RUN_MODEL_CALLS", "256")),
             max_run_tool_calls=int(os.environ.get("EVO_MAX_RUN_TOOL_CALLS", "320")),
+            memory_context_limit_chars=int(
+                os.environ.get("EVO_MEMORY_CONTEXT_LIMIT_CHARS", "10000")
+            ),
             capability_retrieval_top_k=int(os.environ.get("EVO_CAPABILITY_RETRIEVAL_TOP_K", "2")),
             skill_catalog_limit_chars=int(
                 os.environ.get("EVO_SKILL_CATALOG_LIMIT_CHARS", "8000")
