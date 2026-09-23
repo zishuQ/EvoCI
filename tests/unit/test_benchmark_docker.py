@@ -9,6 +9,7 @@ from evoci.benchmark.adapters import CIRepairBenchAdapter
 from evoci.benchmark.docker import (
     DockerImageManager,
     DockerReplayVerifier,
+    PatchApplyError,
     ProtectedPatchError,
     build_candidate_patch,
     build_test_command,
@@ -679,6 +680,27 @@ async def test_image_generated_testbed_file_is_not_covered_by_host_mount(
         ],
     )
     assert "from-image" in output
+    verifier.close()
+
+
+@pytest.mark.asyncio
+async def test_work_container_defers_image_baseline_conflicts_to_patch_sync(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    _init_repo(host)
+    overlay = tmp_path / "image-testbed"
+    fake = OverlayDocker(overlay, {"src.py": "VALUE = different\n"})
+    verifier = DockerReplayVerifier(_spec(), "swebench/test@sha256:abc", cli=fake)
+    fake.patch_apply_fail = True
+    verifier.protect(host)
+    verifier.start_work_container(host)
+    FileTools(host, writable=True).replace_text("src.py", "VALUE = 1", "VALUE = 2")
+
+    with pytest.raises(PatchApplyError, match="patch apply failed"):
+        verifier._sync_workspace_into_container(host)
+
     verifier.close()
 
 

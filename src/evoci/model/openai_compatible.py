@@ -269,6 +269,14 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise json.JSONDecodeError("model response did not contain a complete JSON object", text, 0)
 
 
+def _exception_detail(exc: BaseException | None) -> str:
+    if exc is None:
+        return "unknown error"
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
+
+
 class OpenAICompatibleGateway:
     """Call a user-configured OpenAI-compatible endpoint with structured output."""
 
@@ -423,7 +431,8 @@ class OpenAICompatibleGateway:
             except ModelGatewayError:
                 raise
         raise ModelGatewayError(
-            f"model call failed after {self._max_attempts} attempts: {last_error}"
+            "model call failed after "
+            f"{self._max_attempts} attempts: {_exception_detail(last_error)}"
         ) from last_error
 
     async def _plain_json(

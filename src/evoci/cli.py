@@ -62,7 +62,7 @@ from evoci.domain.models import (
 from evoci.graph.builder import GraphRuntime, build_graph
 from evoci.graph.integration import fixer_output_from_edits
 from evoci.graph.outcome import persist_run_outcome
-from evoci.graph.routing import contains_review_bypass, contains_workspace_review_bypass
+from evoci.graph.routing import contains_workspace_review_bypass
 from evoci.local_task import inspect_repository, parse_verification_command, prepare_local_task
 from evoci.memory.consolidation import ModelMemoryConsolidator
 from evoci.memory.retrieval import MemoryRetriever
@@ -714,12 +714,6 @@ async def _drive_single(
         except RepairBudgetExhausted as exc:
             failure_reason = str(exc)
             break
-
-        blockers = contains_review_bypass(output)
-        if blockers:
-            previous_summary = "; ".join(blockers)
-            failure_reason = previous_summary
-            continue
 
         baseline = snapshot_edit_baseline(workspace, output.edits)
         written = recover_attempt_writes(workspace, output.edits)

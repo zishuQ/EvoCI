@@ -602,8 +602,16 @@ class DockerReplayVerifier:
         self._eval_containers.remove(name)
         self._work_containers.append(name)
         head = self._exec(name, ["git", "-C", "/testbed", "rev-parse", "HEAD"])
-        if head.exit_code == 0 and head.stdout.strip():
-            self._container_base_sha = head.stdout.strip()
+        container_head = head.stdout.strip() if head.exit_code == 0 else ""
+        if not container_head:
+            self._remove(name)
+            raise DockerError("work container /testbed has no readable Git HEAD")
+
+        # The official image may intentionally contain tracked build-time
+        # differences or image-only files. Keep its Git HEAD as the executable
+        # baseline; every agent command restores this revision and atomically
+        # applies the host candidate patch before execution.
+        self._container_base_sha = container_head
         return name
 
     def _remove(self, name: str) -> None:

@@ -15,6 +15,7 @@ from evoci.model.gateway import ModelGatewayError, ToolCallRequest, ToolDefiniti
 from evoci.model.openai_compatible import (
     _MAX_STRUCTURED_CORRECTIONS,
     OpenAICompatibleGateway,
+    _exception_detail,
     _extract_json_object,
     _inject_reasoning_into_payload,
     _reasoning_from_completion,
@@ -55,6 +56,10 @@ async def test_retry_recovers_from_openai_connection_error(monkeypatch) -> None:
     retry_operation: Callable[[], Awaitable[str]] = operation
     assert await gateway._retry(retry_operation) == "recovered"
     assert attempts == 2
+
+
+def test_empty_timeout_error_keeps_structured_detail() -> None:
+    assert _exception_detail(TimeoutError()) == "TimeoutError"
 
 
 def _config(

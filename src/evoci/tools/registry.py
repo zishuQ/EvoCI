@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 class ReadFileArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str
+    offset: int = Field(default=0, ge=0)
+    limit: int | None = Field(default=None, ge=1, le=32_000)
 
 
 class ListFilesArgs(BaseModel):
@@ -325,7 +327,10 @@ def create_worker_registry(
         "read_file",
         "read_files",
         file_tools.read_file,
-        description="Read a UTF-8 text file inside the workspace.",
+        description=(
+            "Read a UTF-8 text file inside the workspace. Use offset and limit "
+            "to page through large files."
+        ),
         args_model=ReadFileArgs,
     )
     registry.register(

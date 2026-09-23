@@ -161,6 +161,69 @@ async def test_leaf_tool_loop_executes_real_tool_and_projects_events(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_large_tool_result_is_projected_and_can_be_read_on_demand(
+    tmp_path: Path,
+) -> None:
+    content = "".join(str(index % 10) for index in range(25_000))
+    (tmp_path / "large.txt").write_text(content)
+    gateway = ScriptedToolGateway(
+        [
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="read-1",
+                        name="read_file",
+                        arguments={"path": "large.txt"},
+                    )
+                ]
+            ),
+            ToolModelResponse(
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="read-more-1",
+                        name="read_tool_result",
+                        arguments={"result_id": "read-1", "offset": 12_000, "limit": 200},
+                    )
+                ]
+            ),
+            ToolModelResponse(content="enough evidence"),
+        ],
+        worker_result(),
+    )
+    recorder = TrajectoryRecorder()
+    loop = BoundedToolAgent(gateway, recorder, max_iterations=4, max_tool_calls=4)
+
+    await loop.run(
+        run_id="large-result-run",
+        agent_id="investigator:inspect",
+        invocation_id="investigation:large",
+        system_prompt="Inspect the fixture.",
+        task_prompt="Read large.txt.",
+        tools=create_worker_registry(INVESTIGATOR_CAPABILITIES, tmp_path),
+        output_schema=WorkerResult,
+    )
+
+    projected = json.loads(gateway.messages_seen[1][-1].content)
+    assert projected["result"]["projected"] is True
+    assert projected["result"]["result_id"] == "read-1"
+    assert projected["result"]["total_chars"] > 25_000
+    assert len(gateway.messages_seen[1][-1].content) < 13_000
+
+    chunk = json.loads(gateway.messages_seen[2][-1].content)["result"]
+    assert chunk["result_id"] == "read-1"
+    assert chunk["offset"] == 12_000
+    assert len(chunk["content"]) == 200
+    assert chunk["next_offset"] == 12_200
+
+    original = next(
+        event
+        for event in recorder.events("large-result-run")
+        if event.type == EventType.TOOL_RESULT and event.payload["call_id"] == "read-1"
+    )
+    assert original.payload["result"] == content
+
+
+@pytest.mark.asyncio
 async def test_leaf_invocation_ids_preserve_repeated_fixer_and_reviewer_turns(
     tmp_path: Path,
 ) -> None:

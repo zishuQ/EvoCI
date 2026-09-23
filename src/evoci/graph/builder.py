@@ -21,6 +21,7 @@ from evoci.config import EvoCIConfig
 from evoci.domain.models import (
     FailedCandidateRef,
     ReviewResult,
+    SkillCatalogEntry,
     SkillRef,
     SupervisorDecision,
     WorkerExecutionResult,
@@ -44,11 +45,7 @@ from evoci.graph.outcome import (
     persist_run_outcome,
     resolve_failure_class,
 )
-from evoci.graph.routing import (
-    contains_review_bypass,
-    contains_workspace_review_bypass,
-    requires_approval,
-)
+from evoci.graph.routing import contains_workspace_review_bypass, requires_approval
 from evoci.graph.scheduler import TaskScheduleError, validate_single_task
 from evoci.graph.state import ORCHESTRATION_SCHEMA_VERSION, EvoCIState, LegacyOrchestrationError
 from evoci.memory.consolidation import MemoryConsolidator
@@ -115,6 +112,25 @@ def _operation_key(state: EvoCIState, key_type: str, *components: str) -> str:
     return f"{prefix}:{suffix}" if suffix else prefix
 
 
+def _coerce_skill_catalog(raw: object) -> list[SkillCatalogEntry]:
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise LegacyOrchestrationError("malformed checkpoint skill_catalog")
+    catalog: list[SkillCatalogEntry] = []
+    for item in raw:
+        if isinstance(item, SkillCatalogEntry):
+            catalog.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise LegacyOrchestrationError("malformed checkpoint skill_catalog")
+        try:
+            catalog.append(SkillCatalogEntry.model_validate(item))
+        except ValueError as exc:
+            raise LegacyOrchestrationError("malformed checkpoint skill_catalog") from exc
+    return catalog
+
+
 def _slice_memories(state: EvoCIState, task: WorkerTask) -> list[Any]:
     retrieved = state.get("retrieved_memories", [])
     if not task.fact_refs:
@@ -124,7 +140,7 @@ def _slice_memories(state: EvoCIState, task: WorkerTask) -> list[Any]:
 
 
 def _slice_skills(state: EvoCIState, task: WorkerTask) -> list[Any]:
-    catalog = state.get("skill_catalog", [])
+    catalog = _coerce_skill_catalog(state.get("skill_catalog"))
     allowed = {ref.skill_id for ref in task.recommended_skill_refs}
     return [skill for skill in catalog if skill.skill_id in allowed]
 
@@ -209,6 +225,26 @@ def _formal_success(state: EvoCIState) -> bool:
     )
 
 
+def _caused_by_timeout(exc: BaseException) -> bool:
+    """Recognize provider timeout failures without depending on message wording."""
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.lower():
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
 def build_graph(
     runtime: GraphRuntime,
     *,
@@ -266,7 +302,7 @@ def build_graph(
             "worker_results": [],
             "retrieved_memories": state.get("retrieved_memories", []),
             "retrieved_skills": [],
-            "skill_catalog": state.get("skill_catalog", []),
+            "skill_catalog": _coerce_skill_catalog(state.get("skill_catalog")),
             "selected_memory_ids": [],
             "used_memory_ids": [],
             "selected_skill_refs": [],
@@ -295,7 +331,7 @@ def build_graph(
 
     async def retrieve_context(state: EvoCIState) -> dict[str, Any]:
         memories = state.get("retrieved_memories", [])
-        catalog = state.get("skill_catalog", [])
+        catalog = _coerce_skill_catalog(state.get("skill_catalog"))
         selected_memory_ids = [memory.memory_id for memory in memories]
         retrieval_events: list[RunEvent] = []
         if runtime.memory_retriever is not None:
@@ -377,7 +413,7 @@ def build_graph(
             workspace_path=state["workspace_path"],
             invocation_id=invocation_id,
             memories=tuple(state.get("retrieved_memories", [])),
-            skills=tuple(state.get("skill_catalog", [])),
+            skills=tuple(_coerce_skill_catalog(state.get("skill_catalog"))),
             previous_decisions=tuple(state.get("decision_history", [])),
             worker_result_summaries=_worker_summaries(state),
             last_verification=state.get("verification"),
@@ -388,10 +424,26 @@ def build_graph(
             failed_candidates=tuple(state.get("failed_candidates", [])),
             usage_complete=usage_complete,
         )
+        completed_invocation_id = invocation_id
         try:
             decision = await runtime.agents.supervisor.decide(context=context)
-        except (RepairBudgetExhausted, ModelGatewayError) as exc:
+        except RepairBudgetExhausted as exc:
             return classified_failure(exc, phase="supervise", supervisor_batch=batch)
+        except ModelGatewayError as exc:
+            if not _caused_by_timeout(exc):
+                return classified_failure(exc, phase="supervise", supervisor_batch=batch)
+            # The gateway exhausted its internal transport retries. Give the
+            # Supervisor one fresh invocation without spending another batch.
+            completed_invocation_id = f"{invocation_id}:timeout-retry"
+            retry_context = replace(context, invocation_id=completed_invocation_id)
+            try:
+                decision = await runtime.agents.supervisor.decide(context=retry_context)
+            except (RepairBudgetExhausted, ModelGatewayError) as retry_exc:
+                return classified_failure(
+                    retry_exc,
+                    phase="supervise",
+                    supervisor_batch=batch,
+                )
         history = list(state.get("decision_history", []))
         history.append(f"{decision.action}: {decision.reasoning_summary}")
         recommended = [
@@ -410,7 +462,7 @@ def build_graph(
                     state,
                     EventType.AGENT_COMPLETED,
                     agent_id="supervisor",
-                    invocation_id=invocation_id,
+                    invocation_id=completed_invocation_id,
                     discriminator=str(batch),
                     payload={
                         "action": decision.action,
@@ -1014,11 +1066,9 @@ def build_graph(
             raise
         review = None
         if verification.passed:
-            blockers: list[str] = []
-            if output is not None:
-                blockers.extend(contains_review_bypass(output))
-            blockers.extend(contains_workspace_review_bypass(Path(state["workspace_path"])))
-            blockers = sorted(set(blockers))
+            # FileEdit.content is a complete replacement and can contain legitimate
+            # pre-existing skip/noqa directives. Scan only additions in the final diff.
+            blockers = contains_workspace_review_bypass(Path(state["workspace_path"]))
             if blockers:
                 events.append(
                     _event(
@@ -1182,6 +1232,16 @@ def build_graph(
                 )
         original_reason = state.get("failure_reason") or state.get("batch_conflict")
         original_stage = state.get("failure_stage") or state.get("phase") or "verify"
+        verification_update: dict[str, Any] = {}
+        if state.get("batch_conflict"):
+            # A passing verification rejected by governance belongs to the candidate
+            # being rolled back. Keep verification_history, but do not expose this
+            # stale pass as current truth to the next Supervisor invocation.
+            verification_update = {
+                "verification": None,
+                "verification_snapshot_id": None,
+                "review": None,
+            }
         apply_failed = state.get("phase") == "apply_candidate" and not state.get("verification")
         try:
             if apply_failed and state.get("attempt_written") is not None:
@@ -1240,6 +1300,7 @@ def build_graph(
             "phase": "rollback",
             "failed_candidates": failed_candidates,
             "integrated_snapshot_id": workspace_snapshot_id(Path(state["workspace_path"])),
+            **verification_update,
             "failure_reason": original_reason,
             "failure_stage": original_stage,
             "batch_conflict": None,

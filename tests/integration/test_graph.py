@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import subprocess
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,7 @@ from evoci.domain.models import (
     PatchProposal,
     RepoSpec,
     ReviewResult,
+    SkillCatalogEntry,
     SkillRef,
     SupervisorDecision,
     VerificationResult,
@@ -333,6 +335,44 @@ def make_runtime(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_timeout_gets_one_fresh_invocation(tmp_path: Path) -> None:
+    class TimeoutThenStop:
+        def __init__(self) -> None:
+            self.invocation_ids: list[str] = []
+
+        async def decide(self, *, context: SupervisorContext) -> SupervisorDecision:
+            self.invocation_ids.append(context.invocation_id)
+            if len(self.invocation_ids) == 1:
+                try:
+                    raise TimeoutError
+                except TimeoutError as exc:
+                    raise ModelGatewayError("model call failed") from exc
+            return SupervisorDecision(
+                action="stop",
+                reasoning_summary="retry completed",
+                stop_reason="no verified repair",
+            )
+
+    coordinator = TimeoutThenStop()
+    runtime = make_runtime(
+        tmp_path,
+        coordinator,  # type: ignore[arg-type]
+        FakeInvestigator(),
+    )
+
+    result = await build_graph(runtime).ainvoke(
+        initial_state(tmp_path, run_id="supervisor-timeout-retry")
+    )
+
+    assert result["status"] == "failed"
+    assert result["supervisor_batch"] == 1
+    assert coordinator.invocation_ids == [
+        "supervise:1",
+        "supervise:1:timeout-retry",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_workers_run_one_task_at_a_time(tmp_path: Path) -> None:
     inflight = 0
     peaks: list[int] = []
@@ -474,9 +514,17 @@ async def test_sqlite_checkpoint_resumes_after_runtime_rebuild(tmp_path: Path) -
     first_handle = await create_async_sqlite_checkpointer(checkpoint_path)
     graph = build_graph(runtime, checkpointer=first_handle.saver)
     invocation_config = {"configurable": {"thread_id": "disk-crash"}}
+    state = initial_state(tmp_path, run_id="disk-run")
+    state["skill_catalog"] = [
+        SkillCatalogEntry(
+            skill_id="checkpoint-skill",
+            name="Checkpoint skill",
+            description="checkpoint replay fixture",
+        )
+    ]
 
     with pytest.raises(RuntimeError, match="simulated worker crash"):
-        await graph.ainvoke(initial_state(tmp_path, run_id="disk-run"), invocation_config)
+        await graph.ainvoke(state, invocation_config)
     await first_handle.close()
 
     second_handle = await create_async_sqlite_checkpointer(checkpoint_path)
@@ -486,6 +534,8 @@ async def test_sqlite_checkpoint_resumes_after_runtime_rebuild(tmp_path: Path) -
 
     assert result["status"] == "success"
     assert investigator.calls == Counter({"b": 2, "a": 1})
+    assert isinstance(result["skill_catalog"][0], SkillCatalogEntry)
+    assert result["skill_catalog"][0].skill_id == "checkpoint-skill"
 
 
 @pytest.mark.asyncio
@@ -880,7 +930,7 @@ class RetryFeedbackFixer:
         del diagnosis, evidence
         self.contexts.append(context)
         self.previous_verifications.append(previous_verification)
-        first = not self.contexts
+        first = len(self.contexts) == 1
         path = "bad.py" if first else "good.py"
         content = "import pytest\npytest.skip('blocked')\n" if first else "ATTEMPT = 2\n"
         return FixerOutput(
@@ -919,13 +969,39 @@ class RejectFirstReviewer:
 
 @pytest.mark.asyncio
 async def test_reviewer_rejection_rolls_back_and_feeds_next_fixer(tmp_path: Path) -> None:
+    class RetryCoordinator:
+        def __init__(self) -> None:
+            self.contexts: list[SupervisorContext] = []
+
+        async def decide(self, *, context: SupervisorContext) -> SupervisorDecision:
+            self.contexts.append(context)
+            return SupervisorDecision(
+                action="dispatch",
+                reasoning_summary="retry rejected candidate",
+                tasks=[
+                    task(
+                        f"repair-{len(self.contexts)}",
+                        kind="repair",
+                        write_scope=["bad.py", "good.py"],
+                    )
+                ],
+            )
+
+    (tmp_path / "base.txt").write_text("baseline\n")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.name", "test"],
+        ["git", "config", "user.email", "test@example.invalid"],
+        ["git", "add", "base.txt"],
+        ["git", "commit", "-qm", "baseline"],
+    ):
+        subprocess.run(command, cwd=tmp_path, check=True)
+
     fixer = RetryFeedbackFixer()
-    _reviewer = RejectFirstReviewer()
-    coordinator = FakeCoordinator([[task("inspect")]])
-    coordinator.repair_task = task("repair", kind="repair", write_scope=["bad.py", "good.py"])
+    coordinator = RetryCoordinator()
     runtime = make_runtime(
         tmp_path,
-        coordinator,
+        coordinator,  # type: ignore[arg-type]
         FakeInvestigator(),
         FakeDiagnoser(),
     )
@@ -939,7 +1015,16 @@ async def test_reviewer_rejection_rolls_back_and_feeds_next_fixer(tmp_path: Path
 
     result = await build_graph(runtime).ainvoke(initial_state(tmp_path, run_id="review-retry"))
 
-    assert result["status"] == "success"
+    assert (
+        result["status"],
+        result.get("failure_class"),
+        result.get("failure_stage"),
+        result.get("failure_reason"),
+        len(coordinator.contexts),
+        len(fixer.contexts),
+    ) == ("success", None, None, None, 2, 2)
+    assert len(coordinator.contexts) == 2
+    assert coordinator.contexts[1].last_verification is None
     assert not (tmp_path / "bad.py").exists()
     assert (tmp_path / "good.py").read_text() == "ATTEMPT = 2\n"
 

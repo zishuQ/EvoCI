@@ -8,7 +8,7 @@ from dataclasses import asdict, is_dataclass
 from time import monotonic
 from typing import Any, TypeVar, cast
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from evoci.domain.models import SkillRef
 from evoci.model.gateway import ToolLoopGateway, ToolLoopMessage
@@ -26,6 +26,15 @@ from evoci.tools.policy import PolicyViolation
 from evoci.tools.registry import LoadSkillArgs, RunSkillScriptArgs, ToolRegistry
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
+_TOOL_RESULT_PREVIEW_CHARS = 12_000
+_TOOL_RESULT_CHUNK_CHARS = 8_000
+_TOOL_ERROR_PREVIEW_CHARS = 2_000
+
+
+class _ReadToolResultArgs(BaseModel):
+    result_id: str
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=_TOOL_RESULT_CHUNK_CHARS, ge=1, le=32_000)
 
 
 def _serializable(value: Any) -> Any:
@@ -104,6 +113,40 @@ class BoundedToolAgent:
     ) -> OutputT:
         if not invocation_id.strip():
             raise ValueError("invocation_id must be a stable non-empty identifier")
+        cached_tool_results: dict[str, str] = {}
+
+        def read_tool_result(
+            result_id: str,
+            offset: int = 0,
+            limit: int = _TOOL_RESULT_CHUNK_CHARS,
+        ) -> dict[str, Any]:
+            try:
+                raw = cached_tool_results[result_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown cached tool result: {result_id}") from exc
+            chunk = raw[offset : offset + limit]
+            next_offset = offset + len(chunk)
+            return {
+                "result_id": result_id,
+                "offset": offset,
+                "content": chunk,
+                "next_offset": None if next_offset >= len(raw) else next_offset,
+                "complete": next_offset >= len(raw),
+                "total_chars": len(raw),
+            }
+
+        tools.register(
+            "read_tool_result",
+            "read_files",
+            read_tool_result,
+            description=(
+                "Read a cached large tool result by result_id. Use offset and limit "
+                "to request only the needed JSON chunk."
+            ),
+            args_model=_ReadToolResultArgs,
+        )
+        if tools.tool_allowlist is not None:
+            tools.tool_allowlist.add("read_tool_result")
         messages = [
             ToolLoopMessage(role="system", content=system_prompt),
             ToolLoopMessage(role="user", content=task_prompt),
@@ -331,7 +374,27 @@ class BoundedToolAgent:
                                 "success": success,
                             },
                         )
-                tool_content = {"ok": success, "result": serialized, "error": error}
+                raw_result = json.dumps(serialized, default=str, sort_keys=True)
+                message_result = serialized
+                if len(raw_result) > _TOOL_RESULT_PREVIEW_CHARS:
+                    cached_tool_results[call.call_id] = raw_result
+                    message_result = {
+                        "projected": True,
+                        "result_id": call.call_id,
+                        "total_chars": len(raw_result),
+                        "preview": raw_result[:_TOOL_RESULT_PREVIEW_CHARS],
+                        "read_more": (
+                            "Call read_tool_result with this result_id and an offset/limit."
+                        ),
+                    }
+                message_error = error
+                if message_error and len(message_error) > _TOOL_ERROR_PREVIEW_CHARS:
+                    message_error = message_error[:_TOOL_ERROR_PREVIEW_CHARS] + "…"
+                tool_content = {
+                    "ok": success,
+                    "result": message_result,
+                    "error": message_error,
+                }
                 messages.append(
                     ToolLoopMessage(
                         role="tool",

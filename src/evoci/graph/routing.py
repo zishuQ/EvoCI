@@ -23,22 +23,6 @@ def requires_approval(output: FixerOutput) -> bool:
     return bool(lowered & manifest_names and lowered & lock_names)
 
 
-def contains_review_bypass(output: FixerOutput) -> list[str]:
-    blockers: list[str] = []
-    forbidden = (
-        "pytest.skip(",
-        "@pytest.mark.skip",
-        "continue-on-error: true",
-        "|| true",
-        "# noqa",
-        "eslint-disable",
-    )
-    for edit in output.edits:
-        if edit.content and any(token in edit.content for token in forbidden):
-            blockers.append(f"possible test or CI bypass in {edit.path}")
-    return blockers
-
-
 def contains_workspace_review_bypass(workspace: Path) -> list[str]:
     """Inspect the complete final Git diff, including untracked files."""
 
@@ -83,6 +67,8 @@ def contains_workspace_review_bypass(workspace: Path) -> list[str]:
             if not row.startswith("?? "):
                 continue
             relative = row[3:]
+            if relative == ".evoci" or relative.startswith(".evoci/"):
+                continue
             target = (workspace / relative).resolve()
             root = workspace.resolve()
             if root not in target.parents or not target.is_file():

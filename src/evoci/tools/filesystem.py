@@ -51,11 +51,15 @@ class FileTools:
         except UnicodeDecodeError as exc:
             raise PolicyViolation(f"file is not valid UTF-8 text: {path}") from exc
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
+        if offset < 0 or (limit is not None and limit < 1):
+            raise ValueError("offset must be non-negative and limit must be positive")
         target = self.boundary.resolve(path, must_exist=True)
         if not target.is_file():
             raise IsADirectoryError(target)
-        return target.read_text(encoding="utf-8", errors="replace")[: self.max_chars]
+        content = target.read_text(encoding="utf-8", errors="replace")
+        window = min(limit or self.max_chars, self.max_chars)
+        return content[offset : offset + window]
 
     def list_files(self, path: str = ".", *, limit: int = 500) -> list[str]:
         target = self.boundary.resolve(path, must_exist=True)
